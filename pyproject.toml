@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=80.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-gpu-asr"
+version = "0.1.0"
+description = "Batched TensorRT inference for Zipformer and Parakeet ASR models."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "Apache-2.0"
+authors = [{ name = "SoundsGoodAI" }]
+keywords = ["asr", "cuda", "speech-recognition", "tensorrt"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "numpy>=2.0.0,<3.0.0",
+    "omegaconf>=2.3.0,<3.0.0",
+    "sentencepiece>=0.2.0,<1.0.0",
+    "torch>=2.4.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+cuda12 = [
+    "cupy-cuda12x>=13.0.0,<15.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorrt-cu12>=10.0.0,<12.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+cuda13 = [
+    "cupy-cuda13x>=14.0.0,<15.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorrt-cu13>=11.0.0,<12.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+dev = [
+    "kaldi-native-fbank>=1.22.3,<2.0.0",
+    "pytest>=9.1.1,<10.0.0",
+    "ruff>=0.16.0,<1.0.0",
+]
+export = [
+    "onnx>=1.22.0,<2.0.0",
+]
+
+[project.scripts]
+fast-gpu-asr-benchmark = "fast_gpu_asr.benchmark:main"
+fast-gpu-asr-export-parakeet = "fast_gpu_asr.export.export_parakeet:main"
+fast-gpu-asr-export-zipformer = "fast_gpu_asr.export.export_zipformer:main"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[project.urls]
+Homepage = "https://github.com/SoundsGoodAI/fast-gpu-asr"
+Issues = "https://github.com/SoundsGoodAI/fast-gpu-asr/issues"
+Repository = "https://github.com/SoundsGoodAI/fast-gpu-asr.git"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fast_gpu_asr = ["py.typed"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
