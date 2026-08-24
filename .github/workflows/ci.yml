@@ -4,20 +4,288 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate GitHub Actions workflows
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o "${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${archive}" | sha256sum --check
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -color
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.12"
+          version: "0.11.21"
+      - name: Check lockfile
+        run: uv lock --check
+      - name: Install development environment
+        run: uv sync --frozen --extra dev --extra export
+      - name: Lint
+        run: uv run --frozen ruff check .
+      - name: Check formatting
+        run: uv run --frozen ruff format --check .
+      - name: Compile Python sources
+        run: uv run --frozen python -m compileall -q src tests scripts
+
+  python-compatibility:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --extra dev
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run pytest -q
+          version: "0.11.21"
+      - name: Install development environment
+        run: uv sync --frozen --extra dev --extra export
+      - name: Compile Python sources
+        run: uv run --frozen python -m compileall -q src tests scripts
+
+  gpu-tests:
+    name: CUDA 13 plugins and wheel
+    needs: [quality, python-compatibility]
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+    concurrency:
+      group: fast-gpu-asr-gpu-ci
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          clean: true
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+          python-version: "3.14"
+          version: "0.11.21"
+      - name: Configure temporary paths
+        run: |
+          {
+            echo "CUPY_CACHE_DIR=${RUNNER_TEMP}/cupy-cache-${GITHUB_RUN_ID}"
+            echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache-${GITHUB_RUN_ID}"
+            echo "UV_PROJECT_ENVIRONMENT=${RUNNER_TEMP}/fast-gpu-asr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "${GITHUB_ENV}"
+      - name: Install CUDA, export, and test dependencies
+        run: uv sync --frozen --extra cuda13 --extra dev --extra export
+      - name: Configure Python CUDA toolchain
+        shell: bash
+        run: |
+          uv run --frozen python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from cuda.pathfinder import (
+              find_nvidia_binary_utility,
+              find_nvidia_header_directory,
+              load_nvidia_dynamic_lib,
+          )
+
+          nvcc = find_nvidia_binary_utility("nvcc")
+          if nvcc is None:
+              raise RuntimeError("The CUDA 13 Python packages did not provide nvcc.")
+
+          include_dirs = set()
+          for name in ("cudart", "cublas", "cufft"):
+              include_dir = find_nvidia_header_directory(name)
+              if include_dir is None:
+                  raise RuntimeError(
+                      f"The CUDA 13 Python packages did not provide {name} headers."
+                  )
+              include_dirs.add(Path(include_dir).resolve())
+          library_dirs = {
+              Path(load_nvidia_dynamic_lib(name).abs_path).resolve().parent
+              for name in ("cudart", "cublas", "cufft")
+          }
+          wheel_paths = (Path(nvcc).resolve(), *include_dirs, *library_dirs)
+          for path in wheel_paths:
+              if "site-packages" not in path.parts:
+                  raise RuntimeError(f"CUDA component did not come from a wheel: {path}")
+
+          github_path = Path(os.environ["GITHUB_PATH"])
+          with github_path.open("a") as output:
+              print(Path(nvcc).resolve().parent, file=output)
+
+          github_env = Path(os.environ["GITHUB_ENV"])
+          with github_env.open("a") as output:
+              for name, paths in (
+                  ("CPATH", include_dirs),
+                  ("LIBRARY_PATH", library_dirs),
+                  ("LD_LIBRARY_PATH", library_dirs),
+              ):
+                  value = ":".join(map(str, sorted(paths)))
+                  if current := os.environ.get(name):
+                      value = f"{value}:{current}"
+                  print(f"{name}={value}", file=output)
+
+          print(f"nvcc={Path(nvcc).resolve()}")
+          print(f"includes={sorted(map(str, include_dirs))}")
+          print(f"libraries={sorted(map(str, library_dirs))}")
+          PY
+      - name: Verify GPU and TensorRT development headers
+        shell: bash
+        run: |
+          nvidia-smi
+          nvcc --version
+          tensorrt_major="$(
+            uv run --frozen python -c \
+              'import tensorrt; print(tensorrt.__version__.split(".")[0])'
+          )"
+          cat > "${RUNNER_TEMP}/check_tensorrt.cpp" <<CPP
+          #include <NvInferVersion.h>
+          static_assert(NV_TENSORRT_MAJOR == ${tensorrt_major});
+          int main() { return 0; }
+          CPP
+          c++ --std=c++20 -fsyntax-only "${RUNNER_TEMP}/check_tensorrt.cpp"
+      - name: Rebuild native plugins
+        run: |
+          rm -f src/fast_gpu_asr/tensorrt_plugins/*.so
+          uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
+          test "$(find src/fast_gpu_asr/tensorrt_plugins -maxdepth 1 -name '*.so' | wc -l)" -eq 9
+      - name: Inspect plugin linkage
+        shell: bash
+        run: |
+          for library in src/fast_gpu_asr/tensorrt_plugins/*.so; do
+            if readelf -d "${library}" | grep -Eq 'RPATH|RUNPATH'; then
+              echo "Unexpected runtime search path in ${library}" >&2
+              exit 1
+            fi
+            readelf -d "${library}" | grep NEEDED
+          done
+      - name: Run complete GPU test suite
+        run: >-
+          uv run --frozen pytest -q
+          --junitxml="${RUNNER_TEMP}/gpu-test-results.xml"
+      - name: Require every GPU test to run
+        run: |
+          uv run --frozen python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "gpu-test-results.xml"
+          root = ET.parse(report).getroot()
+          skipped = sum(
+              int(suite.attrib.get("skipped", 0))
+              for suite in root.iter("testsuite")
+          )
+          if skipped:
+              raise RuntimeError(f"Expected every GPU test to run, but {skipped} skipped.")
+          PY
+      - name: Build platform wheel
+        run: |
+          rm -rf dist
+          scripts/build_wheel.sh dist
+      - name: Verify and smoke-test installed wheel
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "${wheel}"
+          install_dir="${RUNNER_TEMP}/wheel-site"
+          rm -rf "${install_dir}"
+          uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" \
+            --target "${install_dir}" --no-deps "${wheel}"
+          WHEEL_PATH="${wheel}" WHEEL_SITE="${install_dir}" \
+            "${UV_PROJECT_ENVIRONMENT}/bin/python" - <<'PY'
+          import os
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          wheel = Path(os.environ["WHEEL_PATH"])
+          wheel_site = Path(os.environ["WHEEL_SITE"]).resolve()
+          with zipfile.ZipFile(wheel) as archive:
+              libraries = {
+                  Path(name).name
+                  for name in archive.namelist()
+                  if name.endswith(".so")
+              }
+              wheel_metadata = next(
+                  name for name in archive.namelist() if name.endswith("WHEEL")
+              )
+              metadata = archive.read(wheel_metadata).decode()
+
+          expected_libraries = {
+              "parakeet_convolution_plugin.so",
+              "parakeet_feature_plugin.so",
+              "parakeet_flash_attention_plugin.so",
+              "zipformer_attention_value_plugin.so",
+              "zipformer_convolution_plugin.so",
+              "zipformer_feature_plugin.so",
+              "zipformer_output_assembly_plugin.so",
+              "zipformer_relative_attention_plugin.so",
+              "zipformer_resampling_plugin.so",
+          }
+          if libraries != expected_libraries:
+              raise RuntimeError(
+                  f"Expected plugin libraries {expected_libraries}, got {libraries}."
+              )
+          if "Root-Is-Purelib: false" not in metadata:
+              raise RuntimeError("The repaired wheel is incorrectly marked as pure Python.")
+
+          sys.path.insert(0, str(wheel_site))
+          import fast_gpu_asr
+          from fast_gpu_asr.tensorrt_plugins import load_tensorrt_plugins
+
+          if not Path(fast_gpu_asr.__file__).resolve().is_relative_to(wheel_site):
+              raise RuntimeError("Smoke test imported the source tree instead of the wheel.")
+          load_tensorrt_plugins()
+          PY
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fast-gpu-asr-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/*.whl
+          if-no-files-found: error
+      - name: Upload GPU test report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gpu-test-results-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gpu-test-results.xml
+          if-no-files-found: warn
+      - name: Clean GPU runner artifacts
+        if: always()
+        shell: bash
+        run: |
+          rm -rf \
+            "${CUPY_CACHE_DIR}" \
+            "${UV_CACHE_DIR}" \
+            "${UV_PROJECT_ENVIRONMENT}" \
+            "${RUNNER_TEMP}/wheel-site" \
+            dist
+          rm -f src/fast_gpu_asr/tensorrt_plugins/*.so

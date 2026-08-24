@@ -1,51 +1,51 @@
-#!/bin/env python3
-# Copyright SoundsGoodAI 2026
-"""ONNX-friendly activation functions used by Zipformer inference modules."""
+#!/usr/bin/env python3
+# Copyright SoundsGoodAI 2026 - Daniil Kulko
+"""Swoosh activation modules used by the offline Zipformer encoder."""
 
 import torch
 
 
 class SwooshL(torch.nn.Module):
-    """ONNX-friendly Swoosh-L activation used by Zipformer feedforward blocks."""
+    """Apply the Swoosh-L activation used by Zipformer feedforward blocks.
+
+    Swoosh-L is defined as ``softplus(x - 4.0) - 0.08 * x - 0.035``.
+    """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Does a forward pass and returns Swoosh-L activation.
+        """Evaluate Swoosh-L elementwise.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
-            Input of arbitrary shape ``(*)``.
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Floating-point input tensor of arbitrary shape.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Swoosh-L output with the same shape as ``x``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Output with the same shape and dtype as ``x``.
         """
-        logaddexp = torch.clamp(x - 4.0, min=0.0) + torch.log1p(
-            torch.exp(-torch.abs(x - 4.0))
-        )
 
-        return logaddexp - 0.08 * x - 0.035
+        return torch.nn.functional.softplus(x - 4.0) - 0.08 * x - 0.035
 
 
 class SwooshR(torch.nn.Module):
-    """ONNX-friendly Swoosh-R activation used by convolutional Zipformer blocks."""
+    """Apply the Swoosh-R activation used by Zipformer convolution blocks.
+
+    Swoosh-R is defined as ``softplus(x - 1.0) - 0.08 * x - 0.313261687``.
+    """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Does a forward pass and returns Swoosh-R activation.
+        """Evaluate Swoosh-R elementwise.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
-            Input of arbitrary shape ``(*)``.
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Floating-point input tensor of arbitrary shape.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Swoosh-R output with the same shape as ``x``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Output with the same shape and dtype as ``x``.
         """
-        logaddexp = torch.clamp(x - 1.0, min=0.0) + torch.log1p(
-            torch.exp(-torch.abs(x - 1.0))
-        )
 
-        return logaddexp - 0.08 * x - 0.313261687
+        return torch.nn.functional.softplus(x - 1.0) - 0.08 * x - 0.313261687

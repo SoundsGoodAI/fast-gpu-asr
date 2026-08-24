@@ -10,7 +10,15 @@ readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = "Apache-2.0"
 authors = [{ name = "SoundsGoodAI" }]
-keywords = ["asr", "cuda", "speech-recognition", "tensorrt"]
+keywords = [
+    "asr",
+    "cuda",
+    "gpu-inference",
+    "parakeet",
+    "speech-recognition",
+    "tensorrt",
+    "zipformer",
+]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -20,28 +28,29 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
+    "audioop-lts>=0.2.2,<1.0.0 ; python_full_version >= '3.13'",
     "numpy>=2.0.0,<3.0.0",
     "omegaconf>=2.3.0,<3.0.0",
     "sentencepiece>=0.2.0,<1.0.0",
-    "torch>=2.4.0,<3.0.0",
+    "torch>=2.13.0,<3.0.0",
 ]
 
 [project.optional-dependencies]
-cuda12 = [
-    "cupy-cuda12x>=13.0.0,<15.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "tensorrt-cu12>=10.0.0,<12.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 cuda13 = [
-    "cupy-cuda13x>=14.0.0,<15.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "tensorrt-cu13>=11.0.0,<12.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cuda-bindings>=13.0.0,<14.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cuda-pathfinder>=1.6.1,<2.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cuda-toolkit[cccl,cublas,cudart,cufft,nvcc]>=13.0.0,<14.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cupy-cuda13x>=14.2.0,<15.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorrt-cu13>=11.2.1.2,<12.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 dev = [
     "kaldi-native-fbank>=1.22.3,<2.0.0",
     "pytest>=9.1.1,<10.0.0",
-    "ruff>=0.16.0,<1.0.0",
+    "ruff>=0.16.4,<1.0.0",
 ]
 export = [
     "onnx>=1.22.0,<2.0.0",
+    "onnxscript>=0.7.1,<1.0.0",
 ]
 
 [project.scripts]
@@ -67,6 +76,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 fast_gpu_asr = ["py.typed"]
+"fast_gpu_asr.tensorrt_plugins" = ["*.cu", "*.h", "*.so"]
 
 [tool.ruff]
 line-length = 88

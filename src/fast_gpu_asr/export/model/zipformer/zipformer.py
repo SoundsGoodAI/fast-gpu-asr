@@ -1,11 +1,19 @@
-#!/bin/env python3
-# Copyright SoundsGoodAI 2026
+#!/usr/bin/env python3
+# Copyright SoundsGoodAI 2026 - Daniil Kulko
 """Offline Zipformer encoder assembled from export-friendly inference blocks."""
 
 import copy
 
 import torch
 
+from ....constants import (
+    ONNX_OPSET_VERSION,
+    TENSORRT_PLUGIN_NAMESPACE,
+    ZIPFORMER_CONVOLUTION_PLUGIN_NAME,
+    ZIPFORMER_DOWNSAMPLE_PLUGIN_NAME,
+    ZIPFORMER_OUTPUT_ASSEMBLY_PLUGIN_NAME,
+    ZIPFORMER_UPSAMPLE_BYPASS_PLUGIN_NAME,
+)
 from .activation import SwooshL, SwooshR
 from .attention import (
     CompactRelPositionalEncoding,
@@ -18,8 +26,14 @@ from .subsampling import BiasNorm, Conv2dSubsampling
 
 
 class Zipformer2(torch.nn.Module):
-    """
-    Audio-to-encoder module for offline Zipformer2 export.
+    """Audio-to-encoder module for offline Zipformer2 export.
+
+    Waveform feature extraction remains in ``torch.float32``. The extracted
+    features cross one explicit boundary into the configured encoder dtype
+    before convolutional subsampling. BF16 export keeps the first subsampling
+    convolution in ``torch.float16`` because TensorRT executes that convolution
+    substantially faster in FP16, then converts back to ``torch.bfloat16`` for
+    the rest of subsampling and all six encoder stacks.
     """
 
     def __init__(
@@ -36,9 +50,11 @@ class Zipformer2(torch.nn.Module):
         subsample_layer1_channels: int,
         subsample_layer2_channels: int,
         subsample_layer3_channels: int,
+        subsampling_batch_partitions: int,
         encoder_dims: list[int],
         num_encoder_layers: list[int],
         downsampling_factors: list[int],
+        bypass_scales: list[torch.Tensor],
         num_heads: list[int],
         feedforward_dims: list[int],
         cnn_module_kernels: list[int],
@@ -49,9 +65,9 @@ class Zipformer2(torch.nn.Module):
         pos_max_len: int,
         output_dim: int,
         use_ctc: bool,
+        dtype: torch.dtype,
     ) -> None:
-        """
-        Zipformer2 initialization.
+        """Initialize the waveform frontend and six Zipformer encoder stacks.
 
         Parameters
         ----------
@@ -83,6 +99,8 @@ class Zipformer2(torch.nn.Module):
         subsample_layer3_channels : int
             The number of output channels in the third Conv2d layer of the
             Conv2dSubsampling module.
+        subsampling_batch_partitions : int
+            Number of batch partitions used by the convolutional subsampling frontend.
         encoder_dims : list[int]
             A list of 6 integers, the embedding dimension of Zipformer2EncoderLayer
             module in each Zipformer2Encoder stack. Dimensions must be nondecreasing
@@ -95,6 +113,8 @@ class Zipformer2(torch.nn.Module):
             Zipformer2Encoder stack.
             Note: this is in addition to the downsampling factor of 2 that is applied in
             the Conv2dSubsampling module.
+        bypass_scales : list[torch.Tensor]
+            Learned per-channel output bypass scales for the 6 encoder stacks.
         num_heads : list[int]
             A list of 6 integers, the number of heads for attention weights and
             self-attention of the Zipformer2EncoderLayer module in each
@@ -119,25 +139,26 @@ class Zipformer2(torch.nn.Module):
             The dimension of the relative positional embeddings in each
             Zipformer2Encoder stack.
         pos_max_len : int
-            The initial maximum sequence length of the relative positional embeddings
-            in each Zipformer2Encoder stack. Longer inputs require regenerating the
-            positional table and may degrade inference speed.
+            Maximum sequence length supported by the fixed relative positional table
+            in each ``Zipformer2Encoder`` stack.
         output_dim : int
             The output dimension after final output projection.
         use_ctc : bool
             Whether the output projection contains a CTC head. If true, log-softmax is
             applied to the final output.
+        dtype : torch.dtype
+            Floating-point dtype used by subsampling, encoder stacks, and the
+            output projection. Supported values are ``torch.float32``,
+            ``torch.float16``, and ``torch.bfloat16``.
         """
 
         super().__init__()
 
-        device = torch.device("cpu")
-
         self.encoder_dims = tuple(encoder_dims)
-        self.downsampling_factors = tuple(downsampling_factors)
         projection_dim = max(encoder_dims)
         self.projection_dim = projection_dim
         self.ctc = use_ctc
+        self.dtype = dtype
 
         self.feature_extractor = FeatureExtractor(
             samp_freq,
@@ -148,7 +169,6 @@ class Zipformer2(torch.nn.Module):
             low_freq,
             high_freq,
             min_frames,
-            device,
         )
 
         self.subsampling = Conv2dSubsampling(
@@ -157,7 +177,7 @@ class Zipformer2(torch.nn.Module):
             subsample_layer1_channels,
             subsample_layer2_channels,
             subsample_layer3_channels,
-            device,
+            subsampling_batch_partitions,
         )
 
         encoders = []
@@ -171,17 +191,15 @@ class Zipformer2(torch.nn.Module):
                 value_head_dim,
                 feedforward_dims[i],
                 cnn_module_kernels[i],
-                device,
             )
 
             encoder = Zipformer2Encoder(
                 encoder_layer,
                 num_layers,
-                encoder_dims[i],
                 pos_dim,
                 pos_max_len,
                 downsampling_factors[i],
-                device,
+                bypass_scales[i],
             )
 
             encoders.append(encoder)
@@ -195,96 +213,116 @@ class Zipformer2(torch.nn.Module):
             self.encoder_6,
         ) = encoders
 
-        self.downsample_output = SimpleDownsample(2, device)
-        self.projection_output = torch.nn.Linear(
-            projection_dim, output_dim, device=device
-        )
+        self.downsample_output = SimpleDownsample(2)
+        self.projection_output = torch.nn.Linear(projection_dim, output_dim)
+
+        for module in (
+            self.subsampling,
+            *encoders,
+            self.downsample_output,
+            self.projection_output,
+        ):
+            module.to(dtype=self.dtype)
+
+        if self.dtype == torch.bfloat16:
+            self.subsampling.conv1.to(dtype=torch.float16)
 
     def forward(
         self, audio: torch.Tensor, audio_lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Does a forward pass from waveform to encoder embeddings.
+        """Convert padded waveforms into encoder embeddings.
 
         Parameters
         ----------
         audio : torch.Tensor[torch.float32]
-            Padded waveforms with shape ``(batch_size, num_samples)``.
+            Padded waveforms with shape
+            ``(batch_size, num_samples + right_padding)``. The runtime appends
+            the reflected right context required by the feature extractor.
         audio_lengths : torch.Tensor[torch.int32]
             Valid sample counts with shape ``(batch_size,)``.
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor]
+        tuple[
+            torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16],
+            torch.Tensor[torch.int32],
+        ]
             Encoder embeddings with shape
             ``(batch_size, num_encoder_frames, output_dim)`` and
-            ``torch.int32`` valid frame counts.
+            ``torch.int32`` valid frame counts. Encoder embeddings retain the
+            configured floating-point dtype.
         """
 
         x, x_lens = self.feature_extractor(audio, audio_lengths)
-        x, x_lens = self.subsampling(x, x_lens)
+        x, x_lens = self.subsampling(x.to(self.dtype), x_lens)
 
-        batch_size, seq_len, _ = x.size()
-        padding_mask = torch.arange(seq_len, device=x_lens.device).unsqueeze(
-            0
-        ) >= x_lens.unsqueeze(1)
-
-        output = torch.empty(
-            batch_size, seq_len, self.projection_dim, dtype=x.dtype, device=x.device
-        )
+        padding_mask = torch.arange(
+            x.size(1),
+            device=x.device,
+        ).unsqueeze(0) >= x_lens.unsqueeze(1)
 
         # Encoder 1
-        x = self.encoder_1(x, padding_mask)
-        output[:, :, : x.size(2)] = x
+        encoder_1_output = self.encoder_1(x, x_lens, padding_mask)
 
         # Encoder 2
-        pad = torch.zeros(
-            x.size(0),
-            x.size(1),
-            self.encoder_dims[1] - x.size(2),
-            dtype=x.dtype,
-            device=x.device,
+        x = torch.nn.functional.pad(
+            encoder_1_output, (0, self.encoder_dims[1] - self.encoder_dims[0])
         )
-        x = torch.cat((x, pad), dim=2)
-        x = self.encoder_2(x, padding_mask)
-        output[:, :, : x.size(2)] = x
+        encoder_2_output = self.encoder_2(x, x_lens, padding_mask)
 
         # Encoder 3
-        pad = torch.zeros(
-            x.size(0),
-            x.size(1),
-            self.encoder_dims[2] - x.size(2),
-            dtype=x.dtype,
-            device=x.device,
+        x = torch.nn.functional.pad(
+            encoder_2_output, (0, self.encoder_dims[2] - self.encoder_dims[1])
         )
-        x = torch.cat((x, pad), dim=2)
-        x = self.encoder_3(x, padding_mask)
-        output[:, :, : x.size(2)] = x
+        encoder_3_output = self.encoder_3(x, x_lens, padding_mask)
 
         # Encoder 4
-        pad = torch.zeros(
-            x.size(0),
-            x.size(1),
-            self.encoder_dims[3] - x.size(2),
-            dtype=x.dtype,
-            device=x.device,
+        x = torch.nn.functional.pad(
+            encoder_3_output, (0, self.encoder_dims[3] - self.encoder_dims[2])
         )
-        x = torch.cat((x, pad), dim=2)
-        x = self.encoder_4(x, padding_mask)
-        output[:, :, : x.size(2)] = x
+        encoder_4_output = self.encoder_4(x, x_lens, padding_mask)
 
         # Encoder 5
-        x = x[:, :, : self.encoder_dims[4]]
-        x = self.encoder_5(x, padding_mask)
-        output[:, :, : x.size(2)] = x
+        x = encoder_4_output[:, :, : self.encoder_dims[4]]
+        encoder_5_output = self.encoder_5(x, x_lens, padding_mask)
 
         # Encoder 6
-        x = x[:, :, : self.encoder_dims[5]]
-        x = self.encoder_6(x, padding_mask)
-        output[:, :, : x.size(2)] = x
+        x = encoder_5_output[:, :, : self.encoder_dims[5]]
+        encoder_6_output = self.encoder_6(x, x_lens, padding_mask)
+
+        if torch.onnx.is_in_onnx_export():
+            # All six inputs are intentional: besides assembling the three surviving
+            # channel bands, the opaque plugin prevents unsafe cross-stack Myelin
+            # fusion observed when earlier stack outputs disappear from the graph.
+            output = torch.onnx.ops.symbolic(
+                ZIPFORMER_OUTPUT_ASSEMBLY_PLUGIN_NAME,
+                (
+                    encoder_1_output,
+                    encoder_2_output,
+                    encoder_3_output,
+                    encoder_4_output,
+                    encoder_5_output,
+                    encoder_6_output,
+                ),
+                {"plugin_namespace": TENSORRT_PLUGIN_NAMESPACE},
+                dtype=encoder_4_output.dtype,
+                shape=encoder_4_output.shape,
+                version=ONNX_OPSET_VERSION,
+            )
+        else:
+            output = torch.cat(
+                (
+                    encoder_6_output,
+                    encoder_5_output[:, :, self.encoder_dims[5] :],
+                    encoder_4_output[:, :, self.encoder_dims[4] :],
+                ),
+                dim=2,
+            )
 
         output = self.downsample_output(output)
         output_lens = (x_lens + 1) // 2
         output = self.projection_output(output)
+
         if self.ctc:
             output = torch.nn.functional.log_softmax(output, dim=2)
 
@@ -292,22 +330,18 @@ class Zipformer2(torch.nn.Module):
 
 
 class Zipformer2Encoder(torch.nn.Module):
-    """
-    Zipformer2Encoder is a stack of Zipformer2EncoderLayer modules.
-    """
+    """Apply one temporally resampled stack of Zipformer encoder layers."""
 
     def __init__(
         self,
         encoder_layer: torch.nn.Module,
         num_layers: int,
-        embed_dim: int,
         pos_dim: int,
         pos_max_len: int,
         downsample: int,
-        device: torch.device,
+        bypass_scale: torch.Tensor,
     ) -> None:
-        """
-        Zipformer2Encoder initialization.
+        """Initialize temporal resampling, positional encoding, and encoder layers.
 
         Parameters
         ----------
@@ -315,70 +349,71 @@ class Zipformer2Encoder(torch.nn.Module):
             An instance of the Zipformer2EncoderLayer class.
         num_layers : int
             The number of encoder Zipformer2EncoderLayer modules in the stack.
-        embed_dim : int
-            The input and output embedding dimension. The embedding dimension is the
-            same for input and output of this module.
         pos_dim : int
             The dimension for the relative positional embedding.
         pos_max_len : int
-            The initial maximum sequence length of the relative positional table.
+            Maximum sequence length supported by the fixed relative positional table.
         downsample : int
             The downsampling factor of the module, the input will be downsampled in the
             beginning and upsampled back at the end.
-        device : torch.device
-            The device used to store the layer weights. Should be
-            either torch.device("cpu") or torch.device("cuda").
+        bypass_scale : torch.Tensor[torch.float32]
+            Learned per-channel bypass scales with shape ``(embed_dim,)``.
         """
 
         super().__init__()
 
-        self.downsample = SimpleDownsample(downsample, device)
-        self.encoder_pos = CompactRelPositionalEncoding(pos_dim, pos_max_len, device)
+        self.downsample_value = downsample
+        self.register_buffer("bypass_scale", bypass_scale)
+
+        self.downsample = SimpleDownsample(downsample)
+        self.encoder_pos = CompactRelPositionalEncoding(pos_dim, pos_max_len)
+        self.upsample = SimpleUpsample(downsample)
 
         self.layers = torch.nn.ModuleList(
             [copy.deepcopy(encoder_layer) for _ in range(num_layers)],
         )
-        self.upsample = SimpleUpsample(downsample)
-        self.out_combiner = BypassModule(embed_dim, device)
 
-    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Does a forward pass of the Zipformer2Encoder module and returns an output
-        tensor with the same shape as its input.
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode one stack and restore its original temporal resolution.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input features of shape ``(batch_size, seq_len, embed_dim)``.
+        lengths : torch.Tensor[torch.int32]
+            Valid frame counts with shape ``(batch_size,)``.
         padding_mask : torch.Tensor[torch.bool]
             Padding mask of shape ``(batch_size, seq_len)``.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Output with the same shape as ``x``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Output with the same shape and dtype as ``x``.
         """
 
         x_orig = x
 
         x = self.downsample(x)
-        downsampled_padding_mask = padding_mask[:, :: self.downsample.weights.size(0)]
+        downsampled_lengths = (
+            lengths + self.downsample_value - 1
+        ) // self.downsample_value
+        downsampled_padding_mask = padding_mask[:, :: self.downsample_value]
         pos_emb = self.encoder_pos(x)
         for mod in self.layers:
-            x = mod(x, pos_emb, downsampled_padding_mask)
+            x = mod(x, pos_emb, downsampled_padding_mask, downsampled_lengths)
 
-        x = self.upsample(x)
-        # Remove any extra frames that are not a multiple of downsample_factor
-        x = x[:, : x_orig.size(1)]
-        x = self.out_combiner(x_orig, x)
+        x = self.upsample(x_orig, x, self.bypass_scale)
 
         return x
 
 
 class Zipformer2EncoderLayer(torch.nn.Module):
-    """
-    Zipformer2EncoderLayer module, the basic block of Zipformer2Encoder encoder stack.
-    """
+    """Combine Zipformer feed-forward, attention, convolution, and bypass branches."""
 
     def __init__(
         self,
@@ -390,10 +425,8 @@ class Zipformer2EncoderLayer(torch.nn.Module):
         value_head_dim: int,
         feedforward_dim: int,
         cnn_module_kernel: int,
-        device: torch.device,
     ) -> None:
-        """
-        Zipformer2EncoderLayer initialization.
+        """Initialize one Zipformer encoder layer.
 
         Parameters
         ----------
@@ -415,73 +448,70 @@ class Zipformer2EncoderLayer(torch.nn.Module):
             The hidden dimension of the feedforward modules.
         cnn_module_kernel : int
             The kernel size of the convolution modules.
-        device : torch.device
-            The device used to store the layer weights. Should be
-            either torch.device("cpu") or torch.device("cuda").
         """
 
         super().__init__()
 
-        self.bypass = BypassModule(embed_dim, device)
-        self.bypass_mid = BypassModule(embed_dim, device)
+        self.bypass = BypassModule(embed_dim)
+        self.bypass_mid = BypassModule(embed_dim)
 
-        self.feed_forward1 = FeedforwardModule(
-            embed_dim, (feedforward_dim * 3) // 4, device
-        )
-        self.feed_forward2 = FeedforwardModule(embed_dim, feedforward_dim, device)
-        self.feed_forward3 = FeedforwardModule(
-            embed_dim, (feedforward_dim * 5) // 4, device
-        )
+        self.feed_forward1 = FeedforwardModule(embed_dim, (feedforward_dim * 3) // 4)
+        self.feed_forward2 = FeedforwardModule(embed_dim, feedforward_dim)
+        self.feed_forward3 = FeedforwardModule(embed_dim, (feedforward_dim * 5) // 4)
 
         self.self_attn_weights = RelPositionMultiheadAttentionWeights(
-            embed_dim, pos_dim, num_heads, query_head_dim, pos_head_dim, device
+            embed_dim, pos_dim, num_heads, query_head_dim, pos_head_dim
         )
-        self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim, device)
-        self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim, device)
-        self.nonlin_attention = NonlinAttention(embed_dim, 3 * embed_dim // 4, device)
+        self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim)
+        self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim)
+        self.nonlin_attention = NonlinAttention(embed_dim, 3 * embed_dim // 4)
 
-        self.conv_module1 = ConvolutionModule(embed_dim, cnn_module_kernel, device)
-        self.conv_module2 = ConvolutionModule(embed_dim, cnn_module_kernel, device)
+        self.conv_module1 = ConvolutionModule(embed_dim, cnn_module_kernel)
+        self.conv_module2 = ConvolutionModule(embed_dim, cnn_module_kernel)
 
-        self.norm = BiasNorm(embed_dim, device)
+        self.norm = BiasNorm(embed_dim)
 
     def forward(
-        self, x: torch.Tensor, pos_emb: torch.Tensor, padding_mask: torch.Tensor
+        self,
+        x: torch.Tensor,
+        pos_emb: torch.Tensor,
+        padding_mask: torch.Tensor,
+        valid_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Does a forward pass of the Zipformer2EncoderLayer module. Returns an output
-        tensor with the same shape as the input.
+        """Apply one Zipformer encoder layer.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input features of shape ``(batch_size, seq_len, embed_dim)``.
-        pos_emb : torch.Tensor[torch.float32]
-            Positional embeddings with shape
-            ``(batch_size, 2 * seq_len - 1, pos_dim)``.
+        pos_emb : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Positional embeddings with shape ``(1, 2 * seq_len - 1, pos_dim)``.
+            The singleton batch dimension is broadcast over ``x``.
         padding_mask : torch.Tensor[torch.bool]
             Padding mask of shape ``(batch_size, seq_len)``.
+        valid_lengths : torch.Tensor[torch.int32]
+            Valid frame counts with shape ``(batch_size,)`` shared by both
+            convolution modules in every layer of an encoder stack.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Output with the same shape as ``x``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Output with the same shape and dtype as ``x``.
         """
 
         x_orig = x
 
-        # (batch_size, num_heads, seq_len, seq_len_2)
         attn_weights = self.self_attn_weights(x, pos_emb, padding_mask)
 
         x = x + self.feed_forward1(x)
-        x = x + self.nonlin_attention(x, attn_weights[:, 0])
+        x = x + self.nonlin_attention(x, attn_weights)
         x = x + self.self_attn1(x, attn_weights)
-        x = x + self.conv_module1(x, padding_mask)
+        x = x + self.conv_module1(x, valid_lengths)
 
         x = x + self.feed_forward2(x)
         x = self.bypass_mid(x_orig, x)
         x = x + self.self_attn2(x, attn_weights)
-        x = x + self.conv_module2(x, padding_mask)
+        x = x + self.conv_module2(x, valid_lengths)
 
         x = x + self.feed_forward3(x)
         x = self.norm(x)
@@ -491,13 +521,10 @@ class Zipformer2EncoderLayer(torch.nn.Module):
 
 
 class ConvolutionModule(torch.nn.Module):
-    """
-    ConvolutionModule in Zipformer2 encoder.
-    """
+    """Apply Zipformer's gated depthwise temporal convolution branch."""
 
-    def __init__(self, embed_dim: int, kernel_size: int, device: torch.device) -> None:
-        """
-        ConvolutionModule initialization.
+    def __init__(self, embed_dim: int, kernel_size: int) -> None:
+        """Initialize pointwise projections and depthwise convolution.
 
         Parameters
         ----------
@@ -507,9 +534,11 @@ class ConvolutionModule(torch.nn.Module):
             output of this module.
         kernel_size : int
             The kernel size of the depthwise convolution module.
-        device : torch.device
-            The device used to store the layer weights. Should be
-            either torch.device("cpu") or torch.device("cuda").
+
+        Raises
+        ------
+        ValueError
+            Raised when ``kernel_size`` is even.
         """
 
         super().__init__()
@@ -520,65 +549,67 @@ class ConvolutionModule(torch.nn.Module):
                 f"an odd number but got {kernel_size} instead.",
             )
 
-        self.in_proj = torch.nn.Linear(embed_dim, 2 * embed_dim, device=device)
+        self.in_proj = torch.nn.Linear(embed_dim, 2 * embed_dim)
         self.depthwise_conv = torch.nn.Conv1d(
             embed_dim,
             embed_dim,
             kernel_size,
             groups=embed_dim,
             padding=kernel_size // 2,
-            device=device,
         )
 
         self.activation = SwooshR()
-        self.out_proj = torch.nn.Linear(embed_dim, embed_dim, device=device)
+        self.out_proj = torch.nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Does a forward pass of the ConvolutionModule. Returns a processed tensor with
-        the same shape as the input.
+    def forward(self, x: torch.Tensor, valid_lengths: torch.Tensor) -> torch.Tensor:
+        """Apply gated convolution while suppressing padded frames.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input features of shape ``(batch_size, seq_len, embed_dim)``.
-        padding_mask : torch.Tensor[torch.bool]
-            Padding mask of shape ``(batch_size, seq_len)``.
+        valid_lengths : torch.Tensor[torch.int32]
+            Valid frame counts with shape ``(batch_size,)``.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Output with the same shape as ``x``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Output with the same shape and dtype as ``x``.
         """
 
-        x = self.in_proj(x)  # (batch_size, seq_len, 2 * embed_dim)
+        x = self.in_proj(x)
+        x = torch.nn.functional.glu(x, dim=2)
 
-        x, s = x.chunk(2, dim=2)
-        x = x * torch.sigmoid(s)  # (batch_size, seq_len, embed_dim)
+        if torch.onnx.is_in_onnx_export():
+            depthwise_weight = (
+                self.depthwise_conv.weight.squeeze(1).permute(1, 0).contiguous()
+            )
+            x = torch.onnx.ops.symbolic(
+                ZIPFORMER_CONVOLUTION_PLUGIN_NAME,
+                (x, valid_lengths, depthwise_weight, self.depthwise_conv.bias),
+                {"plugin_namespace": TENSORRT_PLUGIN_NAMESPACE},
+                dtype=x.dtype,
+                shape=x.shape,
+                version=ONNX_OPSET_VERSION,
+            )
+        else:
+            padding_mask = torch.arange(
+                x.size(1), device=valid_lengths.device
+            ).unsqueeze(0) >= valid_lengths.unsqueeze(1)
+            x = x.masked_fill(padding_mask.unsqueeze(2), 0.0).permute(0, 2, 1)
+            x = self.depthwise_conv(x)
+            x = self.activation(x).permute(0, 2, 1)
 
-        # exchange the temporal dimension and the feature dimension for depthwise
-        # convolution.
-        x = x.permute(0, 2, 1)  # (batch_size, embed_dim, seq_len).
-        x = x.masked_fill(padding_mask.unsqueeze(1), 0.0)
-        x = self.depthwise_conv(x)
-        x = x.permute(0, 2, 1)  # (batch_size, seq_len, embed_dim)
-
-        x = self.activation(x)
         x = self.out_proj(x)  # (batch_size, seq_len, embed_dim)
 
         return x
 
 
 class FeedforwardModule(torch.nn.Module):
-    """
-    Feedforward module in Zipformer2 encoder.
-    """
+    """Apply one Swoosh-L Zipformer feed-forward branch."""
 
-    def __init__(
-        self, embed_dim: int, feedforward_dim: int, device: torch.device
-    ) -> None:
-        """
-        FeedforwardModule initialization.
+    def __init__(self, embed_dim: int, feedforward_dim: int) -> None:
+        """Initialize input and output projections.
 
         Parameters
         ----------
@@ -587,30 +618,26 @@ class FeedforwardModule(torch.nn.Module):
             for the input and output.
         feedforward_dim : int
             The module hidden dimension.
-        device : torch.device
-            The device used to store the layer weights. Should be
-            either torch.device("cpu") or torch.device("cuda").
         """
 
         super().__init__()
 
-        self.in_proj = torch.nn.Linear(embed_dim, feedforward_dim, device=device)
+        self.in_proj = torch.nn.Linear(embed_dim, feedforward_dim)
         self.activation = SwooshL()
-        self.out_proj = torch.nn.Linear(feedforward_dim, embed_dim, device=device)
+        self.out_proj = torch.nn.Linear(feedforward_dim, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Does a forward pass of the FeedforwardModule.
+        """Apply the feed-forward branch.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input features of shape ``(batch_size, seq_len, embed_dim)``.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Output with the same shape as ``x``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Output with the same shape and dtype as ``x``.
         """
 
         x = self.in_proj(x)
@@ -621,47 +648,39 @@ class FeedforwardModule(torch.nn.Module):
 
 
 class BypassModule(torch.nn.Module):
-    """
-    A bypass module that implements a learnable bypass scale for each input channel.
-    """
+    """Apply a checkpointed bypass scale to each input channel."""
 
-    def __init__(self, num_channels: int, device: torch.device) -> None:
-        """
-        BypassModule initialization.
+    def __init__(self, num_channels: int) -> None:
+        """Initialize one learned scale per channel.
 
         Parameters
         ----------
         num_channels : int
-            The number of input channels, corresponds to the number of learnable bypass
-            scales.
-        device : torch.device
-            The device used to store the layer weights. Should be
-            either torch.device("cpu") or torch.device("cuda").
+            The number of input channels and corresponding bypass scales.
         """
 
         super().__init__()
-        self.bypass_scale = torch.nn.Parameter(
-            torch.ones(num_channels, dtype=torch.float32, device=device),
+        self.register_buffer(
+            "bypass_scale", torch.ones(num_channels, dtype=torch.float32)
         )
 
     def forward(self, x_early: torch.Tensor, x_later: torch.Tensor) -> torch.Tensor:
-        """
-        Does a forward pass of the BypassModule.
+        """Interpolate between early and later representations.
 
         Parameters
         ----------
-        x_early : torch.Tensor[torch.float32]
+        x_early : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input of shape ``(batch_size, seq_len, num_channels)``.
             The module input that will be propagated with (1 - self.bypass_scale)
             weight.
-        x_later : torch.Tensor[torch.float32]
+        x_later : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input of shape ``(batch_size, seq_len, num_channels)``.
             The module input that will be propagated with self.bypass_scale weight.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Combined output with the same shape as both inputs.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Combined output with the same shape and dtype as both inputs.
         """
 
         # This is just a slightly more efficient implementation of
@@ -670,75 +689,69 @@ class BypassModule(torch.nn.Module):
 
 
 class SimpleDownsample(torch.nn.Module):
-    """
-    A downsample layer, does downsampling by weighted sum aggregation.
-    """
+    """Downsample time with checkpointed normalized aggregation weights."""
 
-    def __init__(self, downsample: int, device: torch.device) -> None:
-        """
-        SimpleDownsample initialization.
+    def __init__(self, downsample: int) -> None:
+        """Initialize the checkpointed aggregation logits.
 
         Parameters
         ----------
         downsample : int
             The module downsampling factor.
-        device : torch.device
-            The device used to store the layer weights.
-            Either torch.device("cpu") or torch.device("cuda").
         """
 
         super().__init__()
-        self.weights = torch.nn.Parameter(
-            torch.zeros(downsample, 1, dtype=torch.float32, device=device),
-        )
+        self.register_buffer("weights", torch.zeros(downsample, 1, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Does a forward pass of the SimpleDownsample module.
+        """Aggregate neighboring frames at the configured temporal factor.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
+        x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Input of shape ``(batch_size, seq_len, num_channels)``.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Downsampled output of shape
-            ``(batch_size, ceil(seq_len / downsample), num_channels)``.
+            ``(batch_size, ceil(seq_len / downsample), num_channels)`` with the same
+            dtype as ``x``.
         """
 
         downsample = self.weights.size(0)
         if downsample == 1:
             return x
 
-        batch_size, seq_len, in_channels = x.size()
-        downsampled_seq_len = (seq_len + downsample - 1) // downsample
+        if torch.onnx.is_in_onnx_export():
+            return torch.onnx.ops.symbolic(
+                ZIPFORMER_DOWNSAMPLE_PLUGIN_NAME,
+                (x, self.weights),
+                {"factor": downsample, "plugin_namespace": TENSORRT_PLUGIN_NAMESPACE},
+                dtype=x.dtype,
+                shape=(
+                    x.shape[0],
+                    (x.shape[1] + downsample - 1) // downsample,
+                    x.shape[2],
+                ),
+                version=ONNX_OPSET_VERSION,
+            )
 
-        # Always append enough copies of the final frame, then select the exact
-        # multiple required by the reshape.
-        pad = x[:, seq_len - 1 : seq_len, :].expand(
-            batch_size, downsample - 1, in_channels
-        )
-        x = torch.cat((x, pad), dim=1)
-        x = x[:, : downsampled_seq_len * downsample, :]
-
-        # (batch_size, seq_len, in_channels)
-        # -> (batch_size, seq_len // downsample, downsample, in_channels)
-        x = x.reshape(batch_size, downsampled_seq_len, downsample, in_channels)
+        batch_size, sequence_length, channels = x.shape
+        output_length = (sequence_length + downsample - 1) // downsample
+        x = torch.nn.functional.pad(x, (0, 0, 0, downsample - 1), mode="replicate")
+        x = x[:, : output_length * downsample]
+        x = x.reshape(batch_size, output_length, downsample, channels)
         x = torch.sum(x * self.weights, dim=2)
 
         return x
 
 
 class SimpleUpsample(torch.nn.Module):
-    """
-    An upsample layer, does upsampling by repeating the input frames.
-    """
+    """Repeat downsampled frames and combine them with a bypass input."""
 
     def __init__(self, upsample: int) -> None:
-        """
-        SimpleUpsample initialization.
+        """Initialize the temporal upsampling factor.
 
         Parameters
         ----------
@@ -749,24 +762,42 @@ class SimpleUpsample(torch.nn.Module):
         super().__init__()
         self.upsample = upsample
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Does a forward pass of the SimpleUpsample module.
+    def forward(
+        self, x_early: torch.Tensor, x_later: torch.Tensor, bypass_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Upsample the later representation and apply the bypass scale.
 
         Parameters
         ----------
-        x : torch.Tensor[torch.float32]
-            Input of shape ``(batch_size, seq_len, num_channels)``.
+        x_early : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Bypass input with shape ``(batch_size, seq_len, num_channels)``.
+        x_later : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Downsampled input with shape
+            ``(batch_size, ceil(seq_len / upsample), num_channels)``.
+        bypass_scale : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Per-channel interpolation scale with shape ``(num_channels,)``.
 
         Returns
         -------
-        torch.Tensor[torch.float32]
-            Output of shape ``(batch_size, seq_len * upsample, num_channels)``.
+        torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
+            Upsampled and combined output with the same shape and dtype as ``x_early``.
         """
 
-        if self.upsample == 1:
-            return x
+        if torch.onnx.is_in_onnx_export():
+            return torch.onnx.ops.symbolic(
+                ZIPFORMER_UPSAMPLE_BYPASS_PLUGIN_NAME,
+                (x_early, x_later, bypass_scale),
+                {
+                    "factor": self.upsample,
+                    "plugin_namespace": TENSORRT_PLUGIN_NAMESPACE,
+                },
+                dtype=x_early.dtype,
+                shape=x_early.shape,
+                version=ONNX_OPSET_VERSION,
+            )
 
-        x = torch.repeat_interleave(x, self.upsample, dim=1)
+        if self.upsample > 1:
+            x_later = torch.repeat_interleave(x_later, self.upsample, dim=1)
+            x_later = x_later[:, : x_early.size(1)]
 
-        return x
+        return x_early + (x_later - x_early) * bypass_scale

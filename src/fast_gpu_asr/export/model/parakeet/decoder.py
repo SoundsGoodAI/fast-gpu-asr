@@ -1,5 +1,5 @@
-#!/bin/env python3
-# Copyright SoundsGoodAI 2026
+#!/usr/bin/env python3
+# Copyright SoundsGoodAI 2026 - Daniil Kulko
 """TDT decoder and joiner modules used by Parakeet."""
 
 import torch
@@ -16,9 +16,9 @@ class Decoder(torch.nn.Module):
         joiner_dim: int,
         pred_rnn_layers: int,
         num_extra_outputs: int,
+        dtype: torch.dtype,
     ) -> None:
-        """
-        Decoder initialization.
+        """Initialize the TDT prediction network and joiner.
 
         Parameters
         ----------
@@ -34,22 +34,26 @@ class Decoder(torch.nn.Module):
             The number of prediction network LSTM layers.
         num_extra_outputs : int
             The number of TDT duration outputs after the vocabulary and blank outputs.
+        dtype : torch.dtype
+            Floating-point dtype used by the prediction network and joiner.
+            Supported values are ``torch.float32``, ``torch.float16``, and
+            ``torch.bfloat16``.
         """
 
         super().__init__()
 
-        device = torch.device("cpu")
         self.vocab_size = vocab_size
+
         self.embedding = torch.nn.Embedding(
-            vocab_size + 1, decoder_dim, padding_idx=vocab_size, device=device
+            vocab_size + 1, decoder_dim, padding_idx=vocab_size, dtype=dtype
         )
         self.lstm = torch.nn.LSTM(
-            decoder_dim, decoder_dim, num_layers=pred_rnn_layers, device=device
+            decoder_dim, decoder_dim, num_layers=pred_rnn_layers, dtype=dtype
         )
-        self.decoder_proj = torch.nn.Linear(decoder_dim, joiner_dim, device=device)
-        self.encoder_proj = torch.nn.Linear(encoder_dim, joiner_dim, device=device)
+        self.decoder_proj = torch.nn.Linear(decoder_dim, joiner_dim, dtype=dtype)
+        self.encoder_proj = torch.nn.Linear(encoder_dim, joiner_dim, dtype=dtype)
         self.output_proj = torch.nn.Linear(
-            joiner_dim, vocab_size + 1 + num_extra_outputs, device=device
+            joiner_dim, vocab_size + 1 + num_extra_outputs, dtype=dtype
         )
 
     def forward(
@@ -58,19 +62,23 @@ class Decoder(torch.nn.Module):
         targets: torch.Tensor,
         input_states_1: torch.Tensor,
         input_states_2: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Run the TDT prediction network and joiner for all active hypotheses.
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run the TDT prediction network and joiner for all active hypotheses.
 
         Parameters
         ----------
-        encoder_output : torch.Tensor[torch.float32]
+        encoder_output : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Encoder output with shape ``(num_hyps, encoder_dim)``.
         targets : torch.Tensor[torch.int32]
             Token input with shape ``(num_hyps, 1)``.
-        input_states_1 : torch.Tensor[torch.float32]
+        input_states_1 : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             LSTM hidden state with shape ``(pred_rnn_layers, num_hyps, decoder_dim)``.
-        input_states_2 : torch.Tensor[torch.float32]
+        input_states_2 : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             LSTM cell state with shape ``(pred_rnn_layers, num_hyps, decoder_dim)``.
 
         Returns
@@ -78,15 +86,19 @@ class Decoder(torch.nn.Module):
         tuple[
             torch.Tensor[torch.float32],
             torch.Tensor[torch.float32],
-            torch.Tensor[torch.float32],
-            torch.Tensor[torch.float32],
+            torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16],
+            torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16],
         ]
-            A tuple of four float tensors:
-            - token and blank log probabilities of shape ``(num_hyps, vocab_size + 1)``.
-            - duration log probabilities of shape ``(num_hyps, num_extra_outputs)``.
-            - output LSTM hidden state with shape
+            A tuple containing:
+            - ``torch.float32`` token and blank log probabilities with shape
+              ``(num_hyps, vocab_size + 1)``. The final column is the blank.
+            - ``torch.float32`` duration log probabilities with shape
+              ``(num_hyps, num_extra_outputs)``.
+            - Output LSTM hidden state with the same floating-point dtype as
+              ``input_states_1`` and shape
               ``(pred_rnn_layers, num_hyps, decoder_dim)``.
-            - output LSTM cell state with shape
+            - Output LSTM cell state with the same floating-point dtype as
+              ``input_states_2`` and shape
               ``(pred_rnn_layers, num_hyps, decoder_dim)``.
         """
 
@@ -99,9 +111,16 @@ class Decoder(torch.nn.Module):
         joiner_out = self.output_proj(
             torch.nn.functional.relu(encoder_out + decoder_out)
         )
-        token_log_probs = torch.log_softmax(joiner_out[:, : self.vocab_size + 1], dim=1)
+        token_log_probs = torch.log_softmax(
+            joiner_out[:, : self.vocab_size + 1].to(torch.float32), dim=1
+        )
         duration_log_probs = torch.log_softmax(
-            joiner_out[:, self.vocab_size + 1 :], dim=1
+            joiner_out[:, self.vocab_size + 1 :].to(torch.float32), dim=1
         )
 
-        return token_log_probs, duration_log_probs, output_states_1, output_states_2
+        return (
+            token_log_probs,
+            duration_log_probs,
+            output_states_1,
+            output_states_2,
+        )

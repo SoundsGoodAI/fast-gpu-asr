@@ -5,3 +5,4 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+src/fast_gpu_asr/tensorrt_plugins/*.so

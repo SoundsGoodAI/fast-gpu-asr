@@ -18,8 +18,8 @@ The runtime is designed for throughput-oriented GPU inference:
 - a second fixed-capacity TensorRT engine for prediction-network and joiner
   inference;
 - batched Zipformer modified beam search;
-- batched transducer and CTC greedy search;
-- batched Parakeet TDT greedy and modified beam search with recurrent states
+- batched transducer beam-one search and CTC greedy search;
+- batched Parakeet TDT modified beam search with recurrent states
   retained on the GPU;
 - reusable CuPy device buffers and pinned host buffers;
 - no Icefall or NeMo dependency at inference time.
@@ -92,16 +92,24 @@ decoder type is stored in the bundle's
 the model sample rate, vocabulary size, beam, blank penalty, and
 model-specific decoder parameters.
 
-Zipformer transducer greedy search uses modified beam search with `beam=1`.
-Parakeet `transducer_greedy_search` also forces `beam=1` at export time and
-uses a dedicated GPU TDT label-looping kernel internally. Parakeet modified
-beam search with `beam=1` uses the same greedy runtime path.
+`transducer_greedy_search` is the transducer beam-one mode: exporters force
+`beam=1`, and the runtime still uses the same modified-beam implementation as
+larger transducer beams. This applies to both Zipformer and Parakeet bundles.
+Here "modified" follows the Icefall RNN-T implementation: it limits the maximum
+number of emitted symbols per encoder frame to one. At each frame, the decoder
+scores the current hypotheses against every vocabulary token, adds the
+accumulated hypothesis scores, keeps the top `beam` candidates from the
+flattened hypothesis-by-vocabulary table, appends non-blank/non-unknown tokens,
+and merges identical token histories with log-sum-exp. It is lighter than full
+RNN-T beam search because it does not repeatedly expand labels within one
+encoder frame. For Parakeet TDT, the same idea is adapted to include duration
+outputs.
 
 ## Zipformer Export
 
 The Zipformer exporter loads `model.pt`, `config.yaml`, and `bpe.model` from
 one directory. Its encoder engine combines a Kaldi-compatible filterbank
-frontend with the condensed Zipformer encoder. Greedy transducer bundles use
+frontend with the condensed Zipformer encoder. Transducer beam-one bundles use
 one modified-beam hypothesis per utterance, larger-beam bundles reserve
 `batch_size * beam` slots, and CTC bundles do not contain a decoder engine.
 
@@ -140,8 +148,8 @@ smaller-batch engine for the long tail. For example, batch 32 with a 40-second
 maximum covers the public short-form leaderboard clips without forcing every
 short utterance through a long-duration profile.
 
-Use `--decoder-type transducer_greedy_search` for Parakeet greedy bundles; the
-exporter sets `--beam` to 1 automatically. Use
+Use `--decoder-type transducer_greedy_search` for Parakeet transducer beam-one
+bundles; the exporter sets `--beam` to 1 automatically. Use
 `--decoder-type transducer_modified_beam_search` for larger search beams.
 
 ## Benchmark
@@ -186,7 +194,7 @@ The Parakeet measurements use a batch-128 engine optimized for 15-second
 audio with a 19-second maximum, plus a batch-32 fallback engine with a
 40-second maximum. The seven cleaned public datasets contain 580,586 seconds
 of audio. Timing covers input batching, host-to-device transfer, feature
-extraction, FastConformer encoding, TDT greedy decoding, and tokenization; it
+extraction, FastConformer encoding, TDT modified beam search, and tokenization; it
 does not include WAV loading or WER report generation.
 
 | Model | Runtime | Audio | RTFx | Leaderboard RTFx | Gain |
@@ -208,7 +216,7 @@ The exported v2 model reproduces the current leaderboard WERs within
 | VoxPopuli-AA-Cleaned | 3.78 | 3.85 | 3.19 | 3.07 |
 
 Parakeet v3 is exported from the original `.nemo` archive. Production bundles
-can use the TDT greedy or modified beam-search runtime.
+use the TDT modified beam-search runtime, including beam-one bundles.
 
 ## Development
 

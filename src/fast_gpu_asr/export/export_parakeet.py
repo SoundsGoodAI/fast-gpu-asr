@@ -23,13 +23,14 @@ from ..constants import (
     MODEL_CONFIG_FILE,
     MODEL_TYPE_PARAKEET,
     ONNX_OPSET_VERSION,
+    PARAKEET_DECODER_ONNX_FILE,
+    PARAKEET_DECODER_TENSORRT_FILE,
     PARAKEET_ONNX_FILE,
     PARAKEET_TENSORRT_FILE,
-    TDT_DECODER_ONNX_FILE,
-    TDT_DECODER_TENSORRT_FILE,
+    PRECISION_DTYPES,
     TRANSDUCER_DECODER_TYPES,
 )
-from ..utils import validate_runtime_config
+from ..utils import validate_model, validate_model_config
 from .export_utils import (
     build_tensorrt_engine,
     remove_onnx_artifacts,
@@ -83,7 +84,30 @@ def parse_args() -> argparse.Namespace:
         "--beam",
         type=int,
         required=True,
-        help="Modified-beam hypotheses per utterance; greedy search forces beam 1.",
+        help=(
+            "Beam width used by modified beam search; transducer_greedy_search "
+            "forces beam 1."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-precision",
+        type=str,
+        choices=tuple(PRECISION_DTYPES),
+        default="fp32",
+        help=(
+            "Floating-point precision used by Parakeet subsampling and Conformer "
+            "layers; feature extraction remains fp32."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-precision",
+        type=str,
+        choices=tuple(PRECISION_DTYPES),
+        default="fp32",
+        help=(
+            "Floating-point precision used internally by the Parakeet prediction "
+            "network and joiner."
+        ),
     )
     parser.add_argument(
         "--min-audio-seconds",
@@ -104,10 +128,10 @@ def parse_args() -> argparse.Namespace:
         help="Maximum audio duration supported by the TensorRT profile.",
     )
     parser.add_argument(
-        "--workspace-gib",
-        type=float,
-        default=8.0,
-        help="TensorRT workspace limit in GiB.",
+        "--optimization-level",
+        type=int,
+        default=5,
+        help="TensorRT builder optimization level.",
     )
     parser.add_argument(
         "--debug",
@@ -210,7 +234,10 @@ def adjust_state_dict(
 
     Prediction-network and joiner prefixes are renamed to match :class:`Decoder`.
     Pointwise Conv1d weights are squeezed to the matrix shape expected by the
-    equivalent linear layers in the condensed encoder.
+    equivalent linear layers in the condensed encoder. Attention query, key,
+    and value weights are concatenated for one fused projection. The Macaron
+    FFN output factor is folded into each second projection to remove runtime
+    scaling.
 
     Parameters
     ----------
@@ -252,13 +279,38 @@ def adjust_state_dict(
                     f"(out_channels, in_channels, 1), got {tuple(value.shape)}.",
                 )
             value = value.squeeze(2)
+        if key.endswith(
+            ("feed_forward1.linear2.weight", "feed_forward2.linear2.weight"),
+        ):
+            value = value * 0.5
         adjusted_state_dict[key] = value
+
+    query_suffix = ".self_attn.linear_q.weight"
+    for query_key in tuple(adjusted_state_dict):
+        if not query_key.endswith(query_suffix):
+            continue
+
+        prefix = query_key.removesuffix(query_suffix)
+        key_key = f"{prefix}.self_attn.linear_k.weight"
+        value_key = f"{prefix}.self_attn.linear_v.weight"
+        adjusted_state_dict[f"{prefix}.self_attn.linear_qkv.weight"] = torch.cat(
+            (
+                adjusted_state_dict.pop(query_key),
+                adjusted_state_dict.pop(key_key),
+                adjusted_state_dict.pop(value_key),
+            ),
+            dim=0,
+        )
 
     return adjusted_state_dict
 
 
 def make_model(
-    model_config: DictConfig, state_dict: OrderedDict[str, torch.Tensor]
+    model_config: DictConfig,
+    state_dict: OrderedDict[str, torch.Tensor],
+    subsampling_batch_partitions: int,
+    encoder_dtype: torch.dtype,
+    decoder_dtype: torch.dtype,
 ) -> tuple[ParakeetTDTEncoder, Decoder]:
     """Construct condensed Parakeet modules and load checkpoint weights.
 
@@ -268,6 +320,13 @@ def make_model(
         Validated Parakeet model configuration.
     state_dict : OrderedDict[str, torch.Tensor]
         Converted checkpoint state dictionary from :func:`adjust_state_dict`.
+    subsampling_batch_partitions : int
+        Number of batch partitions used across the three-convolution
+        subsampling frontend to avoid TensorRT's CASK ``int32`` element limit.
+    encoder_dtype : torch.dtype
+        Floating-point dtype used internally by the encoder.
+    decoder_dtype : torch.dtype
+        Floating-point dtype used internally by the prediction network and joiner.
 
     Returns
     -------
@@ -298,6 +357,8 @@ def make_model(
         n_heads=model_config.encoder.n_heads,
         pos_emb_max_len=model_config.encoder.pos_emb_max_len,
         conv_kernel_size=model_config.encoder.conv_kernel_size,
+        subsampling_batch_partitions=subsampling_batch_partitions,
+        dtype=encoder_dtype,
     )
     encoder_state_dict = OrderedDict(
         (key, value) for key, value in state_dict.items() if key.startswith("encoder.")
@@ -312,6 +373,7 @@ def make_model(
         joiner_dim=model_config.joint.jointnet.joint_hidden,
         pred_rnn_layers=model_config.decoder.prednet.pred_rnn_layers,
         num_extra_outputs=model_config.joint.num_extra_outputs,
+        dtype=decoder_dtype,
     )
     decoder_state_dict = OrderedDict(
         (key, value)
@@ -324,6 +386,55 @@ def make_model(
     decoder.eval()
 
     return encoder, decoder
+
+
+def get_subsampling_batch_partitions(
+    model_config: DictConfig, args: argparse.Namespace
+) -> int:
+    """Determine a CASK-safe batch partition count for subsampling.
+
+    TensorRT CASK convolution tactics use signed 32-bit element offsets. The
+    first-convolution output is the largest intermediate tensor in the
+    three-convolution frontend. This helper derives its shape from the maximum
+    audio profile and partitions the entire frontend when that tensor would
+    contain more than ``2**31`` elements.
+
+    Parameters
+    ----------
+    model_config : DictConfig
+        Validated source Parakeet configuration containing feature extraction
+        and encoder dimensions.
+    args : argparse.Namespace
+        Validated export arguments containing the batch size and maximum audio
+        duration.
+
+    Returns
+    -------
+    int
+        Smallest partition count for which every subsampling batch partition
+        stays within the CASK element limit.
+    """
+
+    sample_rate = model_config.preprocessor.sample_rate
+    hop_length = round(model_config.preprocessor.window_stride * sample_rate)
+    max_samples = round(args.max_audio_seconds * sample_rate)
+    feature_frames = max_samples // hop_length + 1
+    conv1_frames = (feature_frames + 1) // 2
+    conv1_features = (model_config.preprocessor.features + 1) // 2
+    elements_per_item = (
+        model_config.encoder.subsampling_conv_channels * conv1_frames * conv1_features
+    )
+    cask_element_limit = 1 << 31
+
+    partitions = (
+        args.batch_size * elements_per_item + cask_element_limit - 1
+    ) // cask_element_limit
+    while (
+        args.batch_size + partitions - 1
+    ) // partitions * elements_per_item > cask_element_limit:
+        partitions += 1
+
+    return partitions
 
 
 def make_runtime_config(
@@ -353,6 +464,7 @@ def make_runtime_config(
             "blank_id": model_config.decoder.vocab_size,
             "audio_encoder_params": {
                 "feature_dim": model_config.preprocessor.features,
+                "frame_shift_ms": round(model_config.preprocessor.window_stride * 1000),
                 "n_layers": model_config.encoder.n_layers,
                 "model_dim": model_config.encoder.d_model,
                 "pos_emb_max_len": model_config.encoder.pos_emb_max_len,
@@ -374,7 +486,7 @@ def make_runtime_config(
             },
         },
     )
-    validate_runtime_config(runtime_config)
+    validate_model_config(runtime_config)
     return runtime_config
 
 
@@ -386,9 +498,9 @@ def export_model_to_onnx(
 ) -> tuple[Path, Path]:
     """Export fixed-batch Parakeet encoder and decoder ONNX graphs.
 
-    The encoder accepts a fixed number of padded waveforms while allowing the
-    waveform duration to vary. The decoder is fully static and reserves
-    ``batch_size * beam`` hypothesis slots.
+    The encoder accepts a fixed number of padded waveforms and their valid sample
+    counts while allowing waveform duration to vary. The decoder is fully static
+    and reserves ``batch_size * beam`` hypothesis slots.
 
     Parameters
     ----------
@@ -409,23 +521,24 @@ def export_model_to_onnx(
     """
 
     encoder_path = args.output_dir / PARAKEET_ONNX_FILE
-    decoder_path = args.output_dir / TDT_DECODER_ONNX_FILE
+    decoder_path = args.output_dir / PARAKEET_DECODER_ONNX_FILE
 
-    dummy_samples = round(args.opt_audio_seconds * model_config.sample_rate)
-    audio = torch.zeros(args.batch_size, dummy_samples, dtype=torch.float32)
-    audio_lengths = torch.full((args.batch_size,), dummy_samples, dtype=torch.int32)
+    # Use the profile optimum as the Dynamo example. At the minimum duration,
+    # subsampling produces singleton dimensions that ONNX shape propagation may
+    # specialize even though waveform time is dynamic.
+    audio_samples = round(args.opt_audio_seconds * model_config.sample_rate)
+    audio = torch.zeros(args.batch_size, audio_samples, dtype=torch.float32)
+    audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int32)
 
     logger.info("Exporting the batched Parakeet encoder to %s.", encoder_path)
     with torch.inference_mode():
         torch.onnx.export(
-            torch.jit.script(encoder),
+            encoder,
             (audio, audio_lengths),
-            str(encoder_path),
-            dynamo=False,
-            external_data=True,
-            dynamic_axes={
-                "audio": {1: "num_samples"},
-                "encoder_output": {1: "num_encoder_frames"},
+            encoder_path,
+            dynamic_shapes={
+                "audio": {1: torch.export.Dim.DYNAMIC},
+                "audio_lengths": {},
             },
             input_names=("audio", "audio_lengths"),
             output_names=("encoder_output", "encoder_output_lengths"),
@@ -436,23 +549,29 @@ def export_model_to_onnx(
     pred_rnn_layers = model_config.decoder.prednet.pred_rnn_layers
     decoder_dim = model_config.decoder.prednet.pred_hidden
     encoder_dim = model_config.joint.jointnet.encoder_hidden
+    decoder_dtype = decoder.output_proj.weight.dtype
 
     logger.info("Exporting the batched TDT decoder to %s.", decoder_path)
     with torch.inference_mode():
         torch.onnx.export(
-            torch.jit.script(decoder),
+            decoder,
             (
-                torch.zeros(decoder_batch, encoder_dim, dtype=torch.float32),
+                torch.zeros(decoder_batch, encoder_dim, dtype=decoder_dtype),
                 torch.zeros(decoder_batch, 1, dtype=torch.int32),
                 torch.zeros(
-                    pred_rnn_layers, decoder_batch, decoder_dim, dtype=torch.float32
+                    pred_rnn_layers,
+                    decoder_batch,
+                    decoder_dim,
+                    dtype=decoder_dtype,
                 ),
                 torch.zeros(
-                    pred_rnn_layers, decoder_batch, decoder_dim, dtype=torch.float32
+                    pred_rnn_layers,
+                    decoder_batch,
+                    decoder_dim,
+                    dtype=decoder_dtype,
                 ),
             ),
-            str(decoder_path),
-            dynamo=False,
+            decoder_path,
             input_names=(
                 "encoder_output",
                 "targets",
@@ -500,7 +619,9 @@ def export_parakeet(args: argparse.Namespace) -> None:
     if args.decoder_type == "transducer_greedy_search":
         if args.beam != 1:
             logger.warning(
-                "Overriding beam=%s with beam=1 for %s.", args.beam, args.decoder_type
+                "Overriding beam=%s with beam=1 because %s requires beam 1.",
+                args.beam,
+                args.decoder_type,
             )
         args.beam = 1
 
@@ -525,7 +646,22 @@ def export_parakeet(args: argparse.Namespace) -> None:
             checkpoint_path, map_location=torch.device("cpu"), weights_only=True
         )
         state_dict = adjust_state_dict(state_dict)
-        encoder, decoder = make_model(model_config, state_dict)
+        subsampling_batch_partitions = get_subsampling_batch_partitions(
+            model_config, args
+        )
+        if subsampling_batch_partitions > 1:
+            logger.info(
+                "Splitting Parakeet convolutional subsampling into %s batch "
+                "partitions to stay within TensorRT's CASK element limit.",
+                subsampling_batch_partitions,
+            )
+        encoder, decoder = make_model(
+            model_config,
+            state_dict,
+            subsampling_batch_partitions,
+            PRECISION_DTYPES[args.encoder_precision],
+            PRECISION_DTYPES[args.decoder_precision],
+        )
         del state_dict
 
         shutil.copyfile(tokenizer_path, args.output_dir / "bpe.model")
@@ -546,19 +682,20 @@ def export_parakeet(args: argparse.Namespace) -> None:
     encoder_profiles = {
         "audio": tuple((args.batch_size, samples) for samples in audio_samples),
     }
-    workspace_bytes = round(args.workspace_gib * 2**30)
     build_tensorrt_engine(
         encoder_onnx_path,
         args.output_dir / PARAKEET_TENSORRT_FILE,
         encoder_profiles,
-        workspace_bytes,
+        args.optimization_level,
     )
     build_tensorrt_engine(
         decoder_onnx_path,
-        args.output_dir / TDT_DECODER_TENSORRT_FILE,
+        args.output_dir / PARAKEET_DECODER_TENSORRT_FILE,
         {},
-        workspace_bytes,
+        args.optimization_level,
     )
+
+    validate_model(args.output_dir, runtime_config)
 
     if not args.debug:
         remove_onnx_artifacts(encoder_onnx_path)

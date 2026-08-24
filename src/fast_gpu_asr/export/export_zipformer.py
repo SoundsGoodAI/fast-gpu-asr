@@ -24,19 +24,20 @@ from ..constants import (
     MODEL_CONFIG_FILE,
     MODEL_TYPE_ZIPFORMER,
     ONNX_OPSET_VERSION,
+    PRECISION_DTYPES,
+    ZIPFORMER_DECODER_CONTEXTS_FILE,
     ZIPFORMER_DECODER_ONNX_FILE,
     ZIPFORMER_DECODER_TENSORRT_FILE,
     ZIPFORMER_ONNX_FILE,
     ZIPFORMER_TENSORRT_FILE,
 )
-from ..utils import validate_runtime_config
+from ..utils import validate_model, validate_model_config
 from .export_utils import (
     build_tensorrt_engine,
-    prepare_onnx_for_tensorrt,
     remove_onnx_artifacts,
     validate_zipformer,
 )
-from .model.zipformer.decoder import Decoder
+from .model.zipformer.decoder import Decoder, Joiner
 from .model.zipformer.zipformer import Zipformer2
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,30 @@ def parse_args() -> argparse.Namespace:
         "--beam",
         type=int,
         required=True,
-        help="Modified-beam hypotheses per utterance; greedy search forces beam 1.",
+        help=(
+            "Beam width used by modified beam search; greedy-search decoders "
+            "force beam 1."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-precision",
+        type=str,
+        choices=tuple(PRECISION_DTYPES),
+        default="fp32",
+        help=(
+            "Floating-point precision used by Zipformer subsampling and encoder "
+            "stacks; feature extraction remains fp32."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-precision",
+        type=str,
+        choices=tuple(PRECISION_DTYPES),
+        default="fp32",
+        help=(
+            "Floating-point precision used by the predictor context cache and "
+            "transducer joiner."
+        ),
     )
     parser.add_argument(
         "--min-audio-seconds",
@@ -105,10 +129,10 @@ def parse_args() -> argparse.Namespace:
         help="Maximum audio duration supported by the TensorRT profile.",
     )
     parser.add_argument(
-        "--workspace-gib",
-        type=float,
-        default=8.0,
-        help="TensorRT workspace limit in GiB.",
+        "--optimization-level",
+        type=int,
+        default=5,
+        help="TensorRT builder optimization level.",
     )
     parser.add_argument(
         "--debug",
@@ -144,6 +168,10 @@ def adjust_state_dict(
     KeyError
         Raised when the checkpoint lacks the first encoder attention projection
         required to infer its channel dimension.
+    ValueError
+        Raised when a ConvNeXt pointwise convolution does not have a singleton
+        two-dimensional kernel and therefore cannot be represented by a linear
+        layer.
     """
 
     adjusted_state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
@@ -160,10 +188,13 @@ def adjust_state_dict(
 
         key = (
             key.replace("encoder_embed", "subsampling")
-            .replace("subsampling.conv.4.weight", "subsampling.conv.2.weight")
-            .replace("subsampling.conv.4.bias", "subsampling.conv.2.bias")
-            .replace("subsampling.conv.7.weight", "subsampling.conv.4.weight")
-            .replace("subsampling.conv.7.bias", "subsampling.conv.4.bias")
+            .replace("subsampling.conv.0.weight", "subsampling.conv1.weight")
+            .replace("subsampling.conv.0.bias", "subsampling.conv1.bias")
+            .replace("subsampling.conv.4.weight", "subsampling.conv2.weight")
+            .replace("subsampling.conv.4.bias", "subsampling.conv2.bias")
+            .replace("subsampling.conv.7.weight", "subsampling.conv3.weight")
+            .replace("subsampling.conv.7.bias", "subsampling.conv3.bias")
+            .replace("subsampling.convnext.", "subsampling.")
             .replace("downsample.bias", "downsample.weights")
             .replace("downsample_output.bias", "downsample_output.weights")
             .replace("encoder.layers", "layers")
@@ -173,18 +204,29 @@ def adjust_state_dict(
             .replace("encoders.3", "encoder_4")
             .replace("encoders.4", "encoder_5")
             .replace("encoders.5", "encoder_6")
+            .replace("out_combiner.bypass_scale", "bypass_scale")
             .replace("joiner.encoder_proj", "projection_output")
         )
         if key.startswith("encoder."):
             key = key.removeprefix("encoder.")
         if bypass_scale_pattern.fullmatch(key):
             continue
+        if key in (
+            "subsampling.pointwise_conv1.weight",
+            "subsampling.pointwise_conv2.weight",
+        ):
+            if value.ndim != 4 or value.shape[2:] != (1, 1):
+                raise ValueError(
+                    f"Expected pointwise Conv2d weight {key} to have shape "
+                    f"(out_channels, in_channels, 1, 1), got {tuple(value.shape)}.",
+                )
+            value = value[:, :, 0, 0]
         adjusted_state_dict[key] = value
 
     encoder_1_dim = adjusted_state_dict[
         "encoder_1.layers.0.self_attn_weights.in_proj.weight"
     ].size(1)
-    adjusted_state_dict["encoder_1.out_combiner.bypass_scale"] = torch.ones(
+    adjusted_state_dict["encoder_1.bypass_scale"] = torch.ones(
         encoder_1_dim, dtype=torch.float32
     )
     adjusted_state_dict["encoder_1.downsample.weights"] = torch.zeros(
@@ -199,7 +241,10 @@ def make_model(
     vocab_size: int,
     pos_emb_max_len: int,
     decoder_type: str,
-) -> tuple[Zipformer2, Decoder | None]:
+    subsampling_batch_partitions: int,
+    encoder_dtype: torch.dtype,
+    decoder_dtype: torch.dtype,
+) -> tuple[Zipformer2, Decoder | None, Joiner | None]:
     """Construct condensed Zipformer modules and load checkpoint weights.
 
     Parameters
@@ -209,17 +254,24 @@ def make_model(
     state_dict : OrderedDict[str, torch.Tensor]
         Converted checkpoint state dictionary from :func:`adjust_state_dict`.
     vocab_size : int
-        Transducer output vocabulary size, excluding the unknown token.
+        Number of output tokens represented by the selected checkpoint head.
     pos_emb_max_len : int
         Maximum positional encoding length compiled into the encoder.
     decoder_type : str
         Decoder whose output head is included in the exported bundle.
+    subsampling_batch_partitions : int
+        Number of batch partitions used by the convolutional subsampling
+        frontend.
+    encoder_dtype : torch.dtype
+        Floating-point dtype used by the encoder.
+    decoder_dtype : torch.dtype
+        Floating-point dtype used by the predictor context cache and joiner.
 
     Returns
     -------
-    tuple[Zipformer2, Decoder | None]
-        Evaluation-mode waveform encoder and, for transducer modes, the merged
-        decoder and joiner.
+    tuple[Zipformer2, Decoder | None, Joiner | None]
+        Evaluation-mode waveform encoder and, for transducer modes, separate
+        predictor and joiner modules.
 
     Raises
     ------
@@ -241,6 +293,9 @@ def make_model(
     cnn_module_kernels = [
         int(value) for value in model_params.cnn_module_kernel.split(",")
     ]
+    bypass_scales = [
+        state_dict[f"encoder_{index}.bypass_scale"] for index in range(1, 7)
+    ]
 
     use_ctc = decoder_type == "ctc_greedy_search"
     projection_prefix = "ctc_output.1" if use_ctc else "projection_output"
@@ -258,12 +313,14 @@ def make_model(
         high_freq=mel_opts.high_freq,
         min_frames=model_config.min_encoder_input_frames,
         subsample_output_dim=state_dict["subsampling.out.weight"].size(0),
-        subsample_layer1_channels=state_dict["subsampling.conv.0.weight"].size(0),
-        subsample_layer2_channels=state_dict["subsampling.conv.2.weight"].size(0),
-        subsample_layer3_channels=state_dict["subsampling.conv.4.weight"].size(0),
+        subsample_layer1_channels=state_dict["subsampling.conv1.weight"].size(0),
+        subsample_layer2_channels=state_dict["subsampling.conv2.weight"].size(0),
+        subsample_layer3_channels=state_dict["subsampling.conv3.weight"].size(0),
+        subsampling_batch_partitions=subsampling_batch_partitions,
         encoder_dims=encoder_dims,
         num_encoder_layers=num_encoder_layers,
         downsampling_factors=downsampling_factors,
+        bypass_scales=bypass_scales,
         num_heads=num_heads,
         feedforward_dims=feedforward_dims,
         cnn_module_kernels=cnn_module_kernels,
@@ -274,6 +331,7 @@ def make_model(
         pos_max_len=pos_emb_max_len,
         output_dim=output_dim,
         use_ctc=use_ctc,
+        dtype=encoder_dtype,
     )
     encoder_state_dict = OrderedDict(
         (key, value)
@@ -290,36 +348,95 @@ def make_model(
     encoder.eval()
 
     if use_ctc:
-        return encoder, None
+        return encoder, None, None
 
     decoder = Decoder(
         vocab_size=vocab_size,
         decoder_dim=model_params.decoder_dim,
         joiner_dim=model_params.joiner_dim,
         context_size=model_params.context_size,
+        dtype=decoder_dtype,
     )
     decoder_state_dict = OrderedDict(
         (
             key.replace("decoder.embedding", "embedding")
             .replace("decoder.conv", "conv")
-            .replace("joiner.decoder_proj", "decoder_proj")
-            .replace("joiner.output_linear", "output_proj"),
+            .replace("joiner.decoder_proj", "decoder_proj"),
             value,
         )
         for key, value in state_dict.items()
         if key.startswith(
-            (
-                "decoder.embedding.",
-                "decoder.conv.",
-                "joiner.decoder_proj.",
-                "joiner.output_linear.",
-            )
+            ("decoder.embedding.", "decoder.conv.", "joiner.decoder_proj.")
         )
     )
     decoder.load_state_dict(decoder_state_dict, strict=True)
     decoder.eval()
 
-    return encoder, decoder
+    joiner = Joiner(model_params.joiner_dim, vocab_size, dtype=decoder_dtype)
+    joiner_state_dict = OrderedDict(
+        (key.replace("joiner.output_linear", "output_proj"), value)
+        for key, value in state_dict.items()
+        if key.startswith("joiner.output_linear.")
+    )
+    joiner.load_state_dict(joiner_state_dict, strict=True)
+    joiner.eval()
+
+    return encoder, decoder, joiner
+
+
+def get_subsampling_batch_partitions(
+    model_config: DictConfig, layer3_channels: int, args: argparse.Namespace
+) -> int:
+    """Determine a CASK-safe batch partition count for subsampling.
+
+    TensorRT CASK convolution tactics use signed 32-bit element offsets. This
+    helper derives the third-convolution output shape from the maximum audio
+    profile and partitions the batch when that tensor would contain more than
+    ``2**31`` elements. The third-convolution output is also the depthwise
+    convolution input and output, so the resulting partition count protects
+    both convolutions.
+
+    Parameters
+    ----------
+    model_config : DictConfig
+        Validated source Zipformer configuration containing feature extraction
+        and model dimensions.
+    layer3_channels : int
+        Number of output channels shared by the third subsampling convolution
+        output and the following depthwise convolution.
+    args : argparse.Namespace
+        Validated export arguments containing the batch size and maximum audio
+        duration.
+
+    Returns
+    -------
+    int
+        Smallest partition count for which every subsampling batch partition
+        stays within the CASK element limit.
+    """
+
+    frame_opts = model_config.feature_opts.frame_opts
+    frame_length = frame_opts.frame_length_ms * frame_opts.samp_freq // 1000
+    frame_shift = frame_opts.frame_shift_ms * frame_opts.samp_freq // 1000
+    conv_features = model_config.model_params.feature_dim
+
+    max_samples = round(args.max_audio_seconds * frame_opts.samp_freq)
+    reflected_samples = max_samples + frame_length - frame_shift // 2
+    feature_frames = (reflected_samples - frame_length) // frame_shift + 1
+    conv_frames = (feature_frames - 5) // 2 - 1
+    conv_features = ((conv_features - 3) // 2 - 2) // 2 + 1
+    elements_per_item = layer3_channels * conv_frames * conv_features
+    cask_element_limit = 1 << 31
+
+    partitions = (
+        args.batch_size * elements_per_item + cask_element_limit - 1
+    ) // cask_element_limit
+    while (
+        args.batch_size + partitions - 1
+    ) // partitions * elements_per_item > cask_element_limit:
+        partitions += 1
+
+    return partitions
 
 
 def make_runtime_config(
@@ -335,7 +452,7 @@ def make_runtime_config(
     model_config : DictConfig
         Validated source Zipformer configuration.
     vocab_size : int
-        Decoder vocabulary size excluding the SentencePiece unknown token.
+        Number of output tokens represented by the selected checkpoint head.
     pos_emb_max_len : int
         Maximum positional encoding length compiled into the encoder.
     args : argparse.Namespace
@@ -348,6 +465,8 @@ def make_runtime_config(
     """
 
     model_params = model_config.model_params
+    frame_opts = model_config.feature_opts.frame_opts
+    right_padding_samples = frame_opts.frame_length_ms * frame_opts.samp_freq // 2000
     decoder_params = {"beam": args.beam, "blank_penalty": 0.0}
     if args.decoder_type != "ctc_greedy_search":
         decoder_params.update(
@@ -362,7 +481,7 @@ def make_runtime_config(
         {
             "model_type": MODEL_TYPE_ZIPFORMER,
             "decoder_type": args.decoder_type,
-            "model_samplerate": model_config.feature_opts.frame_opts.samp_freq,
+            "model_samplerate": frame_opts.samp_freq,
             "vocab_size": vocab_size,
             "audio_encoder_params": {
                 "feature_dim": model_params.feature_dim,
@@ -384,6 +503,8 @@ def make_runtime_config(
                     if args.decoder_type == "ctc_greedy_search"
                     else model_params.joiner_dim
                 ),
+                "frame_shift_ms": frame_opts.frame_shift_ms,
+                "right_padding_samples": right_padding_samples,
                 "subsampling_factor": model_params.subsampling_factor,
                 "use_ctc": args.decoder_type == "ctc_greedy_search",
                 "min_audio_seconds": args.min_audio_seconds,
@@ -393,20 +514,24 @@ def make_runtime_config(
             "decoder_params": decoder_params,
         },
     )
-    validate_runtime_config(runtime_config)
+    validate_model_config(runtime_config)
     return runtime_config
 
 
 def export_model_to_onnx(
     encoder: Zipformer2,
     decoder: Decoder | None,
+    joiner: Joiner | None,
     model_config: DictConfig,
     args: argparse.Namespace,
 ) -> tuple[Path, Path | None]:
     """Export fixed-batch Zipformer encoder and decoder ONNX graphs.
 
     The encoder accepts a fixed number of padded waveforms while allowing their
-    shared sample capacity to vary. The decoder is fully static and reserves
+    shared sample capacity to vary. Its input includes reflected right context,
+    while ``audio_lengths`` retains the unpadded waveform lengths. For
+    transducer modes, the predictor is precomputed into a context table and the
+    exported ONNX decoder contains the fully static joiner with
     ``batch_size * beam`` hypothesis slots.
 
     Parameters
@@ -414,7 +539,9 @@ def export_model_to_onnx(
     encoder : Zipformer2
         Loaded waveform-to-encoder model.
     decoder : Decoder | None
-        Loaded stateless transducer decoder and joiner, or ``None`` for CTC.
+        Loaded stateless transducer predictor, or ``None`` for CTC.
+    joiner : Joiner | None
+        Loaded transducer joiner, or ``None`` for CTC.
     model_config : DictConfig
         Validated published model configuration.
     args : argparse.Namespace
@@ -425,26 +552,38 @@ def export_model_to_onnx(
     -------
     tuple[Path, Path | None]
         Paths to the encoder and optional transducer decoder ONNX graphs.
+
+    Raises
+    ------
+    RuntimeError
+        Raised when a transducer predictor is provided without its joiner.
     """
 
     encoder_path = args.output_dir / ZIPFORMER_ONNX_FILE
     decoder_path = args.output_dir / ZIPFORMER_DECODER_ONNX_FILE
 
     sample_rate = model_config.feature_opts.frame_opts.samp_freq
+    # Use the profile optimum as the Dynamo example. At the minimum duration,
+    # subsampling produces singleton dimensions that ONNX shape propagation may
+    # specialize even though waveform time is dynamic.
     audio_samples = round(args.opt_audio_seconds * sample_rate)
-    audio = torch.zeros(args.batch_size, audio_samples, dtype=torch.float32)
+    right_padding_samples = (
+        model_config.feature_opts.frame_opts.frame_length_ms * sample_rate // 2000
+    )
+    audio = torch.zeros(
+        args.batch_size, audio_samples + right_padding_samples, dtype=torch.float32
+    )
     audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int32)
 
     logger.info("Exporting the batched Zipformer encoder to %s.", encoder_path)
     with torch.inference_mode():
         torch.onnx.export(
-            torch.jit.script(encoder),
+            encoder,
             (audio, audio_lengths),
             encoder_path,
-            dynamo=False,
-            dynamic_axes={
-                "audio": {1: "num_samples"},
-                "encoder_output": {1: "num_encoder_frames"},
+            dynamic_shapes={
+                "audio": {1: torch.export.Dim.DYNAMIC},
+                "audio_lengths": {},
             },
             input_names=("audio", "audio_lengths"),
             output_names=("encoder_output", "encoder_output_lengths"),
@@ -453,28 +592,39 @@ def export_model_to_onnx(
 
     if decoder is None:
         return encoder_path, None
+    if joiner is None:
+        raise RuntimeError("The Zipformer transducer joiner was not initialized.")
 
+    context_lookup = decoder.make_context_lookup(chunk_size=8192)
+    context_lookup_path = args.output_dir / ZIPFORMER_DECODER_CONTEXTS_FILE
+    logger.info(
+        "Writing %s %s predictor contexts to %s.",
+        context_lookup.size(0),
+        context_lookup.dtype,
+        context_lookup_path,
+    )
+    torch.save(context_lookup, context_lookup_path)
     decoder_batch = args.batch_size
     if args.decoder_type == "transducer_modified_beam_search":
         decoder_batch *= args.beam
     logger.info("Exporting the batched Zipformer decoder to %s.", decoder_path)
+    decoder_dtype = joiner.output_proj.weight.dtype
     with torch.inference_mode():
         torch.onnx.export(
-            torch.jit.script(decoder),
+            joiner,
             (
                 torch.zeros(
                     decoder_batch,
-                    model_config.model_params.context_size,
-                    dtype=torch.int32,
+                    model_config.model_params.joiner_dim,
+                    dtype=decoder_dtype,
                 ),
                 torch.zeros(
                     decoder_batch,
                     model_config.model_params.joiner_dim,
-                    dtype=torch.float32,
+                    dtype=decoder_dtype,
                 ),
             ),
             decoder_path,
-            dynamo=False,
             input_names=("decoder_input", "encoder_output"),
             output_names=("tokens_log_prob",),
             opset_version=ONNX_OPSET_VERSION,
@@ -490,6 +640,7 @@ def export_zipformer(args: argparse.Namespace) -> None:
     directory. The tokenizer and a compact runtime configuration are written
     to the destination, checkpoint weights are loaded into condensed inference
     modules, and ONNX graphs are exported before TensorRT engines are built.
+    Transducer bundles also contain a precomputed predictor context table.
     Intermediate ONNX artifacts are retained only in debug mode.
 
     Parameters
@@ -506,12 +657,16 @@ def export_zipformer(args: argparse.Namespace) -> None:
     RuntimeError
         Raised when checkpoint loading, ONNX conversion, or TensorRT engine
         construction fails.
+    KeyError
+        Raised when the checkpoint lacks its model state or a required tensor.
     """
 
     if args.decoder_type in ("transducer_greedy_search", "ctc_greedy_search"):
         if args.beam != 1:
             logger.warning(
-                "Overriding beam=%s with beam=1 for %s.", args.beam, args.decoder_type
+                "Overriding beam=%s with beam=1 because %s requires beam 1.",
+                args.beam,
+                args.decoder_type,
             )
         args.beam = 1
 
@@ -553,12 +708,24 @@ def export_zipformer(args: argparse.Namespace) -> None:
     )
     max_audio_samples = round(args.max_audio_seconds * sample_rate)
     pos_emb_max_len = ((max_audio_samples + frame_shift // 2) // frame_shift + 1) // 2
-    encoder, decoder = make_model(
+    subsampling_batch_partitions = get_subsampling_batch_partitions(
+        model_config, state_dict["subsampling.conv3.weight"].size(0), args
+    )
+    if subsampling_batch_partitions > 1:
+        logger.info(
+            "Splitting Zipformer convolutional subsampling into %s batch partitions "
+            "to stay within TensorRT's CASK element limit.",
+            subsampling_batch_partitions,
+        )
+    encoder, decoder, joiner = make_model(
         model_config,
         state_dict,
         vocab_size,
         pos_emb_max_len,
         args.decoder_type,
+        subsampling_batch_partitions,
+        PRECISION_DTYPES[args.encoder_precision],
+        PRECISION_DTYPES[args.decoder_precision],
     )
     del state_dict
 
@@ -570,45 +737,44 @@ def export_zipformer(args: argparse.Namespace) -> None:
     OmegaConf.save(runtime_config, args.output_dir / MODEL_CONFIG_FILE)
 
     encoder_onnx_path, decoder_onnx_path = export_model_to_onnx(
-        encoder, decoder, model_config, args
+        encoder, decoder, joiner, model_config, args
     )
-    del encoder, decoder
-
-    encoder_tensorrt_onnx_path = args.output_dir / "zipformer-tensorrt.onnx"
-    decoder_tensorrt_onnx_path = args.output_dir / "decoder-tensorrt.onnx"
-    prepare_onnx_for_tensorrt(encoder_onnx_path, encoder_tensorrt_onnx_path)
-    if decoder_onnx_path is not None:
-        prepare_onnx_for_tensorrt(decoder_onnx_path, decoder_tensorrt_onnx_path)
+    del encoder, decoder, joiner
 
     audio_samples = (
         round(args.min_audio_seconds * sample_rate),
         round(args.opt_audio_seconds * sample_rate),
         round(args.max_audio_seconds * sample_rate),
     )
+    right_padding_samples = (
+        model_config.feature_opts.frame_opts.frame_length_ms * sample_rate // 2000
+    )
     encoder_profiles = {
-        "audio": tuple((args.batch_size, samples) for samples in audio_samples),
+        "audio": tuple(
+            (args.batch_size, samples + right_padding_samples)
+            for samples in audio_samples
+        ),
     }
-    workspace_bytes = round(args.workspace_gib * 2**30)
     build_tensorrt_engine(
-        encoder_tensorrt_onnx_path,
+        encoder_onnx_path,
         args.output_dir / ZIPFORMER_TENSORRT_FILE,
         encoder_profiles,
-        workspace_bytes,
+        args.optimization_level,
     )
     if decoder_onnx_path is not None:
         build_tensorrt_engine(
-            decoder_tensorrt_onnx_path,
+            decoder_onnx_path,
             args.output_dir / ZIPFORMER_DECODER_TENSORRT_FILE,
             {},
-            workspace_bytes,
+            args.optimization_level,
         )
+
+    validate_model(args.output_dir, runtime_config)
 
     if not args.debug:
         remove_onnx_artifacts(encoder_onnx_path)
-        remove_onnx_artifacts(encoder_tensorrt_onnx_path)
         if decoder_onnx_path is not None:
             remove_onnx_artifacts(decoder_onnx_path)
-            remove_onnx_artifacts(decoder_tensorrt_onnx_path)
 
     logger.info("Zipformer TensorRT export completed in %s.", args.output_dir)
 

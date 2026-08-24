@@ -17,6 +17,7 @@ import torch
 from omegaconf import DictConfig
 
 from ..constants import TRANSDUCER_DECODER_TYPES
+from ..tensorrt_plugins import load_tensorrt_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -159,8 +160,15 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
 
     if args.beam < 1:
         raise ValueError(f"beam must be positive, got {args.beam}.")
-    if args.workspace_gib <= 0.0:
-        raise ValueError(f"workspace_gib must be positive, got {args.workspace_gib}.")
+    if args.beam > model_config.decoder.vocab_size:
+        raise ValueError(
+            f"beam must not exceed decoder.vocab_size, got beam={args.beam} and "
+            f"decoder.vocab_size={model_config.decoder.vocab_size}."
+        )
+    if not 0 <= args.optimization_level <= 5:
+        raise ValueError(
+            f"optimization_level must be in [0, 5], got {args.optimization_level}."
+        )
 
     sample_rate = model_config.sample_rate
     hop_length = round(model_config.preprocessor.window_stride * sample_rate)
@@ -304,6 +312,15 @@ def validate_zipformer(
     ):
         raise ValueError("The model configuration does not enable the transducer head.")
 
+    if (
+        decoder_type != "ctc_greedy_search"
+        and model_config.model_params.context_size > 2
+    ):
+        raise ValueError(
+            "The predictor context cache supports context_size at most 2, got "
+            f"{model_config.model_params.context_size}."
+        )
+
     positive_integer_values = (
         ("min_encoder_input_frames", model_config.min_encoder_input_frames),
         ("feature_opts.mel_opts.num_bins", model_config.feature_opts.mel_opts.num_bins),
@@ -361,6 +378,7 @@ def validate_zipformer(
             raise ValueError(
                 f"Expected model_params.{name} to contain only integers, got {value}."
             ) from error
+
         if len(values) != 6 or any(item < 1 for item in values):
             raise ValueError(
                 f"Expected model_params.{name} to contain six positive integers, "
@@ -428,8 +446,10 @@ def validate_zipformer(
 
     if args.beam < 1:
         raise ValueError(f"beam must be positive, got {args.beam}.")
-    if args.workspace_gib <= 0.0:
-        raise ValueError(f"workspace_gib must be positive, got {args.workspace_gib}.")
+    if not 0 <= args.optimization_level <= 5:
+        raise ValueError(
+            f"optimization_level must be in [0, 5], got {args.optimization_level}."
+        )
 
     sample_rate = model_config.feature_opts.frame_opts.samp_freq
     frame_shift_ms = model_config.feature_opts.frame_opts.frame_shift_ms
@@ -484,83 +504,21 @@ def remove_onnx_artifacts(onnx_path: Path) -> None:
     onnx_path.unlink(missing_ok=True)
 
 
-def remove_scatternd_attributes(graph: "onnx.GraphProto") -> None:
-    """Remove unsupported no-op ``ScatterND`` reduction attributes in place.
-
-    PyTorch ONNX export can attach ``reduction="none"`` to ``ScatterND`` nodes.
-    TensorRT does not accept that optional attribute, although omitting it has
-    the same semantics. Nested control-flow graphs are processed recursively.
-
-    Parameters
-    ----------
-    graph : onnx.GraphProto
-        ONNX graph to modify.
-
-    Raises
-    ------
-    ValueError
-        Raised when a ``ScatterND`` node uses a reduction mode other than
-        ``"none"``, which cannot be removed without changing graph behavior.
-    """
-
-    for node in graph.node:
-        if node.op_type == "ScatterND":
-            for index in reversed(range(len(node.attribute))):
-                attribute = node.attribute[index]
-                if attribute.name != "reduction":
-                    continue
-                if attribute.s != b"none":
-                    raise ValueError(
-                        "Only ScatterND reduction='none' can be removed safely."
-                    )
-                node.attribute.pop(index)
-
-        for attribute in node.attribute:
-            if attribute.type == onnx.AttributeProto.GRAPH:
-                remove_scatternd_attributes(attribute.g)
-            elif attribute.type == onnx.AttributeProto.GRAPHS:
-                for subgraph in attribute.graphs:
-                    remove_scatternd_attributes(subgraph)
-
-
-def prepare_onnx_for_tensorrt(input_path: Path, output_path: Path) -> None:
-    """Create a TensorRT-compatible copy of an ONNX graph.
-
-    The graph is loaded without materializing external tensor data, then its
-    unsupported no-op ``ScatterND`` attributes are removed recursively. External
-    tensor references therefore remain external.
-
-    Parameters
-    ----------
-    input_path : Path
-        Path to the source ONNX graph.
-    output_path : Path
-        Path at which to save the rewritten graph.
-
-    Raises
-    ------
-    ValueError
-        Raised when a ``ScatterND`` node has a reduction mode that cannot be
-        removed safely.
-    """
-
-    model = onnx.load(input_path, load_external_data=False)
-    remove_scatternd_attributes(model.graph)
-    onnx.save(model, output_path)
-
-
 def build_tensorrt_engine(
     onnx_path: Path,
     engine_path: Path,
     profiles: dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]],
-    workspace_bytes: int,
+    optimization_level: int,
 ) -> None:
     """Build and serialize a TensorRT engine from an ONNX graph.
 
     Every dynamic network input must have exactly one entry in ``profiles``;
     static inputs must not have profile entries. The builder enables TF32,
-    sparse-weight optimizations, and optimization level 5. FP16 is enabled
-    when the installed TensorRT release exposes its weak-typing builder flag.
+    sparse-weight optimizations, all tactic sources exposed by the installed
+    TensorRT release, and the requested optimization level. The workspace pool
+    retains TensorRT's device-specific default so all affordable tactics remain
+    eligible. FP16 and BF16 builder flags are enabled when available. Native
+    custom plugins referenced by the ONNX graph are loaded before parsing.
 
     Parameters
     ----------
@@ -571,8 +529,8 @@ def build_tensorrt_engine(
     profiles : dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]]
         Dynamic input names mapped to their minimum, optimum, and maximum
         shapes. Pass an empty dictionary for a fully static graph.
-    workspace_bytes : int
-        Maximum TensorRT workspace size in bytes.
+    optimization_level : int
+        TensorRT builder optimization level.
 
     Raises
     ------
@@ -584,12 +542,16 @@ def build_tensorrt_engine(
         cannot be parsed, or the serialized engine cannot be built.
     """
 
+    load_tensorrt_plugins()
     trt_logger = trt.Logger(trt.Logger.INFO)
     if not trt.init_libnvinfer_plugins(trt_logger, ""):
         raise RuntimeError("Failed to initialize TensorRT plugins.")
 
     builder = trt.Builder(trt_logger)
-    network = builder.create_network(0)
+    network_flags = 1 << int(
+        trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS
+    )
+    network = builder.create_network(network_flags)
     parser = trt.OnnxParser(network, trt_logger)
     if not parser.parse_from_file(str(onnx_path)):
         errors = "\n".join(
@@ -599,12 +561,20 @@ def build_tensorrt_engine(
 
     builder_config = builder.create_builder_config()
     builder_config.engine_capability = trt.EngineCapability.STANDARD
-    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
+    tactic_sources = 0
+    for tactic_source in trt.TacticSource.__members__.values():
+        tactic_sources |= 1 << int(tactic_source)
+    if not builder_config.set_tactic_sources(tactic_sources):
+        raise RuntimeError(f"TensorRT rejected tactic source mask {tactic_sources}.")
     builder_config.set_flag(trt.BuilderFlag.TF32)
     builder_config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
     if hasattr(trt.BuilderFlag, "FP16"):
         builder_config.set_flag(trt.BuilderFlag.FP16)
-    builder_config.builder_optimization_level = 5
+    if hasattr(trt.BuilderFlag, "BF16"):
+        builder_config.set_flag(trt.BuilderFlag.BF16)
+    builder_config.set_preview_feature(trt.PreviewFeature.ALIASED_PLUGIN_IO_10_03, True)
+    builder_config.builder_optimization_level = optimization_level
+    builder_config.tiling_optimization_level = trt.TilingOptimizationLevel.FULL
 
     dynamic_input_names = {
         network.get_input(index).name
