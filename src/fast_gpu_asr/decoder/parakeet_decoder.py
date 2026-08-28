@@ -12,17 +12,16 @@ import numpy as np
 import tensorrt as trt
 
 from ..constants import INT32_MAX, TDT_SEARCH_CHUNK_STEPS
-from ..utils import ASRInferenceError, get_engine
+from ..utils import ASRInferenceError, ASRInitializationError, get_engine
 from .gpu_kernels import (
     TDT_BEAM_SEARCH_KERNEL,
     TDT_FINALIZE_KERNEL,
     TDT_PREPARE_INPUTS_KERNEL,
     TDT_SELECT_TOKENS_KERNEL,
 )
-from .transcription import DecoderResult
 
 
-class ParakeetDecoder:
+class ParakeetModifiedBeamSearchDecoder:
     """Decode fixed-capacity Parakeet batches with TDT modified beam search.
 
     Decoder engines with ``beam=1`` use the same search path as wider beams,
@@ -135,7 +134,15 @@ class ParakeetDecoder:
             )
 
             self.decoder = engine.create_execution_context()
-            self.decoder.set_optimization_profile_async(0, self.stream.ptr)
+            if self.decoder is None:
+                raise ASRInitializationError(
+                    "TensorRT could not create the Parakeet decoder execution context."
+                )
+            if not self.decoder.set_optimization_profile_async(0, self.stream.ptr):
+                raise ASRInitializationError(
+                    "TensorRT could not select Parakeet decoder optimization profile 0."
+                )
+
             self.cuda_graph: cp.cuda.graph.Graph | None = None
             self.cuda_graph_signature: tuple[int, ...] | None = None
             self.cuda_graph_supported = True
@@ -211,27 +218,92 @@ class ParakeetDecoder:
                 ("output_states_1", self.output_state_1),
                 ("output_states_2", self.output_state_2),
             ):
-                self.decoder.set_tensor_address(name, binding.data.ptr)
+                if not self.decoder.set_tensor_address(name, binding.data.ptr):
+                    raise ASRInitializationError(
+                        f"TensorRT rejected the Parakeet decoder tensor {name}."
+                    )
+
+    def swap_buffers(self) -> None:
+        """Toggle all current and next search buffers without copying device data.
+
+        Each TDT search step writes its hypotheses and recurrent states to the
+        alternate buffers before exchanging the Python references. Full CUDA
+        graph chunks contain an even number of steps and therefore restore the
+        original ownership automatically. Callers use this method after an odd
+        partial chunk or failed attempt to restore that ownership explicitly.
+
+        Every coupled search buffer must move together so hypothesis metadata,
+        backpointers, and recurrent states continue to describe the same beam.
+        TensorRT retains recurrent input addresses independently of these Python
+        references, so both state inputs are rebound after the exchange.
+
+        Raises
+        ------
+        ASRInferenceError
+            Raised when TensorRT rejects either recurrent-state input address.
+        """
+
+        self.hypothesis_scores, self.next_scores = (
+            self.next_scores,
+            self.hypothesis_scores,
+        )
+        self.hypothesis_lengths, self.next_lengths = (
+            self.next_lengths,
+            self.hypothesis_lengths,
+        )
+        self.time_indexes, self.next_time_indexes = (
+            self.next_time_indexes,
+            self.time_indexes,
+        )
+        self.last_tokens, self.next_last_tokens = (
+            self.next_last_tokens,
+            self.last_tokens,
+        )
+        self.symbols_at_timestep, self.next_symbols_at_timestep = (
+            self.next_symbols_at_timestep,
+            self.symbols_at_timestep,
+        )
+        self.hypothesis_nodes, self.next_nodes = (
+            self.next_nodes,
+            self.hypothesis_nodes,
+        )
+        self.hypothesis_hashes, self.next_hashes = (
+            self.next_hashes,
+            self.hypothesis_hashes,
+        )
+        self.state_1, self.next_state_1 = self.next_state_1, self.state_1
+        self.state_2, self.next_state_2 = self.next_state_2, self.state_2
+        state_1_bound = self.decoder.set_tensor_address(
+            "input_states_1", self.state_1.data.ptr
+        )
+        state_2_bound = self.decoder.set_tensor_address(
+            "input_states_2", self.state_2.data.ptr
+        )
+        if not state_1_bound or not state_2_bound:
+            raise ASRInferenceError(
+                "TensorRT rejected a Parakeet decoder recurrent-state input."
+            )
 
     def __call__(
         self, encoder_output: cp.ndarray, encoder_output_lengths: cp.ndarray
-    ) -> DecoderResult:
+    ) -> tuple[list[list[int]], list[list[float]]]:
         """Decode actual utterances in one fixed-capacity encoder batch.
 
         Parameters
         ----------
         encoder_output : cp.ndarray
             Contiguous FP32, FP16, or BF16 CUDA encoder embeddings with shape
-            ``(actual_batch, num_frames, encoder_dim)``.
+            ``(actual_batch, num_frames, encoder_dim)``. Frames are converted to
+            the decoder engine's floating-point dtype while being staged.
         encoder_output_lengths : cp.ndarray
             Contiguous CUDA ``int32`` valid encoder lengths with shape
             ``(actual_batch,)``.
 
         Returns
         -------
-        DecoderResult
-            Best token IDs and token start timestamps in seconds for each
-            actual utterance.
+        tuple[list[list[int]], list[list[float]]]
+            Best token IDs and corresponding token start timestamps in seconds
+            for each actual utterance.
 
         Raises
         ------
@@ -249,7 +321,7 @@ class ParakeetDecoder:
         if encoder_output.ndim != 3:
             raise ASRInferenceError(
                 "Expected a rank-3 Parakeet encoder output, got shape "
-                f"{encoder_output.shape}.",
+                f"{encoder_output.shape}."
             )
         actual_batch_size = encoder_output.shape[0]
         if not 0 < actual_batch_size <= self.batch_size:
@@ -265,7 +337,7 @@ class ParakeetDecoder:
             raise ASRInferenceError(
                 "Expected contiguous rank-3 encoder output with dimension "
                 f"{self.encoder_dim} and float16, float32, or bfloat16 values, "
-                f"got shape {encoder_output.shape} and dtype {encoder_output.dtype}.",
+                f"got shape {encoder_output.shape} and dtype {encoder_output.dtype}."
             )
         if (
             encoder_output_lengths.shape != (actual_batch_size,)
@@ -275,25 +347,25 @@ class ParakeetDecoder:
             raise ASRInferenceError(
                 "Expected contiguous int32 encoder output lengths with shape "
                 f"{(actual_batch_size,)}, got shape {encoder_output_lengths.shape} "
-                f"and dtype {encoder_output_lengths.dtype}.",
+                f"and dtype {encoder_output_lengths.dtype}."
+            )
+
+        max_frames = encoder_output.shape[1]
+        max_steps = max_frames * (self.max_symbols_per_timestep + 1)
+        node_elements = self.decoder_capacity * max_steps
+        encoder_elements = self.batch_size * max_frames * self.encoder_dim
+        if max(node_elements, encoder_elements) > INT32_MAX:
+            raise ASRInferenceError(
+                "Parakeet decoder buffers exceed signed 32-bit kernel "
+                f"indexing: encoder capacity={encoder_elements}, "
+                f"history capacity={node_elements}, limit={INT32_MAX}."
             )
 
         with self.device, self.stream:
-            max_frames = encoder_output.shape[1]
             if max_frames == 0:
-                return DecoderResult(
-                    token_ids=[[] for _ in range(actual_batch_size)],
-                    timestamps=[[] for _ in range(actual_batch_size)],
-                )
-
-            max_steps = max_frames * (self.max_symbols_per_timestep + 1)
-            node_elements = self.decoder_capacity * max_steps
-            encoder_elements = self.batch_size * max_frames * self.encoder_dim
-            if max(node_elements, encoder_elements) > INT32_MAX:
-                raise ASRInferenceError(
-                    "Parakeet decoder buffers exceed signed 32-bit kernel "
-                    f"indexing: encoder capacity={encoder_elements}, "
-                    f"history capacity={node_elements}, limit={INT32_MAX}.",
+                return (
+                    [[] for _ in range(actual_batch_size)],
+                    [[] for _ in range(actual_batch_size)],
                 )
 
             if self.token_capacity < max_steps:
@@ -362,8 +434,17 @@ class ParakeetDecoder:
             if signature_changed:
                 self.cuda_graph = None
 
-            self.decoder.set_tensor_address("input_states_1", self.state_1.data.ptr)
-            self.decoder.set_tensor_address("input_states_2", self.state_2.data.ptr)
+            state_1_bound = self.decoder.set_tensor_address(
+                "input_states_1", self.state_1.data.ptr
+            )
+            state_2_bound = self.decoder.set_tensor_address(
+                "input_states_2", self.state_2.data.ptr
+            )
+            if not state_1_bound or not state_2_bound:
+                raise ASRInferenceError(
+                    "TensorRT rejected a Parakeet decoder recurrent-state input."
+                )
+
             TDT_PREPARE_INPUTS_KERNEL(
                 (self.decoder_capacity,),
                 (self.prepare_inputs_threads,),
@@ -414,6 +495,8 @@ class ParakeetDecoder:
                             self.stream.begin_capture()
 
                         executed = True
+                        binding_failed = False
+                        attempt_steps = 0
                         for _ in range(chunk_steps):
                             if not self.decoder.execute_async_v3(self.stream.ptr):
                                 executed = False
@@ -536,13 +619,18 @@ class ParakeetDecoder:
                                 self.next_state_2,
                                 self.state_2,
                             )
+                            attempt_steps += 1
 
-                            self.decoder.set_tensor_address(
+                            state_1_bound = self.decoder.set_tensor_address(
                                 "input_states_1", self.state_1.data.ptr
                             )
-                            self.decoder.set_tensor_address(
+                            state_2_bound = self.decoder.set_tensor_address(
                                 "input_states_2", self.state_2.data.ptr
                             )
+                            if not state_1_bound or not state_2_bound:
+                                executed = False
+                                binding_failed = True
+                                break
 
                         if capture:
                             try:
@@ -560,6 +648,14 @@ class ParakeetDecoder:
                                 self.cuda_graph.launch(self.stream)
                                 break
 
+                            if not executed and attempt_steps % 2:
+                                self.swap_buffers()
+                            if binding_failed:
+                                raise ASRInferenceError(
+                                    "TensorRT rejected a Parakeet decoder "
+                                    "recurrent-state input."
+                                )
+
                             warn(
                                 "CUDA graph capture failed; Parakeet decoder "
                                 "inference will continue without graph replay.",
@@ -570,6 +666,13 @@ class ParakeetDecoder:
                             self.cuda_graph_supported = False
                             self.cuda_graph, self.cuda_graph_signature = None, None
                         elif not executed:
+                            if attempt_steps % 2:
+                                self.swap_buffers()
+                            if binding_failed:
+                                raise ASRInferenceError(
+                                    "TensorRT rejected a Parakeet decoder "
+                                    "recurrent-state input."
+                                )
                             raise ASRInferenceError(
                                 "TensorRT decoder execution failed."
                             )
@@ -619,38 +722,7 @@ class ParakeetDecoder:
             # final partial chunk may not, so restore canonical buffer identities
             # after the finalize launch has captured the current pointers.
             if steps_executed % 2:
-                self.hypothesis_scores, self.next_scores = (
-                    self.next_scores,
-                    self.hypothesis_scores,
-                )
-                self.hypothesis_lengths, self.next_lengths = (
-                    self.next_lengths,
-                    self.hypothesis_lengths,
-                )
-                self.time_indexes, self.next_time_indexes = (
-                    self.next_time_indexes,
-                    self.time_indexes,
-                )
-                self.last_tokens, self.next_last_tokens = (
-                    self.next_last_tokens,
-                    self.last_tokens,
-                )
-                self.symbols_at_timestep, self.next_symbols_at_timestep = (
-                    self.next_symbols_at_timestep,
-                    self.symbols_at_timestep,
-                )
-                self.hypothesis_nodes, self.next_nodes = (
-                    self.next_nodes,
-                    self.hypothesis_nodes,
-                )
-                self.hypothesis_hashes, self.next_hashes = (
-                    self.next_hashes,
-                    self.hypothesis_hashes,
-                )
-                self.state_1, self.next_state_1 = self.next_state_1, self.state_1
-                self.state_2, self.next_state_2 = self.next_state_2, self.state_2
-                self.decoder.set_tensor_address("input_states_1", self.state_1.data.ptr)
-                self.decoder.set_tensor_address("input_states_2", self.state_2.data.ptr)
+                self.swap_buffers()
 
             self.output_lengths[:actual_batch_size].get(
                 out=self.output_lengths_host[:actual_batch_size],
@@ -702,4 +774,4 @@ class ParakeetDecoder:
             token_ids.append(tokens[:length].tolist())
             timestamps.append(token_timestamps[:length].tolist())
 
-        return DecoderResult(token_ids=token_ids, timestamps=timestamps)
+        return token_ids, timestamps

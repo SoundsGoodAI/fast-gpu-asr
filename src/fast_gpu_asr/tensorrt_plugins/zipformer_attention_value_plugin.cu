@@ -263,7 +263,7 @@ class AttentionValuePlugin final : public IPluginV3,
 public:
     explicit AttentionValuePlugin(
         int32_t valueHeads = 1, int32_t tactic = kStrictComputeTactic,
-        bool supportsNarrowHeadTactic = false)
+        bool supportsNarrowHeadTactic = false) noexcept
         : mValueHeads(valueHeads), mTactic(tactic),
           mSupportsNarrowHeadTactic(supportsNarrowHeadTactic)
     {
@@ -317,6 +317,7 @@ public:
             delete plugin;
             return nullptr;
         }
+        plugin->mInputType = mInputType;
         return plugin;
     }
 
@@ -374,6 +375,7 @@ public:
         mSupportsNarrowHeadTactic = mValueHeads > 1 && channels > 0
             && channels % mValueHeads == 0
             && channels / mValueHeads == kNarrowHeadDim;
+        mInputType = inputs[1].desc.type;
         return 0;
     }
 
@@ -460,18 +462,17 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kCublasComputeTactics.size())
+        return getCublasComputeTacticCount(mInputType)
             + static_cast<int32_t>(mSupportsNarrowHeadTactic);
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        int32_t const cublasTactics =
-            static_cast<int32_t>(kCublasComputeTactics.size());
+        int32_t const cublasTactics = getCublasComputeTacticCount(mInputType);
         if (tactics == nullptr
             || nbTactics != cublasTactics
                 + static_cast<int32_t>(mSupportsNarrowHeadTactic)
-            || writeCublasComputeTactics(tactics, cublasTactics) != 0)
+            || writeCublasComputeTactics(tactics, cublasTactics, mInputType) != 0)
         {
             return 1;
         }
@@ -491,7 +492,7 @@ public:
             mTactic = tactic;
             return 0;
         }
-        return setCublasComputeTactic(tactic, mTactic);
+        return setCublasComputeTactic(tactic, mTactic, mInputType);
     }
 
     char const* getTimingCacheID() noexcept override
@@ -520,7 +521,7 @@ public:
             || !haveValidShapes(inputs[0].dims, inputs[1].dims,
                 outputs[0].dims, mValueHeads, dataTypeBytes(inputs[1].type))
             || (mTactic != kNarrowHeadTactic
-                && !isCublasComputeTactic(mTactic))
+                && !isCublasComputeTactic(mTactic, inputs[1].type))
             || (mTactic == kNarrowHeadTactic
                 && (mValueHeads == 1
                     || inputs[1].dims.d[2] / mValueHeads != kNarrowHeadDim)))
@@ -548,7 +549,13 @@ public:
             || outputDesc[0].format != TensorFormat::kLINEAR
             || !haveValidShapes(inputDesc[0].dims, inputDesc[1].dims,
                 outputDesc[0].dims, mValueHeads,
-                dataTypeBytes(inputDesc[1].type)))
+                dataTypeBytes(inputDesc[1].type))
+            || (mTactic != kNarrowHeadTactic
+                && !isCublasComputeTactic(mTactic, inputDesc[1].type))
+            || (mTactic == kNarrowHeadTactic
+                && (mValueHeads == 1
+                    || inputDesc[1].dims.d[2] / mValueHeads
+                        != kNarrowHeadDim)))
         {
             return 1;
         }
@@ -569,8 +576,12 @@ public:
         }
         int32_t const batchCount = static_cast<int32_t>(batchCount64);
 
-        // Clear caller launch status so checks below cover only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         if (mTactic == kNarrowHeadTactic)
         {
@@ -580,7 +591,7 @@ public:
             // kernel's grid-stride loop handles any rows beyond 65,535 blocks.
             int64_t const rows = static_cast<int64_t>(batchCount) * sequenceLength;
             int32_t const blocks = static_cast<int32_t>(std::min<int64_t>(
-                65535, rows / kWarpsPerBlock
+                kMaxBlocks, rows / kWarpsPerBlock
                     + (rows % kWarpsPerBlock != 0)));
             if (inputDesc[1].type == DataType::kFLOAT)
             {
@@ -716,6 +727,7 @@ private:
 
     cublasHandle_t mHandle{nullptr};
     cudaStream_t mStream{nullptr};
+    DataType mInputType{DataType::kFLOAT};
     int32_t mValueHeads{1};
     int32_t mTactic{kStrictComputeTactic};
     bool mInitialized{false};
@@ -835,5 +847,5 @@ extern "C" bool initFastGpuAsrZipformerAttentionValuePlugin() noexcept
         nvinfer1::getBuilderPluginRegistry(nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

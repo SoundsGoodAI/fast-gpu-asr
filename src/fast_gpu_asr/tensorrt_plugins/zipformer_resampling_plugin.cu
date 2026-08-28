@@ -679,8 +679,13 @@ public:
             return 1;
         }
 
-        // Clear caller launch status so the check below covers only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Do not consume an error left by an earlier asynchronous launch. A
+        // pre-existing error means this invocation cannot report success
+        // reliably, while cudaPeekAtLastError preserves it for its owner.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         int32_t const batch = static_cast<int32_t>(inputDesc[0].dims.d[0]);
         int32_t const inputLength =
@@ -950,5 +955,5 @@ extern "C" bool initFastGpuAsrZipformerResamplingPlugins() noexcept
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderDownsample)
         && ensureRegistered(builderRegistry, builderUpsample);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

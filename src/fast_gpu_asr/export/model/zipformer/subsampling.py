@@ -37,21 +37,9 @@ class Conv2dSubsampling(torch.nn.Module):
         batch_partitions : int
             Number of batch partitions used by the convolutional frontend.
 
-        Raises
-        ------
-        ValueError
-            Raised when ``input_dim`` is too small for the frequency
-            subsampling stages.
         """
 
         super().__init__()
-
-        if input_dim < 7:
-            raise ValueError(
-                "The input feature dimension of the Conv2dSubsampling layer cannot be "
-                "less than seven; otherwise, frequency subsampling produces an empty "
-                f"output. Expected input_dim to be at least 7 but got {input_dim}.",
-            )
 
         self.batch_partitions = batch_partitions
         self.padding = 3
@@ -107,11 +95,14 @@ class Conv2dSubsampling(torch.nn.Module):
             self.conv1(x.unsqueeze(1).to(self.conv1.weight.dtype))
         ).to(self.conv2.weight.dtype)
         x = self.conv_activation(self.conv2(x))
+        output_lens = torch.clamp((x_lens - 7) // 2, min=0, max=x.size(2) - 2)
+        valid_frames = torch.arange(
+            x.size(2) - 2,
+            dtype=output_lens.dtype,
+            device=output_lens.device,
+        ).unsqueeze(0) < output_lens.unsqueeze(1)
 
         if self.batch_partitions > 1:
-            partition_size = (
-                x.size(0) + self.batch_partitions - 1
-            ) // self.batch_partitions
             bypass = torch.empty(
                 (
                     x.size(0),
@@ -124,9 +115,12 @@ class Conv2dSubsampling(torch.nn.Module):
             )
             outputs = torch.empty_like(bypass)
             for partition in range(self.batch_partitions):
-                start = partition * partition_size
-                end = min(start + partition_size, x.size(0))
+                start = partition * x.size(0) // self.batch_partitions
+                end = (partition + 1) * x.size(0) // self.batch_partitions
                 partition_output = self.conv_activation(self.conv3(x[start:end]))
+                partition_output = partition_output * valid_frames[start:end].unsqueeze(
+                    1
+                ).unsqueeze(3)
 
                 partition_bypass = partition_output
                 partition_output = self.depthwise_conv(partition_output)
@@ -137,6 +131,7 @@ class Conv2dSubsampling(torch.nn.Module):
             x = outputs
         else:
             x = self.conv_activation(self.conv3(x))
+            x = x * valid_frames.unsqueeze(1).unsqueeze(3)
             bypass = x
             x = self.depthwise_conv(x)
 
@@ -151,7 +146,7 @@ class Conv2dSubsampling(torch.nn.Module):
         )
         x = self.out_norm(self.out(x))
 
-        return x, (x_lens - 7) // 2
+        return x, output_lens
 
 
 class BiasNorm(torch.nn.Module):
@@ -185,8 +180,11 @@ class BiasNorm(torch.nn.Module):
             A normalized tensor with the same shape and dtype as ``x``.
         """
 
-        centered = x - self.bias
-        var = torch.sqrt(torch.mean(centered * centered, dim=2, keepdim=True))
-        x = x * self.scale / var
+        output_dtype = x.dtype
+        x = x.to(torch.float32)
+        centered = x - self.bias.to(torch.float32)
+        rms = torch.sqrt(torch.mean(centered * centered, dim=2, keepdim=True))
+        rms = torch.clamp(rms, min=torch.finfo(torch.float32).tiny)
+        x = (x * self.scale.to(torch.float32) / rms).to(output_dtype)
 
         return x

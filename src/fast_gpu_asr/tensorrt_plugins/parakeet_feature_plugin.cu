@@ -45,8 +45,23 @@ constexpr size_t kTimingCacheIdSize = 160;
 constexpr size_t kPortableSharedMemoryBytes = 48U << 10;
 constexpr int32_t kMaxFrequencies =
     static_cast<int32_t>(kPortableSharedMemoryBytes / sizeof(cufftComplex));
+// FAST_16F converts the unbounded FP32 power spectrum to FP16 before the mel
+// GEMM. Full-scale PCM can exceed FP16's finite range, so retain only compute
+// modes with an FP32-like exponent range for this projection.
+constexpr std::array<int32_t, 3> kMelProjectionTactics{
+    kStrictComputeTactic,
+    kFast16BFComputeTactic,
+    kFastTF32ComputeTactic,
+};
 static_assert(
     (kParallelNormalizationThreads & (kParallelNormalizationThreads - 1)) == 0);
+
+bool isMelProjectionTactic(int32_t tactic) noexcept
+{
+    return std::find(kMelProjectionTactics.begin(), kMelProjectionTactics.end(),
+               tactic)
+        != kMelProjectionTactics.end();
+}
 
 struct WorkspaceLayout
 {
@@ -165,7 +180,7 @@ bool haveValidShapes(Dims const& audio, Dims const& audioLengths,
         || melFilterbank.nbDims != 2 || features.nbDims != 3
         || featureLengths.nbDims != 1
         || !hasAddressableBytes(audio, sizeof(float))
-        || !hasAddressableBytes(audioLengths, sizeof(int32_t))
+        || !hasAddressableBytes(audioLengths, sizeof(int64_t))
         || !hasAddressableBytes(window, sizeof(float))
         || !hasAddressableBytes(melFilterbank, sizeof(float))
         || !hasAddressableBytes(features, sizeof(float))
@@ -194,7 +209,7 @@ bool haveValidShapes(Dims const& audio, Dims const& audioLengths,
         && makeWorkspaceLayout(rows, static_cast<int32_t>(window.d[0]), layout);
 }
 
-__global__ void prepareFrames(float const* audio, int32_t const* audioLengths,
+__global__ void prepareFrames(float const* audio, int64_t const* audioLengths,
     float const* window, float* frames, int32_t audioSamples,
     int32_t numFrames, int32_t fftLength, int32_t frameShift, float preemph)
 {
@@ -203,7 +218,7 @@ __global__ void prepareFrames(float const* audio, int32_t const* audioLengths,
     int32_t const flattenedFrame = static_cast<int32_t>(blockIdx.x);
     int32_t const batch = flattenedFrame / numFrames;
     int32_t const frame = flattenedFrame - batch * numFrames;
-    int32_t validSamples = audioLengths[batch];
+    int64_t validSamples = audioLengths[batch];
     validSamples = validSamples < 0
         ? 0
         : (validSamples > audioSamples ? audioSamples : validSamples);
@@ -265,7 +280,7 @@ __global__ void powerSpectrumInPlace(
 }
 
 __global__ void normalizeFeaturesParallel(float* features,
-    int32_t const* audioLengths, int32_t* featureLengths,
+    int64_t const* audioLengths, int32_t* featureLengths,
     int32_t audioSamples, int32_t numFrames, int32_t numFeatures,
     int32_t frameShift, float logEps, float eps)
 {
@@ -274,11 +289,10 @@ __global__ void normalizeFeaturesParallel(float* features,
     int32_t const batchFeature = static_cast<int32_t>(blockIdx.x);
     int32_t const batch = batchFeature / numFeatures;
     int32_t const feature = batchFeature - batch * numFeatures;
-    int32_t validSamples = audioLengths[batch];
+    int64_t validSamples = audioLengths[batch];
     validSamples = validSamples < 0
-        ? 0
-        : (validSamples > audioSamples ? audioSamples : validSamples);
-    int32_t const length = validSamples / frameShift;
+        ? 0 : (validSamples > audioSamples ? audioSamples : validSamples);
+    int32_t const length = static_cast<int32_t>(validSamples / frameShift);
     int32_t const thread = static_cast<int32_t>(threadIdx.x);
 
     if (length < 2)
@@ -369,7 +383,7 @@ __global__ void normalizeFeaturesParallel(float* features,
 }
 
 __global__ void normalizeFeaturesCoalesced(float* features,
-    int32_t const* audioLengths, int32_t* featureLengths,
+    int64_t const* audioLengths, int32_t* featureLengths,
     int32_t audioSamples, int32_t numFrames, int32_t numFeatures,
     int32_t frameShift, float logEps, float eps)
 {
@@ -377,11 +391,11 @@ __global__ void normalizeFeaturesCoalesced(float* features,
     // channels. Every frame therefore produces coalesced feature loads/stores,
     // while each thread keeps its numerically stable Welford state in registers.
     int32_t const batch = static_cast<int32_t>(blockIdx.x);
-    int32_t validSamples = audioLengths[batch];
+    int64_t validSamples = audioLengths[batch];
     validSamples = validSamples < 0
         ? 0
         : (validSamples > audioSamples ? audioSamples : validSamples);
-    int32_t const length = validSamples / frameShift;
+    int32_t const length = static_cast<int32_t>(validSamples / frameShift);
     int32_t const thread = static_cast<int32_t>(threadIdx.x);
     if (thread == 0)
     {
@@ -556,7 +570,7 @@ public:
             || outputs[0].desc.dims.nbDims != 3
             || outputs[1].desc.dims.nbDims != 1
             || inputs[0].desc.type != DataType::kFLOAT
-            || inputs[1].desc.type != DataType::kINT32
+            || inputs[1].desc.type != DataType::kINT64
             || inputs[2].desc.type != DataType::kFLOAT
             || inputs[3].desc.type != DataType::kFLOAT
             || outputs[0].desc.type != DataType::kFLOAT
@@ -586,7 +600,7 @@ public:
         if (outputTypes == nullptr || inputTypes == nullptr
             || nbInputs != kInputCount || nbOutputs != kOutputCount
             || inputTypes[0] != DataType::kFLOAT
-            || inputTypes[1] != DataType::kINT32
+            || inputTypes[1] != DataType::kINT64
             || inputTypes[2] != DataType::kFLOAT
             || inputTypes[3] != DataType::kFLOAT)
         {
@@ -651,8 +665,8 @@ public:
         {
             return false;
         }
-        auto const type =
-            pos == 1 || pos == 5 ? DataType::kINT32 : DataType::kFLOAT;
+        auto const type = pos == 1 ? DataType::kINT64
+            : (pos == 5 ? DataType::kINT32 : DataType::kFLOAT);
         return inOut[pos].desc.format == TensorFormat::kLINEAR
             && inOut[pos].desc.type == type;
     }
@@ -681,17 +695,32 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kCublasComputeTactics.size());
+        return static_cast<int32_t>(kMelProjectionTactics.size());
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        return writeCublasComputeTactics(tactics, nbTactics);
+        if (tactics == nullptr
+            || nbTactics != static_cast<int32_t>(kMelProjectionTactics.size()))
+        {
+            return 1;
+        }
+        std::copy(kMelProjectionTactics.begin(), kMelProjectionTactics.end(), tactics);
+        return 0;
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
     {
-        return setCublasComputeTactic(tactic, mTactic);
+        if (tactic == 0)
+        {
+            tactic = kStrictComputeTactic;
+        }
+        if (!isMelProjectionTactic(tactic))
+        {
+            return 1;
+        }
+        mTactic = tactic;
+        return 0;
     }
 
     char const* getTimingCacheID() noexcept override
@@ -707,7 +736,7 @@ public:
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
             || nbOutputs != kOutputCount
             || inputs[0].type != DataType::kFLOAT
-            || inputs[1].type != DataType::kINT32
+            || inputs[1].type != DataType::kINT64
             || inputs[2].type != DataType::kFLOAT
             || inputs[3].type != DataType::kFLOAT
             || outputs[0].type != DataType::kFLOAT
@@ -718,7 +747,7 @@ public:
             || inputs[3].format != TensorFormat::kLINEAR
             || outputs[0].format != TensorFormat::kLINEAR
             || outputs[1].format != TensorFormat::kLINEAR
-            || !isCublasComputeTactic(mTactic) || !mInitialized
+            || !isMelProjectionTactic(mTactic) || !mInitialized
             || !haveValidShapes(inputs[0].dims, inputs[1].dims,
                 inputs[2].dims, inputs[3].dims, outputs[0].dims,
                 outputs[1].dims, mParameters))
@@ -741,6 +770,8 @@ public:
         mPlanRows = 0;
         mPlanLength = 0;
         mStream = nullptr;
+        mStreamInitialized = false;
+        mCublasWorkspace = nullptr;
 
         // A plan fixes transform length, physical row stride, and batch count.
         // Publish its cached dimensions only after successful construction so a
@@ -778,7 +809,7 @@ public:
             || inputs[3] == nullptr || outputs[0] == nullptr
             || outputs[1] == nullptr || workspace == nullptr || mPlan == 0
             || !mInitialized || inputDesc[0].type != DataType::kFLOAT
-            || inputDesc[1].type != DataType::kINT32
+            || inputDesc[1].type != DataType::kINT64
             || inputDesc[2].type != DataType::kFLOAT
             || inputDesc[3].type != DataType::kFLOAT
             || outputDesc[0].type != DataType::kFLOAT
@@ -789,7 +820,7 @@ public:
             || inputDesc[3].format != TensorFormat::kLINEAR
             || outputDesc[0].format != TensorFormat::kLINEAR
             || outputDesc[1].format != TensorFormat::kLINEAR
-            || !isCublasComputeTactic(mTactic)
+            || !isMelProjectionTactic(mTactic)
             || !haveValidShapes(inputDesc[0].dims, inputDesc[1].dims,
                 inputDesc[2].dims, inputDesc[3].dims, outputDesc[0].dims,
                 outputDesc[1].dims, mParameters))
@@ -815,8 +846,12 @@ public:
             return 1;
         }
 
-        // Clear caller launch status so checks below cover only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         auto* workspaceBytes = static_cast<unsigned char*>(workspace);
         auto* frames = reinterpret_cast<float*>(workspaceBytes);
@@ -825,7 +860,7 @@ public:
 
         // cuFFT and cuBLAS handles belong to this execution-context clone. Only
         // update their stream state when TensorRT changes the execution stream.
-        if (stream != mStream)
+        if (!mStreamInitialized || stream != mStream)
         {
             if (cufftSetStream(mPlan, stream) != CUFFT_SUCCESS
                 || cublasSetStream(mCublas, stream) != CUBLAS_STATUS_SUCCESS)
@@ -833,11 +868,15 @@ public:
                 return 1;
             }
             mStream = stream;
+            mStreamInitialized = true;
+            // cublasSetStream resets the handle's workspace selection. Clear
+            // the pointer cache so this execution reapplies TensorRT's region.
+            mCublasWorkspace = nullptr;
         }
 
         prepareFrames<<<static_cast<uint32_t>(rows), kThreadsPerBlock, 0,
             stream>>>(static_cast<float const*>(inputs[0]),
-            static_cast<int32_t const*>(inputs[1]),
+            static_cast<int64_t const*>(inputs[1]),
             static_cast<float const*>(inputs[2]), frames, audioSamples,
             numFrames, fftLength, mParameters.frameShift,
             mParameters.preemph);
@@ -889,7 +928,7 @@ public:
             normalizeFeaturesCoalesced<<<static_cast<uint32_t>(batch),
                 kCoalescedNormalizationThreads, 0, stream>>>(
                 static_cast<float*>(outputs[0]),
-                static_cast<int32_t const*>(inputs[1]),
+                static_cast<int64_t const*>(inputs[1]),
                 static_cast<int32_t*>(outputs[1]), audioSamples, numFrames,
                 numFeatures, mParameters.frameShift, mParameters.logEps,
                 mParameters.eps);
@@ -900,7 +939,7 @@ public:
                 static_cast<uint32_t>(normalizationBlocks),
                 kParallelNormalizationThreads, 0, stream>>>(
                 static_cast<float*>(outputs[0]),
-                static_cast<int32_t const*>(inputs[1]),
+                static_cast<int64_t const*>(inputs[1]),
                 static_cast<int32_t*>(outputs[1]), audioSamples, numFrames,
                 numFeatures, mParameters.frameShift, mParameters.logEps,
                 mParameters.eps);
@@ -947,6 +986,7 @@ private:
     int32_t mTactic{kStrictComputeTactic};
     int32_t mCoalescedNormalizationMinBatch{std::numeric_limits<int32_t>::max()};
     bool mInitialized{false};
+    bool mStreamInitialized{false};
     std::array<char, kTimingCacheIdSize> mTimingCacheId{};
     std::array<PluginField, 4> mSerializedFields{};
     PluginFieldCollection mFields{};
@@ -1113,5 +1153,5 @@ extern "C" bool initFastGpuAsrParakeetFeaturePlugin() noexcept
         nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

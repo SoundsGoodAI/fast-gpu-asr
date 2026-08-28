@@ -5,9 +5,10 @@
 namespace fastgpuasr_tensorrt
 {
 
-// Keep this value synchronized with TENSORRT_PLUGIN_NAMESPACE in constants.py.
-// TensorRT uses it for both ONNX plugin lookup and creator registration, so a
-// mismatch prevents the ONNX graph from being parsed.
+// Keep this value synchronized with TENSORRT_PLUGIN_NAMESPACE in
+// fast_gpu_asr/constants.py. TensorRT uses it for ONNX lookup, creator
+// registration, and engine deserialization, so a mismatch makes bundles
+// unloadable.
 constexpr char kPluginNamespace[] = "fast_gpu_asr";
 
 } // namespace fastgpuasr_tensorrt

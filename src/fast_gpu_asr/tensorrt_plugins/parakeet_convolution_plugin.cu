@@ -32,23 +32,13 @@ constexpr char const* kPluginName = "parakeet_conformer_convolution";
 constexpr char const* kPluginVersion = "1";
 constexpr int32_t kInputCount = 4;
 constexpr int32_t kOutputCount = 1;
+// Grid-stride loops cover larger tensors; this cap supplies enough resident
+// blocks to saturate supported GPUs without creating an excessive launch grid.
 constexpr int64_t kMaxBlocks = 65535;
-// Tactic-ID ranges identify the historical packed-channel kernels and the
-// current adjacent-frame kernel. Keeping both ranges distinct lets serialized
-// engines continue to select their original implementation.
-constexpr int32_t kPackedTacticOffset = 1024;
-constexpr int32_t kAdjacentFrameTacticOffset = 2048;
-constexpr std::array<int32_t, 1> kTactics{
-    kAdjacentFrameTacticOffset + 256,
-};
-constexpr std::array<int32_t, 6> kLegacyTactics{
-    128,
-    256,
-    512,
-    kPackedTacticOffset + 128,
-    kPackedTacticOffset + 256,
-    kPackedTacticOffset + 512,
-};
+// Keep the current adjacent-frame tactic ID stable for serialized engines;
+// the ID is opaque to TensorRT and independent of the CUDA block size.
+constexpr int32_t kTactic = 2304;
+constexpr int32_t kThreads = 256;
 constexpr std::array<int32_t, 3> kDataInputIndexes{0, 2, 3};
 
 constexpr bool isSupportedDataType(DataType type) noexcept
@@ -81,8 +71,7 @@ bool hasAddressableBytes(Dims const& dims, int32_t elementBytes) noexcept
     }
 
     int64_t elements = 1;
-    int64_t const maxElements =
-        std::numeric_limits<int64_t>::max() / elementBytes;
+    int64_t const maxElements = std::numeric_limits<int64_t>::max() / elementBytes;
     for (int32_t index = 0; index < dims.nbDims; ++index)
     {
         if (dims.d[index] < 1
@@ -142,14 +131,12 @@ __global__ void parakeetConformerConvolutionFloat4(
         int32_t const batch = static_cast<int32_t>(frameIndex / sequenceLength);
         int32_t const requestedLength = validLengths[batch];
         int32_t const validLength = requestedLength < 0
-            ? 0
-            : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
+            ? 0 : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
         int32_t const padding = kernelSize / 2;
         float4 value = *reinterpret_cast<float4 const*>(bias + channel);
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
         {
-            int64_t const inputFrame =
-                static_cast<int64_t>(frame) + kernel - padding;
+            int64_t const inputFrame = static_cast<int64_t>(frame) + kernel - padding;
             if (inputFrame >= 0 && inputFrame < validLength)
             {
                 int64_t const inputIndex =
@@ -240,6 +227,13 @@ struct alignas(16) PackedEightChannels
     typename LowPrecisionOps<T>::Pair values[4];
 };
 
+// The adjacent-frame kernel relies on one aligned 16-byte transaction for
+// every eight-channel load and store.
+static_assert(sizeof(PackedEightChannels<half>) == 16);
+static_assert(sizeof(PackedEightChannels<__nv_bfloat16>) == 16);
+static_assert(alignof(PackedEightChannels<half>) == 16);
+static_assert(alignof(PackedEightChannels<__nv_bfloat16>) == 16);
+
 // FP16 and BF16 expose matching packed-pair intrinsics. Templating these
 // kernels keeps their indexing and boundary behavior identical while each
 // specialization still compiles to its native storage and conversion ops.
@@ -283,66 +277,6 @@ __global__ void parakeetConformerConvolutionPair(
         }
         *reinterpret_cast<Pair*>(output + frameIndex * numChannels + channel)
             = siluPair<T>(value);
-    }
-}
-
-// Processing four packed pairs per thread amortizes frame/channel index
-// arithmetic and the valid-length load across eight channels. TensorRT-owned
-// linear buffers are allocation-aligned, and the channel stride is a multiple
-// of eight whenever this path is selected, so every 16-byte access is aligned.
-template <typename T>
-__global__ void parakeetConformerConvolutionPackedEight(
-    T const* __restrict__ x, int32_t const* __restrict__ validLengths,
-    T const* __restrict__ weight, T const* __restrict__ bias,
-    int64_t numElements, int32_t sequenceLength, int32_t numChannels,
-    int32_t kernelSize, T* __restrict__ output)
-{
-    using Ops = LowPrecisionOps<T>;
-    using Packed = PackedEightChannels<T>;
-    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
-    {
-        int32_t const channelGroups = numChannels / 8;
-        int32_t const channel = static_cast<int32_t>(index % channelGroups) * 8;
-        int64_t const frameIndex = index / channelGroups;
-        int32_t const frame = static_cast<int32_t>(frameIndex % sequenceLength);
-        int32_t const batch = static_cast<int32_t>(frameIndex / sequenceLength);
-        int32_t const requestedLength = validLengths[batch];
-        int32_t const validLength = requestedLength < 0
-            ? 0
-            : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
-        int32_t const padding = kernelSize / 2;
-        Packed value = *reinterpret_cast<Packed const*>(bias + channel);
-        for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
-        {
-            int64_t const inputFrame =
-                static_cast<int64_t>(frame) + kernel - padding;
-            if (inputFrame >= 0 && inputFrame < validLength)
-            {
-                int64_t const inputIndex =
-                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame)
-                    * numChannels + channel;
-                Packed const inputValue =
-                    *reinterpret_cast<Packed const*>(x + inputIndex);
-                Packed const weightValue = *reinterpret_cast<Packed const*>(
-                    weight + static_cast<int64_t>(kernel) * numChannels + channel);
-#pragma unroll
-                for (int32_t pair = 0; pair < 4; ++pair)
-                {
-                    value.values[pair] = Ops::fma(
-                        inputValue.values[pair], weightValue.values[pair],
-                        value.values[pair]);
-                }
-            }
-        }
-        Packed result;
-#pragma unroll
-        for (int32_t pair = 0; pair < 4; ++pair)
-        {
-            result.values[pair] = siluPair<T>(value.values[pair]);
-        }
-        *reinterpret_cast<Packed*>(
-            output + frameIndex * numChannels + channel) = result;
     }
 }
 
@@ -439,7 +373,7 @@ __global__ void parakeetConformerConvolutionAdjacentFrames(
 template <typename T>
 void launchLowPrecisionConvolution(T const* x,
     int32_t const* validLengths, T const* weight, T const* bias,
-    T* output, bool useAdjacentFrameKernel, bool usePackedKernel,
+    T* output, bool useAdjacentFrameKernel,
     int32_t blocks, int32_t threads, int64_t numElements,
     int32_t sequenceLength, int32_t numChannels, int32_t kernelSize,
     cudaStream_t stream)
@@ -447,12 +381,6 @@ void launchLowPrecisionConvolution(T const* x,
     if (useAdjacentFrameKernel)
     {
         parakeetConformerConvolutionAdjacentFrames<T>
-            <<<blocks, threads, 0, stream>>>(x, validLengths, weight, bias,
-                numElements, sequenceLength, numChannels, kernelSize, output);
-    }
-    else if (usePackedKernel)
-    {
-        parakeetConformerConvolutionPackedEight<T>
             <<<blocks, threads, 0, stream>>>(x, validLengths, weight, bias,
                 numElements, sequenceLength, numChannels, kernelSize, output);
     }
@@ -464,18 +392,13 @@ void launchLowPrecisionConvolution(T const* x,
     }
 }
 
-// Current builds use the measured 256-thread adjacent-frame tactic. Historical
-// tactic IDs remain accepted so existing development engines retain their
-// original kernel; the plugin itself has no model-specific fields.
+// Current builds use the measured 256-thread adjacent-frame tactic for aligned
+// low-precision tensors. The pair kernel preserves support for channel counts
+// that cannot use the eight-channel vectorization, while FP32 uses float4.
 class ParakeetConvolutionPlugin final : public IPluginV3, public IPluginV3OneCore,
                                         public IPluginV3OneBuild, public IPluginV3OneRuntime
 {
 public:
-    explicit ParakeetConvolutionPlugin(int32_t tactic = 256) noexcept : mTactic(tactic)
-    {
-        mFields = {0, nullptr};
-    }
-
     IPluginCapability* getCapabilityInterface(PluginCapabilityType type) noexcept override
     {
         switch (type)
@@ -492,7 +415,7 @@ public:
 
     IPluginV3* clone() noexcept override
     {
-        return new (std::nothrow) ParakeetConvolutionPlugin(mTactic);
+        return new (std::nothrow) ParakeetConvolutionPlugin();
     }
 
     char const* getPluginName() const noexcept override
@@ -628,42 +551,22 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kTactics.size());
+        return 1;
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        if (tactics == nullptr
-            || nbTactics != static_cast<int32_t>(kTactics.size()))
+        if (tactics == nullptr || nbTactics != 1)
         {
             return 1;
         }
-        for (int32_t index = 0; index < nbTactics; ++index)
-        {
-            tactics[index] = kTactics[index];
-        }
+        tactics[0] = kTactic;
         return 0;
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
     {
-        for (int32_t validTactic : kTactics)
-        {
-            if (tactic == validTactic)
-            {
-                mTactic = tactic;
-                return 0;
-            }
-        }
-        for (int32_t legacyTactic : kLegacyTactics)
-        {
-            if (tactic == legacyTactic)
-            {
-                mTactic = tactic;
-                return 0;
-            }
-        }
-        return 1;
+        return tactic == kTactic ? 0 : 1;
     }
 
     char const* getTimingCacheID() noexcept override
@@ -728,42 +631,31 @@ public:
         // TensorRT calls onShapeChange before enqueue. Rechecking here keeps the
         // memory-safety contract local to the launch when a runtime invokes the
         // plugin outside the usual execution-context lifecycle.
-        if (onShapeChange(
-                inputDesc, kInputCount, outputDesc, kOutputCount)
-            != 0)
+        if (onShapeChange(inputDesc, kInputCount, outputDesc, kOutputCount) != 0)
         {
             return 1;
         }
 
-        // Clear caller launch status so the check below covers only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
-        int32_t const batch = inputDesc[0].dims.d[0];
-        int32_t const sequenceLength = inputDesc[0].dims.d[1];
-        int32_t const numChannels = inputDesc[0].dims.d[2];
-        int32_t const kernelSize = inputDesc[2].dims.d[0];
-        bool const adjacentFrameTactic =
-            mTactic >= kAdjacentFrameTacticOffset;
-        bool const useAdjacentFrameKernel = adjacentFrameTactic
-            && inputDesc[0].type != DataType::kFLOAT
-            && numChannels % 8 == 0;
-        bool const usePackedKernel = !adjacentFrameTactic
-            && mTactic >= kPackedTacticOffset
-            && inputDesc[0].type != DataType::kFLOAT
-            && numChannels % 8 == 0;
+        int32_t const batch = static_cast<int32_t>(inputDesc[0].dims.d[0]);
+        int32_t const sequenceLength = static_cast<int32_t>(inputDesc[0].dims.d[1]);
+        int32_t const numChannels = static_cast<int32_t>(inputDesc[0].dims.d[2]);
+        int32_t const kernelSize = static_cast<int32_t>(inputDesc[2].dims.d[0]);
+        bool const useAdjacentFrameKernel =
+            inputDesc[0].type != DataType::kFLOAT && numChannels % 8 == 0;
         int32_t const width = useAdjacentFrameKernel
-            ? 8
-            : (usePackedKernel ? 8 : vectorWidth(inputDesc[0].type));
+            ? 8 : vectorWidth(inputDesc[0].type);
         int32_t const temporalElements = useAdjacentFrameKernel
-            ? sequenceLength / 2 + sequenceLength % 2
-            : sequenceLength;
+            ? sequenceLength / 2 + sequenceLength % 2 : sequenceLength;
         int64_t const numElements = static_cast<int64_t>(batch)
             * temporalElements * (numChannels / width);
-        int32_t const threads = adjacentFrameTactic
-            ? mTactic - kAdjacentFrameTacticOffset
-            : (mTactic >= kPackedTacticOffset
-                    ? mTactic - kPackedTacticOffset
-                    : mTactic);
+        int32_t const threads = kThreads;
         int64_t const requiredBlocks =
             numElements / threads + (numElements % threads != 0);
         int32_t const blocks = static_cast<int32_t>(
@@ -776,7 +668,7 @@ public:
                 static_cast<half const*>(inputs[2]),
                 static_cast<half const*>(inputs[3]),
                 static_cast<half*>(outputs[0]), useAdjacentFrameKernel,
-                usePackedKernel, blocks, threads, numElements,
+                blocks, threads, numElements,
                 sequenceLength, numChannels, kernelSize, stream);
         }
         else if (inputDesc[0].type == DataType::kBF16)
@@ -787,7 +679,7 @@ public:
                 static_cast<__nv_bfloat16 const*>(inputs[2]),
                 static_cast<__nv_bfloat16 const*>(inputs[3]),
                 static_cast<__nv_bfloat16*>(outputs[0]),
-                useAdjacentFrameKernel, usePackedKernel, blocks, threads,
+                useAdjacentFrameKernel, blocks, threads,
                 numElements, sequenceLength, numChannels, kernelSize, stream);
         }
         else
@@ -814,15 +706,12 @@ public:
     }
 
 private:
-    int32_t mTactic{256};
     PluginFieldCollection mFields{};
 };
 
 class ParakeetConvolutionPluginCreator final : public IPluginCreatorV3One
 {
 public:
-    ParakeetConvolutionPluginCreator() noexcept { mFields = {0, nullptr}; }
-
     char const* getPluginName() const noexcept override
     {
         return kPluginName;
@@ -895,5 +784,5 @@ extern "C" bool initFastGpuAsrParakeetConvolutionPlugin() noexcept
         nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

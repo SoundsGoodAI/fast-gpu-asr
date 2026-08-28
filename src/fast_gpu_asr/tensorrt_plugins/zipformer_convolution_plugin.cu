@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <new>
@@ -38,6 +39,7 @@ constexpr int64_t kMaxBlocks = 65535;
 // Tactic IDs encode both the implementation and the CUDA block size.
 constexpr int32_t kAdjacentFrameTacticOffset = 2048;
 constexpr int32_t kFourFrameTacticOffset = 4096;
+constexpr int32_t kDefaultTactic = kAdjacentFrameTacticOffset + 256;
 constexpr std::array<int32_t, 6> kTactics{
     kAdjacentFrameTacticOffset + 128,
     kAdjacentFrameTacticOffset + 256,
@@ -45,6 +47,11 @@ constexpr std::array<int32_t, 6> kTactics{
     kFourFrameTacticOffset + 128,
     kFourFrameTacticOffset + 256,
     kFourFrameTacticOffset + 512,
+};
+constexpr std::array<int32_t, 3> kSingleImplementationTactics{
+    kAdjacentFrameTacticOffset + 128,
+    kAdjacentFrameTacticOffset + 256,
+    kAdjacentFrameTacticOffset + 512,
 };
 constexpr std::array<int32_t, 3> kDataInputIndexes{0, 2, 3};
 
@@ -58,6 +65,20 @@ constexpr bool isValidTactic(int32_t tactic) noexcept
         }
     }
     return false;
+}
+
+template <std::size_t Size>
+int32_t writeConvolutionTactics(
+    std::array<int32_t, Size> const& validTactics, int32_t* tactics,
+    int32_t nbTactics) noexcept
+{
+    if (tactics == nullptr
+        || nbTactics != static_cast<int32_t>(validTactics.size()))
+    {
+        return 1;
+    }
+    std::copy(validTactics.begin(), validTactics.end(), tactics);
+    return 0;
 }
 
 constexpr bool isSupportedDataType(DataType type) noexcept
@@ -257,6 +278,8 @@ struct alignas(8) PackedFourChannels
     typename LowPrecisionOps<T>::Pair values[2];
 };
 
+// The temporal kernels rely on aligned 16-byte and 8-byte transactions for
+// their eight-channel and four-channel vectors, respectively.
 static_assert(sizeof(PackedEightChannels<half>) == 16);
 static_assert(sizeof(PackedEightChannels<__nv_bfloat16>) == 16);
 static_assert(alignof(PackedEightChannels<half>) == 16);
@@ -559,20 +582,21 @@ void launchLowPrecisionConvolution(T const* x,
     }
 }
 
-// TensorRT times adjacent two-frame and four-frame implementations with three
-// block sizes for each concrete profile. FP32 uses the corresponding float4
-// kernel because CUDA has no packed float pair intrinsic analogous to half2 or
-// bfloat162.
+// TensorRT times three block sizes for every shape. FP16 and BF16 profiles whose
+// channel count supports the packed four-frame layout also compare that kernel
+// with the best supported baseline implementation. Other profiles advertise
+// only one implementation family, avoiding duplicate timings for identical
+// launches. FP32 always uses its float4 kernel because CUDA has no packed float
+// pair intrinsic analogous to half2 or bfloat162.
 class ZipformerConvolutionPlugin final : public IPluginV3, public IPluginV3OneCore,
                                         public IPluginV3OneBuild, public IPluginV3OneRuntime
 {
 public:
-    explicit ZipformerConvolutionPlugin(
-        int32_t tactic = kAdjacentFrameTacticOffset + 256) noexcept
-        : mTactic(tactic)
-    {
-        mFields = {0, nullptr};
-    }
+    ZipformerConvolutionPlugin() noexcept = default;
+
+    ZipformerConvolutionPlugin(
+        int32_t tactic, bool supportsFourFrameTactic) noexcept
+        : mTactic(tactic), mSupportsFourFrameTactic(supportsFourFrameTactic) {}
 
     IPluginCapability* getCapabilityInterface(PluginCapabilityType type) noexcept override
     {
@@ -590,7 +614,8 @@ public:
 
     IPluginV3* clone() noexcept override
     {
-        return new (std::nothrow) ZipformerConvolutionPlugin(mTactic);
+        return new (std::nothrow) ZipformerConvolutionPlugin(
+            mTactic, mSupportsFourFrameTactic);
     }
 
     char const* getPluginName() const noexcept override
@@ -652,13 +677,22 @@ public:
             optInputs[index] = inputs[index].opt;
             maxInputs[index] = inputs[index].max;
         }
-        return haveValidShapes(minInputs, outputs[0].min, inputs[0].desc.type)
+        bool const valid = haveValidShapes(
+                               minInputs, outputs[0].min, inputs[0].desc.type)
                 && haveValidShapes(
                     optInputs, outputs[0].opt, inputs[0].desc.type)
                 && haveValidShapes(
-                    maxInputs, outputs[0].max, inputs[0].desc.type)
-            ? 0
-            : 1;
+                    maxInputs, outputs[0].max, inputs[0].desc.type);
+        if (!valid)
+        {
+            return 1;
+        }
+        // Tactics are timed at the profile's optimization shape. Runtime shapes
+        // that cannot use the four-frame layout safely fall back to the packed
+        // pair kernel in enqueue().
+        mSupportsFourFrameTactic = inputs[0].desc.type != DataType::kFLOAT
+            && inputs[0].opt.d[2] % 4 == 0;
+        return 0;
     }
 
     int32_t getOutputDataTypes(DataType* outputTypes, int32_t nbOutputs,
@@ -726,21 +760,19 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kTactics.size());
+        return mSupportsFourFrameTactic
+            ? static_cast<int32_t>(kTactics.size())
+            : static_cast<int32_t>(kSingleImplementationTactics.size());
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        if (tactics == nullptr
-            || nbTactics != static_cast<int32_t>(kTactics.size()))
+        if (mSupportsFourFrameTactic)
         {
-            return 1;
+            return writeConvolutionTactics(kTactics, tactics, nbTactics);
         }
-        for (int32_t index = 0; index < nbTactics; ++index)
-        {
-            tactics[index] = kTactics[static_cast<size_t>(index)];
-        }
-        return 0;
+        return writeConvolutionTactics(
+            kSingleImplementationTactics, tactics, nbTactics);
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
@@ -823,8 +855,12 @@ public:
             return 1;
         }
 
-        // Clear caller launch status so the check below covers only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         int32_t const batch = static_cast<int32_t>(inputDesc[0].dims.d[0]);
         int32_t const sequenceLength =
@@ -912,15 +948,14 @@ public:
     }
 
 private:
-    int32_t mTactic{kAdjacentFrameTacticOffset + 256};
+    int32_t mTactic{kDefaultTactic};
+    bool mSupportsFourFrameTactic{false};
     PluginFieldCollection mFields{};
 };
 
 class ZipformerConvolutionPluginCreator final : public IPluginCreatorV3One
 {
 public:
-    ZipformerConvolutionPluginCreator() noexcept { mFields = {0, nullptr}; }
-
     char const* getPluginName() const noexcept override
     {
         return kPluginName;
@@ -993,5 +1028,5 @@ extern "C" bool initFastGpuAsrZipformerConvolutionPlugin() noexcept
         nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

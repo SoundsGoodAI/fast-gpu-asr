@@ -16,7 +16,7 @@ import tensorrt as trt
 import torch
 from omegaconf import DictConfig
 
-from ..constants import TRANSDUCER_DECODER_TYPES
+from ..constants import INT32_MAX, PARAKEET_MAX_ENCODER_FRAMES, TRANSDUCER_DECODER_TYPES
 from ..tensorrt_plugins import load_tensorrt_plugins
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         Configuration extracted from the source Parakeet ``.nemo`` archive.
     args : argparse.Namespace
         Parsed export arguments containing batch, beam, duration-profile, and
-        TensorRT workspace settings.
+        TensorRT build settings.
 
     Raises
     ------
@@ -50,6 +50,24 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         ("preprocessor.normalize", model_config.preprocessor.normalize, "per_feature"),
         ("preprocessor.window", model_config.preprocessor.window, "hann"),
         ("preprocessor.frame_splicing", model_config.preprocessor.frame_splicing, 1),
+        ("preprocessor.n_fft", model_config.preprocessor.get("n_fft", 512), 512),
+        ("preprocessor.log", model_config.preprocessor.get("log", True), True),
+        (
+            "preprocessor.mag_power",
+            model_config.preprocessor.get("mag_power", 2.0),
+            2.0,
+        ),
+        (
+            "preprocessor.mel_norm",
+            model_config.preprocessor.get("mel_norm", "slaney"),
+            "slaney",
+        ),
+        ("preprocessor.pad_to", model_config.preprocessor.get("pad_to", 0), 0),
+        (
+            "preprocessor.pad_value",
+            model_config.preprocessor.get("pad_value", 0.0),
+            0.0,
+        ),
         ("encoder.subsampling", model_config.encoder.subsampling, "dw_striding"),
         ("encoder.subsampling_factor", model_config.encoder.subsampling_factor, 8),
         (
@@ -139,12 +157,66 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         ),
         ("joint.jointnet.joint_hidden", model_config.joint.jointnet.joint_hidden),
         ("joint.num_extra_outputs", model_config.joint.num_extra_outputs),
+        ("decoding.greedy.max_symbols", model_config.decoding.greedy.max_symbols),
     )
     for name, value in positive_integer_values:
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f"Expected {name} to be a positive integer, got {value}.")
 
-    if args.batch_size < 1:
+    if model_config.encoder.d_model % 2 != 0:
+        raise ValueError(
+            "encoder.d_model must be even for relative positional encoding, got "
+            f"{model_config.encoder.d_model}."
+        )
+    if model_config.encoder.d_model != model_config.joint.jointnet.encoder_hidden:
+        raise ValueError(
+            "encoder.d_model and joint.jointnet.encoder_hidden must match, got "
+            f"{model_config.encoder.d_model} and "
+            f"{model_config.joint.jointnet.encoder_hidden}."
+        )
+    if model_config.encoder.d_model % model_config.encoder.n_heads != 0:
+        raise ValueError(
+            "encoder.d_model must be divisible by encoder.n_heads, got "
+            f"d_model={model_config.encoder.d_model} and "
+            f"n_heads={model_config.encoder.n_heads}."
+        )
+
+    convolution_alignment = 4 if args.encoder_precision == "fp32" else 2
+    if model_config.encoder.d_model % convolution_alignment != 0:
+        raise ValueError(
+            "encoder.d_model must be divisible by "
+            f"{convolution_alignment} for {args.encoder_precision} "
+            "Parakeet convolution."
+        )
+    if model_config.encoder.conv_kernel_size % 2 == 0:
+        raise ValueError(
+            "encoder.conv_kernel_size must be odd, got "
+            f"{model_config.encoder.conv_kernel_size}."
+        )
+
+    durations = list(model_config.model_defaults.tdt_durations)
+    if not durations or any(
+        not isinstance(duration, int) or not 0 <= duration <= INT32_MAX
+        for duration in durations
+    ):
+        raise ValueError(
+            "model_defaults.tdt_durations must contain non-negative signed "
+            "32-bit integers."
+        )
+    if len(durations) != len(set(durations)):
+        raise ValueError("model_defaults.tdt_durations must contain unique values.")
+    if len(durations) != model_config.joint.num_extra_outputs:
+        raise ValueError(
+            "The number of model_defaults.tdt_durations must match "
+            "joint.num_extra_outputs."
+        )
+    if 0 not in durations or all(duration == 0 for duration in durations):
+        raise ValueError(
+            "model_defaults.tdt_durations must contain zero and at least one "
+            "positive duration."
+        )
+
+    if not isinstance(args.batch_size, int) or args.batch_size < 1:
         raise ValueError(f"batch_size must be positive, got {args.batch_size}.")
 
     audio_seconds = (
@@ -158,23 +230,71 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             f"max_audio_seconds, got {audio_seconds}."
         )
 
-    if args.beam < 1:
+    if audio_seconds[2] > INT32_MAX / model_config.sample_rate:
+        raise ValueError(
+            "max_audio_seconds exceeds the signed 32-bit TensorRT audio-sample "
+            f"dimension at {model_config.sample_rate} Hz."
+        )
+
+    if not isinstance(args.beam, int) or args.beam < 1:
         raise ValueError(f"beam must be positive, got {args.beam}.")
     if args.beam > model_config.decoder.vocab_size:
         raise ValueError(
             f"beam must not exceed decoder.vocab_size, got beam={args.beam} and "
             f"decoder.vocab_size={model_config.decoder.vocab_size}."
         )
-    if not 0 <= args.optimization_level <= 5:
+
+    decoder_capacity = args.batch_size * args.beam
+    if decoder_capacity > INT32_MAX:
         raise ValueError(
-            f"optimization_level must be in [0, 5], got {args.optimization_level}."
+            "batch_size * beam must fit in a signed 32-bit decoder dimension, "
+            f"got {decoder_capacity}."
         )
 
+    decoder_dim = model_config.decoder.prednet.pred_hidden
+    pred_rnn_layers = model_config.decoder.prednet.pred_rnn_layers
+    decoder_tensor_elements = {
+        "encoder_output": decoder_capacity * model_config.joint.jointnet.encoder_hidden,
+        "targets": decoder_capacity,
+        "input_states_1": pred_rnn_layers * decoder_capacity * decoder_dim,
+        "input_states_2": pred_rnn_layers * decoder_capacity * decoder_dim,
+        "token_log_probs": decoder_capacity * (model_config.decoder.vocab_size + 1),
+        "duration_log_probs": decoder_capacity * model_config.joint.num_extra_outputs,
+        "output_states_1": pred_rnn_layers * decoder_capacity * decoder_dim,
+        "output_states_2": pred_rnn_layers * decoder_capacity * decoder_dim,
+    }
+    for name, elements in decoder_tensor_elements.items():
+        if elements > INT32_MAX:
+            raise ValueError(
+                f"Parakeet decoder tensor {name} exceeds signed 32-bit indexing: "
+                f"{elements} elements, limit={INT32_MAX}."
+            )
+
+    model_dim = model_config.encoder.d_model
+    feed_forward_dim = model_dim * model_config.encoder.ff_expansion_factor
+    joiner_dim = model_config.joint.jointnet.joint_hidden
+    vocab_size = model_config.decoder.vocab_size
+    num_extra_outputs = model_config.joint.num_extra_outputs
+    parameter_tensor_elements = {
+        "encoder feed-forward weight": model_dim * feed_forward_dim,
+        "decoder embedding weight": (vocab_size + 1) * decoder_dim,
+        "decoder recurrent weight": 4 * decoder_dim * decoder_dim,
+        "decoder encoder projection weight": model_dim * joiner_dim,
+        "decoder output projection weight": (vocab_size + 1 + num_extra_outputs)
+        * joiner_dim,
+    }
+    for name, elements in parameter_tensor_elements.items():
+        if elements > INT32_MAX:
+            raise ValueError(
+                f"The Parakeet {name} exceeds signed 32-bit indexing: "
+                f"{elements} elements, limit={INT32_MAX}."
+            )
+
     sample_rate = model_config.sample_rate
-    hop_length = round(model_config.preprocessor.window_stride * sample_rate)
     frame_shift_ms = round(model_config.preprocessor.window_stride * 1000)
     frame_length_ms = round(model_config.preprocessor.window_size * 1000)
     win_length = frame_length_ms * sample_rate // 1000
+    hop_length = frame_shift_ms * sample_rate // 1000
     if win_length < 2:
         raise ValueError(
             f"preprocessor.window_size produces a {win_length}-sample window; "
@@ -189,6 +309,14 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             "preprocessor.window_stride must not exceed preprocessor.window_size."
         )
 
+    n_fft = model_config.preprocessor.get("n_fft", 512)
+    constructed_n_fft = 2 ** (win_length - 1).bit_length()
+    if constructed_n_fft != n_fft:
+        raise ValueError(
+            f"preprocessor.window_size requires n_fft={constructed_n_fft}, "
+            f"but the model config specifies n_fft={n_fft}."
+        )
+
     min_samples = round(args.min_audio_seconds * sample_rate)
     if min_samples < 2 * hop_length:
         raise ValueError(
@@ -198,7 +326,21 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
 
     max_samples = round(args.max_audio_seconds * sample_rate)
     feature_frames = max_samples // hop_length + 1
+    transform_bytes = args.batch_size * feature_frames * (n_fft + 2) * 4
+    cublas_offset = (transform_bytes + 255) // 256 * 256
+    if cublas_offset + (16 << 20) > INT32_MAX:
+        raise ValueError(
+            "The maximum Parakeet profile exceeds the feature plugin's signed "
+            "32-bit TensorRT workspace limit."
+        )
+
     encoder_frames = (((feature_frames + 1) // 2 + 1) // 2 + 1) // 2
+    if encoder_frames > PARAKEET_MAX_ENCODER_FRAMES:
+        raise ValueError(
+            f"The maximum profile produces {encoder_frames} encoder frames, but "
+            "the Parakeet FlashAttention plugin supports at most "
+            f"{PARAKEET_MAX_ENCODER_FRAMES}."
+        )
     if encoder_frames > model_config.encoder.pos_emb_max_len:
         raise ValueError(
             f"The maximum profile produces {encoder_frames} encoder frames, but "
@@ -231,8 +373,8 @@ def validate_zipformer(
         Decoder vocabulary size represented by the SentencePiece tokenizer and
         model output heads.
     args : argparse.Namespace
-        Parsed export arguments containing decoder, batch, beam,
-        duration-profile, and TensorRT workspace settings.
+        Parsed export arguments containing decoder, batch, beam, duration-profile,
+        and TensorRT build settings.
 
     Raises
     ------
@@ -312,16 +454,8 @@ def validate_zipformer(
     ):
         raise ValueError("The model configuration does not enable the transducer head.")
 
-    if (
-        decoder_type != "ctc_greedy_search"
-        and model_config.model_params.context_size > 2
-    ):
-        raise ValueError(
-            "The predictor context cache supports context_size at most 2, got "
-            f"{model_config.model_params.context_size}."
-        )
-
     positive_integer_values = (
+        ("vocab_size", vocab_size),
         ("min_encoder_input_frames", model_config.min_encoder_input_frames),
         ("feature_opts.mel_opts.num_bins", model_config.feature_opts.mel_opts.num_bins),
         ("model_params.feature_dim", model_config.model_params.feature_dim),
@@ -334,6 +468,42 @@ def validate_zipformer(
     for name, value in positive_integer_values:
         if not isinstance(value, int) or value < 1:
             raise ValueError(f"Expected {name} to be a positive integer, got {value}.")
+
+    if model_config.model_params.pos_dim % 2 != 0:
+        raise ValueError(
+            "Expected model_params.pos_dim to be even, got "
+            f"{model_config.model_params.pos_dim}."
+        )
+
+    if decoder_type != "ctc_greedy_search":
+        if model_config.model_params.context_size > 2:
+            raise ValueError(
+                "The predictor context cache supports context_size at most 2, got "
+                f"{model_config.model_params.context_size}."
+            )
+
+        decoder_dim = model_config.model_params.decoder_dim
+        convolution_groups = decoder_dim // 4
+        if model_config.model_params.context_size > 1 and (
+            convolution_groups < 1 or decoder_dim % convolution_groups != 0
+        ):
+            raise ValueError(
+                "model_params.decoder_dim must produce a positive "
+                "grouped-convolution count that divides it exactly, got "
+                f"{decoder_dim}."
+            )
+
+    if model_config.feature_opts.mel_opts.num_bins < 7:
+        raise ValueError(
+            "Zipformer convolutional subsampling requires at least seven mel "
+            f"bins, got {model_config.feature_opts.mel_opts.num_bins}."
+        )
+
+    if model_config.min_encoder_input_frames < 9:
+        raise ValueError(
+            "Zipformer convolutional subsampling requires at least nine input "
+            f"frames, got {model_config.min_encoder_input_frames}."
+        )
 
     low_freq = model_config.feature_opts.mel_opts.low_freq
     high_freq = model_config.feature_opts.mel_opts.high_freq
@@ -369,12 +539,12 @@ def validate_zipformer(
         "encoder_dim",
         "cnn_module_kernel",
     )
-    encoder_dims: list[int] = []
+    parsed_sequences: dict[str, list[int]] = {}
     for name in sequence_names:
         value = model_config.model_params[name]
         try:
             values = [int(item) for item in value.split(",")]
-        except ValueError as error:
+        except (AttributeError, TypeError, ValueError) as error:
             raise ValueError(
                 f"Expected model_params.{name} to contain only integers, got {value}."
             ) from error
@@ -384,8 +554,28 @@ def validate_zipformer(
                 f"Expected model_params.{name} to contain six positive integers, "
                 f"got {values}."
             )
-        if name == "encoder_dim":
-            encoder_dims = values
+        parsed_sequences[name] = values
+
+    encoder_dims = parsed_sequences["encoder_dim"]
+    cnn_module_kernels = parsed_sequences["cnn_module_kernel"]
+
+    convolution_alignment = 4 if args.encoder_precision == "fp32" else 2
+    if any(dimension % convolution_alignment != 0 for dimension in encoder_dims):
+        raise ValueError(
+            "Every model_params.encoder_dim value must be divisible by "
+            f"{convolution_alignment} for {args.encoder_precision} Zipformer "
+            "convolution."
+        )
+
+    output_assembly_alignment = 4 if args.encoder_precision == "fp32" else 8
+    if any(
+        dimension % output_assembly_alignment != 0 for dimension in encoder_dims[3:]
+    ):
+        raise ValueError(
+            "The final three model_params.encoder_dim values must be divisible by "
+            f"{output_assembly_alignment} for {args.encoder_precision} Zipformer "
+            "output assembly."
+        )
 
     if not (
         encoder_dims[0]
@@ -400,37 +590,73 @@ def validate_zipformer(
             f"stack and nonincreasing afterward, but got {encoder_dims}."
         )
 
+    if any(kernel_size % 2 == 0 for kernel_size in cnn_module_kernels):
+        raise ValueError(
+            "Every model_params.cnn_module_kernel value must be odd, got "
+            f"{cnn_module_kernels}."
+        )
+
+    head_dims: dict[str, int] = {}
     for name in ("query_head_dim", "value_head_dim", "pos_head_dim"):
         value = model_config.model_params[name]
+        if type(value) not in (int, str):
+            raise ValueError(
+                f"Expected model_params.{name} to contain one integer, got {value}."
+            )
         try:
             parsed_value = int(value)
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             raise ValueError(
                 f"Expected model_params.{name} to contain one integer, got {value}."
             ) from error
+
         if parsed_value < 1:
             raise ValueError(
-                f"Expected model_params.{name} to contain one positive integer, "
-                f"got {parsed_value}."
+                f"Expected model_params.{name} to contain one positive integer, got "
+                f"{parsed_value}."
             )
+
+        head_dims[name] = parsed_value
+
+    if head_dims["pos_head_dim"] != 4:
+        raise ValueError(
+            "The Zipformer relative-attention TensorRT plugin requires "
+            f"model_params.pos_head_dim=4, got {head_dims['pos_head_dim']}."
+        )
 
     use_ctc = decoder_type == "ctc_greedy_search"
     projection_prefix = "ctc_output.1" if use_ctc else "projection_output"
     projection_weight = f"{projection_prefix}.weight"
-    if projection_weight not in state_dict:
+    projection_bias = f"{projection_prefix}.bias"
+    if projection_weight not in state_dict or projection_bias not in state_dict:
         raise RuntimeError(
             f"The checkpoint does not contain the {projection_prefix} head "
             f"required by {decoder_type}."
         )
 
-    output_dim = state_dict[projection_weight].size(0)
+    weight = state_dict[projection_weight]
+    output_dim = weight.size(0)
+    input_dim = weight.size(1)
+    expected_input_dim = max(encoder_dims)
+    if input_dim != expected_input_dim:
+        raise RuntimeError(
+            f"The {projection_prefix} head accepts {input_dim} input features, but "
+            f"model_params.encoder_dim requires {expected_input_dim}."
+        )
+
     if use_ctc and output_dim != vocab_size:
         raise RuntimeError(
             f"The CTC head contains {output_dim} outputs, "
             f"but the decoder vocabulary contains {vocab_size} tokens."
         )
 
-    if args.batch_size < 1:
+    if not use_ctc and output_dim != model_config.model_params.joiner_dim:
+        raise RuntimeError(
+            f"The transducer projection contains {output_dim} outputs, but "
+            f"model_params.joiner_dim is {model_config.model_params.joiner_dim}."
+        )
+
+    if not isinstance(args.batch_size, int) or args.batch_size < 1:
         raise ValueError(f"batch_size must be positive, got {args.batch_size}.")
 
     audio_seconds = (
@@ -438,17 +664,51 @@ def validate_zipformer(
         args.opt_audio_seconds,
         args.max_audio_seconds,
     )
-    if not 0.0 < audio_seconds[0] <= audio_seconds[1] <= audio_seconds[2]:
+    if (
+        not all(isinstance(value, (int, float)) for value in audio_seconds)
+        or not 0.0 < audio_seconds[0] <= audio_seconds[1] <= audio_seconds[2]
+    ):
         raise ValueError(
             "Expected 0 < min_audio_seconds <= opt_audio_seconds <= "
             f"max_audio_seconds, got {audio_seconds}."
         )
 
-    if args.beam < 1:
-        raise ValueError(f"beam must be positive, got {args.beam}.")
-    if not 0 <= args.optimization_level <= 5:
+    if audio_seconds[2] > INT32_MAX / model_config.feature_opts.frame_opts.samp_freq:
         raise ValueError(
-            f"optimization_level must be in [0, 5], got {args.optimization_level}."
+            "max_audio_seconds exceeds the signed 32-bit TensorRT audio-sample "
+            "dimension at "
+            f"{model_config.feature_opts.frame_opts.samp_freq} Hz."
+        )
+
+    if not isinstance(args.beam, int) or args.beam < 1:
+        raise ValueError(f"beam must be positive, got {args.beam}.")
+
+    if decoder_type != "ctc_greedy_search":
+        decoder_capacity = args.batch_size
+        if decoder_type == "transducer_modified_beam_search":
+            decoder_capacity *= args.beam
+        if decoder_capacity > INT32_MAX:
+            raise ValueError(
+                "The Zipformer decoder capacity exceeds signed 32-bit indexing: "
+                f"{decoder_capacity} hypotheses, limit={INT32_MAX}."
+            )
+
+        decoder_tensor_elements = {
+            "decoder_input": decoder_capacity * model_config.model_params.joiner_dim,
+            "encoder_output": decoder_capacity * model_config.model_params.joiner_dim,
+            "tokens_log_prob": decoder_capacity * vocab_size,
+        }
+        for name, elements in decoder_tensor_elements.items():
+            if elements > INT32_MAX:
+                raise ValueError(
+                    f"Zipformer decoder tensor {name} exceeds signed 32-bit "
+                    f"indexing: {elements} elements, limit={INT32_MAX}."
+                )
+
+    if args.batch_size > (1 << 16) - 1:
+        raise ValueError(
+            "batch_size exceeds the Zipformer resampling plugin's CUDA grid.z "
+            f"limit of 65535, got {args.batch_size}."
         )
 
     sample_rate = model_config.feature_opts.frame_opts.samp_freq
@@ -480,6 +740,25 @@ def validate_zipformer(
             f"the model requires at least {model_config.min_encoder_input_frames}."
         )
 
+    max_audio_samples = round(args.max_audio_seconds * sample_rate)
+    max_feature_frames = (max_audio_samples + frame_shift // 2) // frame_shift
+    max_encoder_frames = (max_feature_frames - 7) // 2
+    if max_encoder_frames > (1 << 16) - 1:
+        raise ValueError(
+            "max_audio_seconds produces "
+            f"{max_encoder_frames} encoder frames, exceeding the Zipformer "
+            "resampling plugin's CUDA grid.y limit of 65535."
+        )
+
+    fft_length = 2 ** (frame_length - 1).bit_length()
+    transform_bytes = args.batch_size * max_feature_frames * (fft_length + 2) * 4
+    cublas_offset = (transform_bytes + 255) // 256 * 256
+    if cublas_offset + (16 << 20) > INT32_MAX:
+        raise ValueError(
+            "The maximum Zipformer profile exceeds the feature plugin's signed "
+            "32-bit TensorRT workspace limit."
+        )
+
 
 def remove_onnx_artifacts(onnx_path: Path) -> None:
     """Remove an ONNX graph and its adjacent external-data artifacts.
@@ -491,7 +770,7 @@ def remove_onnx_artifacts(onnx_path: Path) -> None:
         are removed from the same directory.
     """
 
-    if onnx_path.is_file():
+    try:
         model = onnx.load(onnx_path, load_external_data=False)
         external_data_locations = {
             entry.value
@@ -501,7 +780,8 @@ def remove_onnx_artifacts(onnx_path: Path) -> None:
         }
         for location in external_data_locations:
             (onnx_path.parent / location).unlink(missing_ok=True)
-    onnx_path.unlink(missing_ok=True)
+    finally:
+        onnx_path.unlink(missing_ok=True)
 
 
 def build_tensorrt_engine(
@@ -542,10 +822,11 @@ def build_tensorrt_engine(
         cannot be parsed, or the serialized engine cannot be built.
     """
 
-    load_tensorrt_plugins()
     trt_logger = trt.Logger(trt.Logger.INFO)
     if not trt.init_libnvinfer_plugins(trt_logger, ""):
         raise RuntimeError("Failed to initialize TensorRT plugins.")
+
+    load_tensorrt_plugins()
 
     builder = trt.Builder(trt_logger)
     network_flags = 1 << int(
@@ -574,7 +855,6 @@ def build_tensorrt_engine(
         builder_config.set_flag(trt.BuilderFlag.BF16)
     builder_config.set_preview_feature(trt.PreviewFeature.ALIASED_PLUGIN_IO_10_03, True)
     builder_config.builder_optimization_level = optimization_level
-    builder_config.tiling_optimization_level = trt.TilingOptimizationLevel.FULL
 
     dynamic_input_names = {
         network.get_input(index).name
@@ -584,7 +864,7 @@ def build_tensorrt_engine(
     if dynamic_input_names != set(profiles):
         raise ValueError(
             f"Expected TensorRT profiles for {sorted(dynamic_input_names)}, got "
-            f"{sorted(profiles)}.",
+            f"{sorted(profiles)}."
         )
 
     if profiles:

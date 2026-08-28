@@ -62,12 +62,7 @@ class Decoder(torch.nn.Module):
         targets: torch.Tensor,
         input_states_1: torch.Tensor,
         input_states_2: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the TDT prediction network and joiner for all active hypotheses.
 
         Parameters
@@ -118,9 +113,4 @@ class Decoder(torch.nn.Module):
             joiner_out[:, self.vocab_size + 1 :].to(torch.float32), dim=1
         )
 
-        return (
-            token_log_probs,
-            duration_log_probs,
-            output_states_1,
-            output_states_2,
-        )
+        return token_log_probs, duration_log_probs, output_states_1, output_states_2

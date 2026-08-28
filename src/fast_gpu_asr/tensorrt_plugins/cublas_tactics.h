@@ -2,11 +2,12 @@
 
 #pragma once
 
+#include <NvInferRuntimeBase.h>
 #include <cublas_v2.h>
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace fastgpuasr_tensorrt
 {
@@ -14,20 +15,41 @@ namespace fastgpuasr_tensorrt
 // TensorRT reserves tactic zero while selecting an implementation. Positive
 // IDs keep that sentinel distinct from the cuBLAS compute modes serialized in
 // an engine.
-constexpr int32_t kStrictComputeTactic = 1;
-constexpr int32_t kFast16FComputeTactic = 2;
-constexpr int32_t kFast16BFComputeTactic = 3;
-constexpr int32_t kFastTF32ComputeTactic = 4;
-constexpr std::array<int32_t, 4> kCublasComputeTactics{
+inline constexpr int32_t kStrictComputeTactic = 1;
+inline constexpr int32_t kFast16FComputeTactic = 2;
+inline constexpr int32_t kFast16BFComputeTactic = 3;
+inline constexpr int32_t kFastTF32ComputeTactic = 4;
+inline constexpr std::array<int32_t, 4> kCublasComputeTactics{
     kStrictComputeTactic,
     kFast16FComputeTactic,
     kFast16BFComputeTactic,
     kFastTF32ComputeTactic,
 };
 
-constexpr bool isCublasComputeTactic(int32_t tactic) noexcept
+// The FAST_* modes require FP32 A, B, and C storage and alter the internal
+// multiplication precision. GEMMs with FP16 or BF16 storage therefore retain
+// strict FP32 accumulation.
+inline constexpr std::array<int32_t, 1> kReducedStorageCublasComputeTactics{
+    kStrictComputeTactic,
+};
+
+constexpr std::span<int32_t const> getCublasComputeTactics(
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
 {
-    for (int32_t const candidate : kCublasComputeTactics)
+    switch (type)
+    {
+    case nvinfer1::DataType::kHALF:
+    case nvinfer1::DataType::kBF16:
+        return kReducedStorageCublasComputeTactics;
+    case nvinfer1::DataType::kFLOAT: return kCublasComputeTactics;
+    default: return {};
+    }
+}
+
+constexpr bool isCublasComputeTactic(int32_t tactic,
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
+{
+    for (int32_t const candidate : getCublasComputeTactics(type))
     {
         if (candidate == tactic)
         {
@@ -35,6 +57,12 @@ constexpr bool isCublasComputeTactic(int32_t tactic) noexcept
         }
     }
     return false;
+}
+
+constexpr int32_t getCublasComputeTacticCount(
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
+{
+    return static_cast<int32_t>(getCublasComputeTactics(type).size());
 }
 
 constexpr cublasComputeType_t getCublasComputeType(int32_t tactic) noexcept
@@ -51,30 +79,37 @@ constexpr cublasComputeType_t getCublasComputeType(int32_t tactic) noexcept
     }
 }
 
-inline int32_t writeCublasComputeTactics(
-    int32_t* tactics, int32_t nbTactics) noexcept
+inline int32_t writeCublasComputeTactics(int32_t* tactics,
+    int32_t nbTactics,
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
 {
+    std::span<int32_t const> const validTactics =
+        getCublasComputeTactics(type);
     if (tactics == nullptr
-        || nbTactics != static_cast<int32_t>(kCublasComputeTactics.size()))
+        || validTactics.empty()
+        || nbTactics != static_cast<int32_t>(validTactics.size()))
     {
         return 1;
     }
-    for (std::size_t index = 0; index < kCublasComputeTactics.size(); ++index)
+    for (int32_t const tactic : validTactics)
     {
-        tactics[index] = kCublasComputeTactics[index];
+        *tactics++ = tactic;
     }
     return 0;
 }
 
-inline int32_t setCublasComputeTactic(
-    int32_t tactic, int32_t& selectedTactic) noexcept
+inline int32_t setCublasComputeTactic(int32_t tactic,
+    int32_t& selectedTactic,
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
 {
-    // TensorRT reserves zero for the default tactic before autotuning.
+    // TensorRT restores a serialized tactic before runtime shapes are known.
+    // The default FP32 type deliberately accepts every compute tactic here;
+    // onShapeChange validates it again against the concrete tensor type.
     if (tactic == 0)
     {
         tactic = kStrictComputeTactic;
     }
-    if (!isCublasComputeTactic(tactic))
+    if (!isCublasComputeTactic(tactic, type))
     {
         return 1;
     }

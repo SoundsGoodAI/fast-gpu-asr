@@ -55,6 +55,7 @@ class SelfAttention(torch.nn.Module):
         """
 
         x = self.in_proj(x)  # (batch_size, seq_len, num_heads * value_head_dim)
+        attn_weights = attn_weights.to(x.dtype)
 
         if torch.onnx.is_in_onnx_export():
             x = torch.onnx.ops.symbolic(
@@ -73,7 +74,7 @@ class SelfAttention(torch.nn.Module):
             x = x.reshape(
                 batch_size, x.size(1), self.num_heads, x.size(2) // self.num_heads
             ).permute(0, 2, 1, 3)
-            x = torch.matmul(attn_weights.to(x.dtype), x)
+            x = torch.matmul(attn_weights, x)
             x = x.permute(0, 2, 1, 3)
             x = x.reshape(batch_size, x.size(1), self.num_heads * x.size(3))
 
@@ -127,6 +128,7 @@ class NonlinAttention(torch.nn.Module):
 
         s, x, y = x.chunk(3, dim=2)
         x = x * torch.tanh(s)
+        attn_weights = attn_weights.to(x.dtype)
 
         if torch.onnx.is_in_onnx_export():
             x = torch.onnx.ops.symbolic(
@@ -138,7 +140,7 @@ class NonlinAttention(torch.nn.Module):
                 version=ONNX_OPSET_VERSION,
             )
         else:
-            x = torch.matmul(attn_weights[:, 0].to(x.dtype), x)
+            x = torch.matmul(attn_weights[:, 0], x)
 
         x = x * y
         x = self.out_proj(x)
@@ -170,7 +172,8 @@ class RelPositionMultiheadAttentionWeights(torch.nn.Module):
         query_head_dim : int
             The dimension of the query and key per head.
         pos_head_dim : int
-            The dimension of the projected positional encoding per head.
+            The dimension of the projected positional encoding per head. The
+            native TensorRT relative-attention plugin requires four channels.
         """
 
         super().__init__()
@@ -200,14 +203,17 @@ class RelPositionMultiheadAttentionWeights(torch.nn.Module):
             The singleton batch dimension is broadcast across the input batch.
         key_padding_mask : torch.Tensor[torch.bool]
             Padding mask with shape ``(batch_size, seq_len)``. True positions
-            are excluded as attention sources.
+            must form one contiguous suffix and are excluded as attention
+            sources.
 
         Returns
         -------
         torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Attention weights with shape ``(batch_size, num_heads, seq_len, seq_len)``.
             ONNX export represents the complete calculation with the native
-            Zipformer relative-attention TensorRT plugin.
+            Zipformer relative-attention TensorRT plugin. Query rows at least
+            seven positions inside the padded suffix are zero because they
+            cannot contribute to a valid downstream convolution output.
         """
 
         projection = self.in_proj(x)
@@ -274,8 +280,18 @@ class RelPositionMultiheadAttentionWeights(torch.nn.Module):
 
         scores = torch.matmul(query, key)
         scores = scores + position_scores[:, :, :, :sequence_length]
-        scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), -1000.0)
-        scores = torch.softmax(scores, dim=3)
+        expanded_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+        scores = torch.softmax(scores.masked_fill(expanded_mask, float("-inf")), dim=3)
+        # Define an all-masked row as zero and make source exclusion exact.
+        scores = scores.masked_fill(expanded_mask, 0.0)
+        if sequence_length > 7:
+            query_padding_mask = torch.cat(
+                (torch.zeros_like(key_padding_mask[:, :7]), key_padding_mask[:, :-7]),
+                dim=1,
+            )
+            scores = scores.masked_fill(
+                query_padding_mask.unsqueeze(1).unsqueeze(3), 0.0
+            )
 
         return scores
 
@@ -303,20 +319,9 @@ class CompactRelPositionalEncoding(torch.nn.Module):
             The positional embedding dimension.
         max_length : int
             The maximum input length supported by the exported inference profile.
-
-        Raises
-        ------
-        ValueError
-            Raised when ``embed_dim`` is odd.
         """
 
         super().__init__()
-
-        if embed_dim % 2 != 0:
-            raise ValueError(
-                "Embedding dimension for CompactRelPositionalEncoding "
-                f"should be an even number, but got {embed_dim}.",
-            )
 
         # if max_length == 4, the x would contain [-3, -2, -1, 0, 1, 2, 3]
         x = torch.arange(-max_length + 1, max_length, dtype=torch.float32)
@@ -364,7 +369,9 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Relative positional embeddings with shape
             ``(1, 2 * seq_len - 1, embed_dim)``. The singleton batch dimension
-            avoids repeating the same positional table for every utterance.
+            avoids repeating the same positional table for every utterance. The
+            dtype and device follow this module's registered positional buffer;
+            callers must place the module and input on compatible devices.
         """
 
         # (2 * seq_len - 1, embed_dim), i.e. (pos_len, embed_dim).

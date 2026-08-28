@@ -1,129 +1,176 @@
 # Fast GPU ASR
 
-**Fast GPU ASR** is a batched TensorRT runtime and exporter for offline
-Zipformer transducers and NVIDIA Parakeet TDT models.
+**Fast GPU ASR** exports supported offline Zipformer and NVIDIA Parakeet TDT
+checkpoints to fixed-capacity TensorRT bundles and runs batched speech recognition
+without Icefall or NeMo in the inference environment.
 
-The initial model targets are:
+Validated model targets include:
 
-- `soundsgoodai/Zipformer-transducer-XL-290M`
-- `soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M`
-- `nvidia/parakeet-tdt-0.6b-v2`
-- `nvidia/parakeet-tdt-0.6b-v3`
+- [`soundsgoodai/Zipformer-transducer-XL-290M`](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M)
+- [`soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M`](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M)
+- [`nvidia/parakeet-tdt-0.6b-v2`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
+- [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+
+Other noncausal Icefall Zipformer checkpoints can be exported when their
+configuration and checkpoint layout satisfy the exporter's validation rules.
 
 The runtime is designed for throughput-oriented GPU inference:
 
-- fixed utterance batches with dynamic audio duration;
+- fixed batch capacity with a dynamic audio-duration profile;
 - waveform feature extraction and acoustic encoding in one TensorRT engine;
-- encoder embeddings retained on the GPU;
-- a second fixed-capacity TensorRT engine for prediction-network and joiner
-  inference;
-- batched Zipformer modified beam search;
-- batched transducer beam-one search and CTC greedy search;
-- batched Parakeet TDT modified beam search with recurrent states
-  retained on the GPU;
+- a second TensorRT engine for transducer prediction-network and joiner inference;
+- CTC greedy, Zipformer modified-beam, and Parakeet TDT modified-beam decoders;
+- decoder state, hypothesis histories, and encoder embeddings retained on the GPU;
 - reusable CuPy device buffers and pinned host buffers;
-- no Icefall or NeMo dependency at inference time.
+- CUDA graph replay for recurring input shapes when capture is supported;
+- text and word-level timestamps returned for every input waveform.
 
-The current production runtime targets high-throughput deployment. On an
-NVIDIA H100, the batch-64 Zipformer greedy, CTC, and beam-6 transducer paths
-exceed the initial 6,100-6,200 RTFx target for the 15-second optimization
-profile. Batched Parakeet v2 and v3 inference also exceeds 7,000 aggregate
-RTFx across the seven public cleaned Open ASR Leaderboard datasets.
+## Requirements
+
+Fast GPU ASR currently supports Linux x86-64, Python 3.12 through 3.14, CUDA 13,
+and TensorRT 11.2.1.2 or newer within the TensorRT 11 release family. CUDA is a
+mandatory runtime dependency.
+
+The packaged plugins contain native code for `sm_80`, `sm_86`, `sm_87`, `sm_88`,
+`sm_89`, `sm_90`, `sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121`, plus a
+`compute_80` PTX fallback. A sufficiently recent NVIDIA driver is still required.
+
+Building the native plugins from a repository checkout additionally requires:
+
+- a CUDA-compatible host compiler with C++20 support;
+- TensorRT 11 development headers, including `NvInfer.h`;
+- enough host and GPU memory for TensorRT tactic selection.
+
+`nvcc`, CUDA headers, cuBLAS, cuFFT, the CUDA runtime, TensorRT Python bindings,
+and TensorRT runtime libraries are supplied by the required Python packages. The
+plugin build resolves and links those wheel-provided libraries directly.
 
 ## Installation
 
-From a repository checkout, install the runtime for the CUDA major version
-available on the deployment machine:
+From a repository checkout, create the locked runtime environment and compile the
+nine native TensorRT plugins:
 
 ```bash
-uv sync --extra cuda12
-# or
-uv sync --extra cuda13
+uv sync --frozen
+uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
 ```
 
-Choose exactly one CUDA extra. CuPy and TensorRT wheels are tied to a CUDA
-major version, so `cuda12` and `cuda13` should not be installed together. The
-project resolves Torch from the PyTorch CPU wheel index when installed with
-`uv`; GPU execution is provided by the selected CuPy and TensorRT wheels.
+The project resolves Torch from the PyTorch CPU wheel index when installed with
+`uv`. GPU execution is provided by CuPy, TensorRT, and the native CUDA plugins;
+CUDA-enabled Torch is not required.
 
-Install ONNX dependencies for model export:
+Install the additional ONNX dependencies before exporting models:
 
 ```bash
-uv sync --extra cuda12 --extra export
-# or
-uv sync --extra cuda13 --extra export
+uv sync --frozen --extra export
 ```
 
-TensorRT engines are specific to the TensorRT version and target GPU. Build
-them on a compatible NVIDIA machine.
+Serialized TensorRT engines depend on the TensorRT version, plugin binaries, and
+GPU architecture used to build them. Build and validate each bundle on the target
+deployment architecture and software stack.
 
 ## Runtime
 
-Both model families accept normalized mono float32 audio sampled at the model
-sample rate stored in the bundle configuration. The current Zipformer and
-Parakeet targets use 16 kHz audio. One `ASR` instance owns reusable TensorRT
-contexts and is intended to process batches serially.
+Both model families accept nonempty, one-dimensional NumPy waveforms normalized
+to `[-1.0, 1.0]` and sampled at the rate stored in `model_config.yaml`. The
+currently validated targets use 16 kHz audio.
 
 ```python
 import numpy as np
 
 from fast_gpu_asr import ASR
 
-model = ASR(
-    "/path/to/exported/model",
-    blank_penalty=0.0,
-)
+model = ASR("/path/to/exported/model", device_id=0)
 audios = [
     np.zeros(16000, dtype=np.float32),
     np.zeros(24000, dtype=np.float32),
 ]
-transcripts = model(audios)
+texts, word_timestamps = model(audios)
+
+print(texts[0])
+for word, start, end in word_timestamps[0]:
+    print(word, start, end)
 ```
 
-The number of waveforms can be smaller than the engine batch size, but cannot
-exceed `model.batch_size`. Audio duration must remain inside the TensorRT
-profile used during export.
+The input list may contain fewer waveforms than the engine capacity, but it must
+contain at least one and cannot exceed `model.encoder.batch_size`. No waveform may
+exceed the maximum duration profile stored in the bundle. Inputs shorter than the
+minimum profile are padded to its execution shape; their valid lengths remain
+separate.
 
-Zipformer supports `transducer_greedy_search`,
-`transducer_modified_beam_search`, and `ctc_greedy_search`. Parakeet supports
-`transducer_greedy_search` and `transducer_modified_beam_search`. The selected
-decoder type is stored in the bundle's
-`model_config.yaml`, together with production-style runtime metadata such as
-the model sample rate, vocabulary size, beam, blank penalty, and
-model-specific decoder parameters.
+Word timestamps are returned as `(word, start, end)` tuples in seconds. The final
+word ends at the input waveform duration. Bundle validation is enabled by default;
+`ASR(..., validate=False)` is intended only for an artifact that was already
+validated. An `ASR` instance owns mutable TensorRT contexts and serializes calls
+with an internal lock.
 
-`transducer_greedy_search` is the transducer beam-one mode: exporters force
-`beam=1`, and the runtime still uses the same modified-beam implementation as
-larger transducer beams. This applies to both Zipformer and Parakeet bundles.
-Here "modified" follows the Icefall RNN-T implementation: it limits the maximum
-number of emitted symbols per encoder frame to one. At each frame, the decoder
-scores the current hypotheses against every vocabulary token, adds the
-accumulated hypothesis scores, keeps the top `beam` candidates from the
-flattened hypothesis-by-vocabulary table, appends non-blank/non-unknown tokens,
-and merges identical token histories with log-sum-exp. It is lighter than full
-RNN-T beam search because it does not repeatedly expand labels within one
-encoder frame. For Parakeet TDT, the same idea is adapted to include duration
-outputs.
+The top-level package also exposes `Encoder`, `CTCGreedyDecoder`,
+`ZipformerModifiedBeamSearchDecoder`, `ParakeetModifiedBeamSearchDecoder`, and
+`PostProcessor` for advanced composition.
+
+### Decoder modes
+
+Zipformer supports:
+
+- `ctc_greedy_search`;
+- `transducer_greedy_search`;
+- `transducer_modified_beam_search`.
+
+Parakeet supports the two transducer modes. For either model family,
+`transducer_greedy_search` uses the same modified-beam implementation with
+`beam=1`; the exporters override any other beam value for greedy mode. Zipformer
+CTC also requires `beam=1`.
+
+The Zipformer modified search permits at most one nonblank symbol per encoder
+frame. It scores the complete hypothesis-by-vocabulary table, selects its top
+`beam` candidates, and merges identical retained token histories with log-sum-exp.
+Parakeet applies the corresponding TDT search over token and duration outputs.
+The selected decoder type, beam, blank penalty, blank token ID, and model-specific
+dimensions are stored in `model_config.yaml`. Exporters currently initialize the
+blank penalty to `0.0`.
 
 ## Zipformer Export
 
-The Zipformer exporter loads `model.pt`, `config.yaml`, and `bpe.model` from
-one directory. Its encoder engine combines a Kaldi-compatible filterbank
-frontend with the condensed Zipformer encoder. Transducer beam-one bundles use
-one modified-beam hypothesis per utterance, larger-beam bundles reserve
-`batch_size * beam` slots, and CTC bundles do not contain a decoder engine.
+The Zipformer exporter expects `model.pt` beside `config.yaml` and `bpe.model`.
+It reconstructs the supported six-stack offline encoder and selects either the
+checkpoint's transducer projection or CTC head.
+
+> **Warning:** the exporter deletes and recreates `--output-dir`. Never place the
+> source checkpoint, configuration, tokenizer, or unrelated files inside it.
 
 ```bash
-uv run fast-gpu-asr-export-zipformer \
+uv run --frozen fast-gpu-asr-export-zipformer \
   --model-path /path/to/Zipformer-cr-ctc-transducer-XL-290M/model.pt \
   --output-dir exported/zipformer-cr-ctc-xl \
   --batch-size 64 \
   --decoder-type transducer_modified_beam_search \
   --beam 6 \
-  --min-audio-seconds 0.5 \
-  --opt-audio-seconds 15 \
-  --max-audio-seconds 120
+  --encoder-precision fp16 \
+  --decoder-precision fp16 \
+  --min-audio-seconds 0.1 \
+  --opt-audio-seconds 8 \
+  --max-audio-seconds 40
 ```
+
+`--encoder-precision` and `--decoder-precision` accept `fp32`, `fp16`, and
+`bf16`; both default to `fp32`. Encoder precision controls subsampling and all six
+Zipformer stacks. The waveform frontend and final output projection remain FP32,
+so both transducer encoder embeddings and CTC log probabilities are FP32. For
+BF16 export, the first subsampling convolution uses FP16 because that TensorRT
+path is faster, then returns to BF16.
+
+Decoder precision controls the precomputed stateless-predictor context table and
+the joiner. Runtime search kernels convert FP32 encoder embeddings to the decoder
+precision while staging each frame. The 512-token, context-size-two FP16 table
+used by the validated XL models is approximately 257 MiB. Log-softmax output
+remains FP32. Reduced precision can alter decisions near score ties, so compare
+WER after changing precision.
+
+The engine uses native plugins for cuFFT feature extraction, convolution,
+relative-attention scoring and softmax, attention-value products, temporal
+resampling, and final encoder-output assembly. A CTC bundle contains no decoder
+engine or predictor context table. Pass `--debug` to retain intermediate ONNX
+artifacts; otherwise they are removed after a successful build and validation.
 
 ## Parakeet Export
 
@@ -131,100 +178,113 @@ The Parakeet exporter reads the original `.nemo` archive and reconstructs the
 feature extractor, FastConformer encoder, TDT prediction network, and joiner
 without importing NeMo.
 
+> **Warning:** the exporter deletes and recreates `--output-dir`. Do not put the
+> source `.nemo` archive or unrelated files inside it.
+
 ```bash
-uv run fast-gpu-asr-export-parakeet \
+uv run --frozen fast-gpu-asr-export-parakeet \
   --model-path /path/to/parakeet-tdt-0.6b-v3.nemo \
   --output-dir exported/parakeet-tdt-0.6b-v3 \
-  --batch-size 128 \
-  --decoder-type transducer_modified_beam_search \
-  --beam 6 \
-  --min-audio-seconds 0.5 \
-  --opt-audio-seconds 15 \
-  --max-audio-seconds 19
+  --batch-size 64 \
+  --decoder-type transducer_greedy_search \
+  --beam 1 \
+  --encoder-precision fp16 \
+  --decoder-precision fp16 \
+  --min-audio-seconds 0.1 \
+  --opt-audio-seconds 8 \
+  --max-audio-seconds 40
 ```
 
-For mixed-duration datasets, pair the high-throughput batch-128 engine with a
-smaller-batch engine for the long tail. For example, batch 32 with a 40-second
-maximum covers the public short-form leaderboard clips without forcing every
-short utterance through a long-duration profile.
+Both precision arguments accept `fp32`, `fp16`, and `bf16` and default to
+`fp32`. Encoder precision controls convolutional subsampling and FastConformer
+layers; the waveform frontend remains FP32. Decoder precision controls the
+prediction network, recurrent state, and joiner. Token and duration log-softmax
+outputs remain FP32.
 
-Use `--decoder-type transducer_greedy_search` for Parakeet transducer beam-one
-bundles; the exporter sets `--beam` to 1 automatically. Use
-`--decoder-type transducer_modified_beam_search` for larger search beams.
+Parakeet feature extraction, Conformer convolution, and full-context
+relative-position attention use native TensorRT plugins. The attention plugin
+fuses query preparation, relative alignment, masking, softmax, and value
+aggregation while using TensorRT-owned workspace for its score matrices. The
+maximum profile is validated against the plugin's 512-frame encoder limit.
+
+For mixed-duration traffic, separate engines tuned for short and long utterances
+can be more efficient than one maximum-duration profile. Batch size, profile
+durations, precision, and decoder mode all affect memory use and throughput.
 
 ## Benchmark
 
-Benchmark one mono PCM16 WAV repeated across the exported engine batch:
+From a repository checkout, benchmark one mono PCM16 WAV repeated across a full
+or partial engine batch:
 
 ```bash
-uv run fast-gpu-asr-benchmark \
+uv run --frozen scripts/benchmark.py \
   --model-dir exported/zipformer-cr-ctc-xl \
   --wav sample-16khz-mono-pcm16.wav \
-  --device cuda:0 \
+  --device-id 0 \
+  --batch-size 64 \
   --warmups 3 \
   --runs 10
 ```
 
-The command reports median encoder, decoder, postprocessing, total time, RTFx,
-and CuPy memory-pool usage. Use `--batch-size` to benchmark a partial
-engine batch.
+The script logs median encoder, decoder, postprocessing, and independently
+measured end-to-end latency, along with RTFx and CuPy memory-pool usage. It
+synchronizes the shared CUDA stream around timed GPU work. Postprocessing
+includes SentencePiece decoding and word timestamp construction.
 
-### H100 Results
-
-The following end-to-end measurements use an NVIDIA H100 80GB HBM3,
-TensorRT 11.1.0.106, batch size 64, three warmups, and 20 measured runs.
-Each batch repeats a real Earnings21 waveform trimmed to the stated duration.
-
-| Decoder | 5 s | 15 s | 30 s |
-| --- | ---: | ---: | ---: |
-| Zipformer transducer greedy | 8,599 RTFx | 8,523 RTFx | 6,352 RTFx |
-| Zipformer CR-CTC greedy | 10,135 RTFx | 9,848 RTFx | 7,109 RTFx |
-| Zipformer transducer beam 6 | 7,244 RTFx | 7,550 RTFx | 4,716 RTFx |
-| Zipformer CR-CTC transducer beam 6 | 7,275 RTFx | 7,542 RTFx | 4,651 RTFx |
-
-Beam search keeps candidate scoring, selection, hypothesis merging, and state
-updates on the GPU. Its token output exactly matches the previous host-side
-search on the tested real-audio batch. The published leaderboard WERs use
-modified beam search, while the faster greedy and CTC modes require separate
-accuracy evaluation before making Pareto-front claims.
-
-### Parakeet H100 Results
-
-The Parakeet measurements use a batch-128 engine optimized for 15-second
-audio with a 19-second maximum, plus a batch-32 fallback engine with a
-40-second maximum. The seven cleaned public datasets contain 580,586 seconds
-of audio. Timing covers input batching, host-to-device transfer, feature
-extraction, FastConformer encoding, TDT modified beam search, and tokenization; it
-does not include WAV loading or WER report generation.
-
-| Model | Runtime | Audio | RTFx | Leaderboard RTFx | Gain |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Parakeet TDT 0.6B v2 | 81.28 s | 580,586 s | 7,143 | 6,038.1 | +18.3% |
-| Parakeet TDT 0.6B v3 | 82.05 s | 580,586 s | 7,076 | 6,098.2 | +16.0% |
-
-The exported v2 model reproduces the current leaderboard WERs within
-0.08 absolute WER on every public cleaned dataset:
-
-| Dataset | v2 leaderboard | v2 TensorRT | v3 leaderboard | v3 TensorRT |
-| --- | ---: | ---: | ---: | ---: |
-| AMI-Cleaned | 9.10 | 9.02 | 9.41 | 9.31 |
-| Earnings22 | 10.78 | 10.71 | 10.77 | 9.87 |
-| GigaSpeech-Cleaned | 8.15 | 8.18 | 8.00 | 8.00 |
-| LibriSpeech clean | 1.27 | 1.29 | 1.51 | 1.51 |
-| LibriSpeech other | 2.73 | 2.70 | 3.12 | 3.13 |
-| SPGISpeech | 1.94 | 1.91 | 3.63 | 3.63 |
-| VoxPopuli-AA-Cleaned | 3.78 | 3.85 | 3.19 | 3.07 |
-
-Parakeet v3 is exported from the original `.nemo` archive. Production bundles
-use the TDT modified beam-search runtime, including beam-one bundles.
+RTFx is the batch's total audio duration divided by synchronized end-to-end wall
+time. Because component and end-to-end medians come from separate runs, the total
+need not equal the sum of component medians. A repeated-waveform benchmark is a
+controlled latency measurement, not a substitute for pooled RTFx and WER over a
+real dataset. Reportable dataset RTFx should use total audio seconds divided by
+total synchronized inference seconds across the complete evaluation set.
 
 ## Development
 
+Install all test and export dependencies, build the native plugins, and run the
+quality checks:
+
 ```bash
-uv sync --extra cuda12 --extra export --extra dev
-uv run pytest
-uv run ruff check .
+uv sync --frozen --extra dev --extra export
+uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
+uv run --frozen pytest
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
 ```
 
-Model checkpoints retain the licenses stated in their source repositories.
-Fast GPU ASR runtime and export code is Apache-2.0.
+CPU-only tests skip device execution when no compatible GPU is available. The
+complete plugin and runtime suite requires a supported NVIDIA GPU.
+
+### Building a wheel
+
+Build a publishable platform wheel from a clean repository checkout:
+
+```bash
+scripts/build_wheel.sh
+```
+
+An optional destination directory may be passed as the only argument. The script
+rebuilds all native plugins, creates a Python-ABI-independent Linux wheel, and
+repairs it for `manylinux_2_27_x86_64`. CUDA, cuBLAS, cuFFT, and TensorRT remain
+required package dependencies rather than being copied into the project wheel.
+The packaged plugins contain no absolute `RPATH` or `RUNPATH`. Source
+distributions are intentionally unsupported because they cannot provide portable
+TensorRT plugin binaries.
+
+### Continuous integration
+
+GitHub-hosted jobs check the lockfile, Actions workflow syntax, lint, formatting,
+and the Python 3.12, 3.13, and 3.14 test matrix. A self-hosted Linux x86-64 GPU
+runner rebuilds all nine CUDA plugins, runs the complete test suite, inspects
+native linkage, builds and repairs the wheel, and smoke-tests the installed wheel.
+
+The GPU runner requires a CUDA 13-capable driver, a C++20 host compiler,
+`readelf`, and TensorRT 11 development headers. CI verifies that `nvcc`, CUDA
+headers, and CUDA libraries resolve from Python `site-packages`; it rejects plugin
+`RPATH` or `RUNPATH` entries and incomplete wheels. Self-hosted GPU jobs run for
+pushes to `main`, manual dispatches, and same-repository pull requests. Fork pull
+requests run only on GitHub-hosted workers.
+
+## License
+
+Fast GPU ASR runtime and export code is licensed under Apache-2.0. Model
+checkpoints retain the licenses stated by their source repositories.

@@ -25,6 +25,7 @@ from ..constants import (
     MODEL_TYPE_ZIPFORMER,
     ONNX_OPSET_VERSION,
     PRECISION_DTYPES,
+    TOKENIZER_FILE,
     ZIPFORMER_DECODER_CONTEXTS_FILE,
     ZIPFORMER_DECODER_ONNX_FILE,
     ZIPFORMER_DECODER_TENSORRT_FILE,
@@ -170,8 +171,8 @@ def adjust_state_dict(
         required to infer its channel dimension.
     ValueError
         Raised when a ConvNeXt pointwise convolution does not have a singleton
-        two-dimensional kernel and therefore cannot be represented by a linear
-        layer.
+        two-dimensional kernel or when two source keys map to the same inference
+        key.
     """
 
     adjusted_state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
@@ -218,9 +219,14 @@ def adjust_state_dict(
             if value.ndim != 4 or value.shape[2:] != (1, 1):
                 raise ValueError(
                     f"Expected pointwise Conv2d weight {key} to have shape "
-                    f"(out_channels, in_channels, 1, 1), got {tuple(value.shape)}.",
+                    f"(out_channels, in_channels, 1, 1), got {tuple(value.shape)}."
                 )
             value = value[:, :, 0, 0]
+        if key in adjusted_state_dict:
+            raise ValueError(
+                f"Checkpoint tensor {original_key} and an earlier tensor both map "
+                f"to {key}."
+            )
         adjusted_state_dict[key] = value
 
     encoder_1_dim = adjusted_state_dict[
@@ -415,6 +421,11 @@ def get_subsampling_batch_partitions(
         stays within the CASK element limit.
     """
 
+    if not isinstance(layer3_channels, int) or layer3_channels < 1:
+        raise ValueError(
+            f"layer3_channels must be a positive integer, got {layer3_channels}."
+        )
+
     frame_opts = model_config.feature_opts.frame_opts
     frame_length = frame_opts.frame_length_ms * frame_opts.samp_freq // 1000
     frame_shift = frame_opts.frame_shift_ms * frame_opts.samp_freq // 1000
@@ -426,7 +437,13 @@ def get_subsampling_batch_partitions(
     conv_frames = (feature_frames - 5) // 2 - 1
     conv_features = ((conv_features - 3) // 2 - 2) // 2 + 1
     elements_per_item = layer3_channels * conv_frames * conv_features
+
     cask_element_limit = 1 << 31
+    if elements_per_item > cask_element_limit:
+        raise ValueError(
+            "One Zipformer subsampling item exceeds TensorRT's CASK element "
+            f"limit: {elements_per_item} elements, limit={cask_element_limit}."
+        )
 
     partitions = (
         args.batch_size * elements_per_item + cask_element_limit - 1
@@ -442,6 +459,7 @@ def get_subsampling_batch_partitions(
 def make_runtime_config(
     model_config: DictConfig,
     vocab_size: int,
+    blank_id: int,
     pos_emb_max_len: int,
     args: argparse.Namespace,
 ) -> DictConfig:
@@ -453,6 +471,8 @@ def make_runtime_config(
         Validated source Zipformer configuration.
     vocab_size : int
         Number of output tokens represented by the selected checkpoint head.
+    blank_id : int
+        Tokenizer ID of the Zipformer blank token.
     pos_emb_max_len : int
         Maximum positional encoding length compiled into the encoder.
     args : argparse.Namespace
@@ -483,6 +503,7 @@ def make_runtime_config(
             "decoder_type": args.decoder_type,
             "model_samplerate": frame_opts.samp_freq,
             "vocab_size": vocab_size,
+            "blank_id": blank_id,
             "audio_encoder_params": {
                 "feature_dim": model_params.feature_dim,
                 "encoder_dims": [
@@ -556,7 +577,7 @@ def export_model_to_onnx(
     Raises
     ------
     RuntimeError
-        Raised when a transducer predictor is provided without its joiner.
+        Raised when a transducer decoder is provided without its joiner.
     """
 
     encoder_path = args.output_dir / ZIPFORMER_ONNX_FILE
@@ -573,7 +594,7 @@ def export_model_to_onnx(
     audio = torch.zeros(
         args.batch_size, audio_samples + right_padding_samples, dtype=torch.float32
     )
-    audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int32)
+    audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int64)
 
     logger.info("Exporting the batched Zipformer encoder to %s.", encoder_path)
     with torch.inference_mode():
@@ -672,10 +693,18 @@ def export_zipformer(args: argparse.Namespace) -> None:
 
     model_dir = args.model_path.parent
     config_path = model_dir / "config.yaml"
-    tokenizer_path = model_dir / "bpe.model"
+    tokenizer_path = model_dir / TOKENIZER_FILE
     for required_path in (config_path, args.model_path, tokenizer_path):
         if not required_path.is_file():
             raise FileNotFoundError(f"Missing required model file: {required_path}.")
+
+    output_dir = args.output_dir.resolve()
+    for required_path in (config_path, args.model_path, tokenizer_path):
+        if required_path.resolve().is_relative_to(output_dir):
+            raise ValueError(
+                f"Output directory {args.output_dir} contains required source file "
+                f"{required_path}."
+            )
 
     if args.output_dir.exists():
         shutil.rmtree(args.output_dir)
@@ -693,6 +722,13 @@ def export_zipformer(args: argparse.Namespace) -> None:
             vocab_size + 1,
         )
         vocab_size += 1
+
+    blank_id = tokenizer.piece_to_id("<blk>")
+    if not 0 <= blank_id < vocab_size or tokenizer.id_to_piece(blank_id) != "<blk>":
+        raise ValueError(
+            "The Zipformer tokenizer must contain an exact <blk> piece inside "
+            f"the decoder vocabulary, got ID {blank_id}."
+        )
 
     logger.info("Loading Zipformer checkpoint %s.", args.model_path)
     checkpoint = torch.load(
@@ -729,9 +765,9 @@ def export_zipformer(args: argparse.Namespace) -> None:
     )
     del state_dict
 
-    shutil.copyfile(tokenizer_path, args.output_dir / "bpe.model")
+    shutil.copyfile(tokenizer_path, args.output_dir / TOKENIZER_FILE)
     runtime_config = make_runtime_config(
-        model_config, vocab_size, pos_emb_max_len, args
+        model_config, vocab_size, blank_id, pos_emb_max_len, args
     )
     logger.info("Zipformer runtime config:\n%s", OmegaConf.to_yaml(runtime_config))
     OmegaConf.save(runtime_config, args.output_dir / MODEL_CONFIG_FILE)

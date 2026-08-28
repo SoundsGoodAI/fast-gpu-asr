@@ -2,7 +2,8 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-build/
-dist/
+/build/
+/dist/
 *.egg-info/
+/src/fast_gpu_asr/tensorrt_plugins/.plugin-build-*/
 src/fast_gpu_asr/tensorrt_plugins/*.so

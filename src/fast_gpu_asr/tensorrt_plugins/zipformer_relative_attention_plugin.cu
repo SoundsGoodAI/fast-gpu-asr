@@ -308,7 +308,9 @@ __global__ void softmaxWarpRows(T const* projection, T const* position,
         return;
     }
 
-    // Packed per-head dimensions are even, so these vector loads are aligned.
+    // The projection row width and position-query offset are both even in
+    // elements. CUDA allocations are at least 256-byte aligned, so every pair
+    // remains naturally aligned for half2, bfloat162, and float2 loads.
     float2 const query01 = loadPair(projection + projectionBase + positionQueryOffset);
     float2 const query23 = loadPair(projection + projectionBase + positionQueryOffset + 2);
     int32_t const slots =
@@ -319,8 +321,10 @@ __global__ void softmaxWarpRows(T const* projection, T const* position,
     for (int slot = 0; slot < ValuesPerThread; ++slot)
     {
         int32_t const key = lane + slot * kWarpSize;
-        float value = -1000.0F;
-        if (slot < slots && key < sequenceLength && !mask[batch * sequenceLength + key])
+        float value = -FLT_MAX;
+        bool const valid = slot < slots && key < sequenceLength
+            && !mask[batch * sequenceLength + key];
+        if (valid)
         {
             // Apply the Transformer-XL relative shift directly for this
             // (query, key) pair instead of materializing a shifted tensor.
@@ -335,7 +339,7 @@ __global__ void softmaxWarpRows(T const* projection, T const* position,
                 + query23.x * position23.x + query23.y * position23.y;
         }
         values[slot] = value;
-        if (slot < slots && key < sequenceLength) maximum = fmaxf(maximum, value);
+        if (valid) maximum = fmaxf(maximum, value);
     }
     maximum = warpMaximum(maximum);
     maximum = __shfl_sync(0xFFFFFFFFU, maximum, 0);
@@ -344,8 +348,9 @@ __global__ void softmaxWarpRows(T const* projection, T const* position,
     for (int slot = 0; slot < ValuesPerThread; ++slot)
     {
         int32_t const key = lane + slot * kWarpSize;
-        float const value = slot < slots && key < sequenceLength
-            ? __expf(values[slot] - maximum) : 0.0F;
+        bool const valid = slot < slots && key < sequenceLength
+            && !mask[batch * sequenceLength + key];
+        float const value = valid ? __expf(values[slot] - maximum) : 0.0F;
         values[slot] = value;
         sum += value;
     }
@@ -358,7 +363,7 @@ __global__ void softmaxWarpRows(T const* projection, T const* position,
         if (slot < slots && key < sequenceLength)
         {
             scores[static_cast<int64_t>(row) * sequenceLength + key]
-                = fromFloat<T>(values[slot] / sum);
+                = fromFloat<T>(sum > 0.0F ? values[slot] / sum : 0.0F);
         }
     }
 }
@@ -404,13 +409,14 @@ __global__ void softmaxBlockGeneric(T const* projection, T const* position,
             * kPositionHeadDim;
         float2 const position01 = loadPair(position + positionBase);
         float2 const position23 = loadPair(position + positionBase + 2);
-        float const value = mask[batch * sequenceLength + key]
-            ? -1000.0F
-            : toFloat(scores[scoreBase + key])
+        bool const valid = !mask[batch * sequenceLength + key];
+        float const value = valid
+            ? toFloat(scores[scoreBase + key])
                 + query01.x * position01.x + query01.y * position01.y
-                + query23.x * position23.x + query23.y * position23.y;
+                + query23.x * position23.x + query23.y * position23.y
+            : -FLT_MAX;
         scores[scoreBase + key] = fromFloat<T>(value);
-        maximum = fmaxf(maximum, value);
+        if (valid) maximum = fmaxf(maximum, value);
     }
     // Keep the two reductions in separate shared arrays. Reusing one array
     // would let a fast warp begin the sum reduction while another warp still
@@ -421,14 +427,16 @@ __global__ void softmaxBlockGeneric(T const* projection, T const* position,
     float sum = 0.0F;
     for (int32_t key = thread; key < sequenceLength; key += blockDim.x)
     {
-        float const value = __expf(toFloat(scores[scoreBase + key]) - maximum);
+        float const value = mask[batch * sequenceLength + key]
+            ? 0.0F : __expf(toFloat(scores[scoreBase + key]) - maximum);
         scores[scoreBase + key] = fromFloat<T>(value);
         sum += value;
     }
     sum = blockSum(sum, sumReduction);
     for (int32_t key = thread; key < sequenceLength; key += blockDim.x)
     {
-        scores[scoreBase + key] = fromFloat<T>(toFloat(scores[scoreBase + key]) / sum);
+        scores[scoreBase + key] = fromFloat<T>(
+            sum > 0.0F ? toFloat(scores[scoreBase + key]) / sum : 0.0F);
     }
 }
 
@@ -469,8 +477,10 @@ __global__ void softmaxBlockRegisters(T const* projection, T const* position,
     for (int slot = 0; slot < ValuesPerThread; ++slot)
     {
         int32_t const key = thread + slot * blockDim.x;
-        float value = -1000.0F;
-        if (key < sequenceLength && !mask[batch * sequenceLength + key])
+        float value = -FLT_MAX;
+        bool const valid = key < sequenceLength
+            && !mask[batch * sequenceLength + key];
+        if (valid)
         {
             int32_t const relative = sequenceLength - 1 - query + key;
             int64_t const positionBase =
@@ -485,7 +495,7 @@ __global__ void softmaxBlockRegisters(T const* projection, T const* position,
         // Match the generic path's reduced-precision materialization before softmax.
         value = toFloat(fromFloat<T>(value));
         values[slot] = value;
-        if (key < sequenceLength) maximum = fmaxf(maximum, value);
+        if (valid) maximum = fmaxf(maximum, value);
     }
 
     // Maximum and sum reductions must not reuse shared storage between helper
@@ -500,7 +510,8 @@ __global__ void softmaxBlockRegisters(T const* projection, T const* position,
         int32_t const key = thread + slot * blockDim.x;
         if (key < sequenceLength)
         {
-            float const value = __expf(values[slot] - maximum);
+            float const value = mask[batch * sequenceLength + key]
+                ? 0.0F : __expf(values[slot] - maximum);
             sum += value;
             values[slot] = toFloat(fromFloat<T>(value));
         }
@@ -512,7 +523,8 @@ __global__ void softmaxBlockRegisters(T const* projection, T const* position,
         int32_t const key = thread + slot * blockDim.x;
         if (key < sequenceLength)
         {
-            scores[scoreBase + key] = fromFloat<T>(values[slot] / sum);
+            scores[scoreBase + key]
+                = fromFloat<T>(sum > 0.0F ? values[slot] / sum : 0.0F);
         }
     }
 }
@@ -641,10 +653,10 @@ class RelativeAttentionPlugin final : public IPluginV3,
                                       public IPluginV3OneRuntime
 {
 public:
-    explicit RelativeAttentionPlugin(int32_t tactic = kStrictComputeTactic)
+    explicit RelativeAttentionPlugin(
+        int32_t tactic = kStrictComputeTactic) noexcept
         : mTactic(tactic)
     {
-        mFields = {0, nullptr};
         mInitialized = cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS;
     }
 
@@ -673,13 +685,13 @@ public:
 
     IPluginV3* clone() noexcept override
     {
-        auto* plugin =
-            new (std::nothrow) RelativeAttentionPlugin(mTactic);
+        auto* plugin = new (std::nothrow) RelativeAttentionPlugin(mTactic);
         if (plugin == nullptr || !plugin->mInitialized)
         {
             delete plugin;
             return nullptr;
         }
+        plugin->mInputType = mInputType;
         return plugin;
     }
 
@@ -734,6 +746,7 @@ public:
         {
             return 1;
         }
+        mInputType = inputs[0].desc.type;
         return 0;
     }
 
@@ -803,36 +816,37 @@ public:
         int32_t nbInputs, DynamicPluginTensorDesc const* outputs,
         int32_t nbOutputs) const noexcept override
     {
-        static_cast<void>(inputs);
-        static_cast<void>(outputs);
+        if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
+            || nbOutputs != kOutputCount)
+        {
+            return 0;
+        }
         // TensorRT owns this scratch allocation. Binding it to the cuBLAS
         // handle avoids internal allocations and keeps execution capturable.
-        return nbInputs == kInputCount && nbOutputs == kOutputCount
-            ? kCublasWorkspaceBytes
-            : 0;
+        return kCublasWorkspaceBytes;
     }
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kCublasComputeTactics.size());
+        return getCublasComputeTacticCount(mInputType);
     }
 
     int32_t getValidTactics(int32_t* tactics,
         int32_t nbTactics) noexcept override
     {
-        return writeCublasComputeTactics(tactics, nbTactics);
+        return writeCublasComputeTactics(tactics, nbTactics, mInputType);
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
     {
-        return setCublasComputeTactic(tactic, mTactic);
+        return setCublasComputeTactic(tactic, mTactic, mInputType);
     }
 
     char const* getTimingCacheID() noexcept override
     {
         // TensorRT combines this implementation identity with concrete tensor
-        // shapes and formats, allowing all equivalent encoder layers to reuse
-        // their four cuBLAS tactic timings.
+        // shapes and formats, allowing equivalent encoder layers to reuse
+        // their dtype-specific cuBLAS tactic timings.
         return kTimingCacheId;
     }
 
@@ -849,7 +863,7 @@ public:
             || inputs[1].format != TensorFormat::kLINEAR
             || inputs[2].format != TensorFormat::kLINEAR
             || outputs[0].format != TensorFormat::kLINEAR
-            || !isCublasComputeTactic(mTactic)
+            || !isCublasComputeTactic(mTactic, inputs[0].type)
             || !haveValidShapes(inputs[0].dims, inputs[1].dims,
                 inputs[2].dims, outputs[0].dims, inputs[0].type))
         {
@@ -866,24 +880,18 @@ public:
         if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr
             || outputs == nullptr || inputs[0] == nullptr || inputs[1] == nullptr
             || inputs[2] == nullptr || outputs[0] == nullptr
-            || workspace == nullptr || !mInitialized
-            || inputDesc[0].type != inputDesc[1].type
-            || outputDesc[0].type != inputDesc[0].type
-            || !isSupportedDataType(inputDesc[0].type)
-            || inputDesc[2].type != DataType::kBOOL
-            || inputDesc[0].format != TensorFormat::kLINEAR
-            || inputDesc[1].format != TensorFormat::kLINEAR
-            || inputDesc[2].format != TensorFormat::kLINEAR
-            || outputDesc[0].format != TensorFormat::kLINEAR
-            || !isCublasComputeTactic(mTactic)
-            || !haveValidShapes(inputDesc[0].dims, inputDesc[1].dims,
-                inputDesc[2].dims, outputDesc[0].dims, inputDesc[0].type))
+            || workspace == nullptr
+            || onShapeChange(inputDesc, kInputCount, outputDesc, kOutputCount) != 0)
         {
             return 1;
         }
 
-        // Clear caller launch status so checks below cover only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         bool const streamChanged = stream != mStream;
         if (streamChanged)
@@ -942,6 +950,7 @@ private:
     cublasHandle_t mCublas{nullptr};
     cudaStream_t mStream{nullptr};
     void* mWorkspace{nullptr};
+    DataType mInputType{DataType::kFLOAT};
     int32_t mTactic{kStrictComputeTactic};
     bool mInitialized{false};
     PluginFieldCollection mFields{};
@@ -950,11 +959,6 @@ private:
 class RelativeAttentionCreator final : public IPluginCreatorV3One
 {
 public:
-    RelativeAttentionCreator()
-    {
-        mFields = {0, nullptr};
-    }
-
     char const* getPluginName() const noexcept override
     {
         return kPluginName;
@@ -1020,15 +1024,13 @@ extern "C" bool initFastGpuAsrZipformerRelativeAttentionPlugin() noexcept
             return true;
         }
         return registry->registerCreator(creator, kPluginNamespace)
-            || registry->getCreator(kPluginName, kPluginVersion,
-                   kPluginNamespace)
+            || registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace)
                 != nullptr;
     };
     bool const runtimeRegistered =
         ensureRegistered(getPluginRegistry(), runtimeCreator);
     auto* builderRegistry =
         nvinfer1::getBuilderPluginRegistry(nvinfer1::EngineCapability::kSTANDARD);
-    bool const builderRegistered =
-        ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    bool const builderRegistered = ensureRegistered(builderRegistry, builderCreator);
+    return runtimeRegistered && builderRegistered;
 }

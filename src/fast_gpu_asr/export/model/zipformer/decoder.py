@@ -33,32 +33,25 @@ class Decoder(torch.nn.Module):
         dtype : torch.dtype
             Floating-point dtype used by the prediction network. Supported values
             are ``torch.float32``, ``torch.float16``, and ``torch.bfloat16``.
-
-        Raises
-        ------
-        ValueError
-            Raised when ``context_size`` is less than one.
         """
 
         super().__init__()
-
-        if context_size < 1:
-            raise ValueError(
-                "RNN-T decoder context size should be an integer greater "
-                f"than or equal to 1, but got {context_size}.",
-            )
 
         self.context_size = context_size
         self.vocab_size = vocab_size
 
         self.embedding = torch.nn.Embedding(vocab_size, decoder_dim, dtype=dtype)
-        self.conv = torch.nn.Conv1d(
-            decoder_dim,
-            decoder_dim,
-            context_size,
-            groups=decoder_dim // 4,
-            bias=False,
-            dtype=dtype,
+        self.conv = (
+            torch.nn.Conv1d(
+                decoder_dim,
+                decoder_dim,
+                context_size,
+                groups=decoder_dim // 4,
+                bias=False,
+                dtype=dtype,
+            )
+            if context_size > 1
+            else torch.nn.Identity()
         )
         self.decoder_proj = torch.nn.Linear(decoder_dim, joiner_dim, dtype=dtype)
 
@@ -89,11 +82,19 @@ class Decoder(torch.nn.Module):
             num_contexts,
             self.decoder_proj.out_features,
             dtype=self.decoder_proj.weight.dtype,
+            device=self.decoder_proj.weight.device,
         )
         for start in range(0, num_contexts, chunk_size):
             end = min(start + chunk_size, num_contexts)
-            indexes = torch.arange(start, end, dtype=torch.int64)
-            contexts = torch.empty(end - start, self.context_size, dtype=torch.int64)
+            indexes = torch.arange(
+                start, end, dtype=torch.int64, device=self.decoder_proj.weight.device
+            )
+            contexts = torch.empty(
+                end - start,
+                self.context_size,
+                dtype=torch.int64,
+                device=self.decoder_proj.weight.device,
+            )
             for position in range(self.context_size - 1, -1, -1):
                 contexts[:, position] = torch.remainder(indexes, num_values) - 1
                 indexes = torch.floor_divide(indexes, num_values)
@@ -151,6 +152,7 @@ class Joiner(torch.nn.Module):
         """
 
         super().__init__()
+
         self.output_proj = torch.nn.Linear(joiner_dim, vocab_size, dtype=dtype)
 
     def forward(

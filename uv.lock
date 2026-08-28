@@ -152,21 +152,19 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "audioop-lts", marker = "python_full_version >= '3.13'" },
+    { name = "cuda-bindings", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "cuda-pathfinder", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "cuda-toolkit", extra = ["cccl", "cublas", "cudart", "cufft", "nvcc"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "cupy-cuda13x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numpy" },
     { name = "omegaconf" },
     { name = "sentencepiece" },
+    { name = "tensorrt-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
 ]
 
 [package.optional-dependencies]
-cuda13 = [
-    { name = "cuda-bindings", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "cuda-pathfinder", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "cuda-toolkit", extra = ["cccl", "cublas", "cudart", "cufft", "nvcc"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "cupy-cuda13x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "tensorrt-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
 dev = [
     { name = "kaldi-native-fbank" },
     { name = "pytest" },
@@ -180,10 +178,10 @@ export = [
 [package.metadata]
 requires-dist = [
     { name = "audioop-lts", marker = "python_full_version >= '3.13'", specifier = ">=0.2.2,<1.0.0" },
-    { name = "cuda-bindings", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda13'", specifier = ">=13.0.0,<14.0.0" },
-    { name = "cuda-pathfinder", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda13'", specifier = ">=1.6.1,<2.0.0" },
-    { name = "cuda-toolkit", extras = ["cccl", "cublas", "cudart", "cufft", "nvcc"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda13'", specifier = ">=13.0.0,<14.0.0" },
-    { name = "cupy-cuda13x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda13'", specifier = ">=14.2.0,<15.0.0" },
+    { name = "cuda-bindings", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=13.0.0,<14.0.0" },
+    { name = "cuda-pathfinder", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=1.6.1,<2.0.0" },
+    { name = "cuda-toolkit", extras = ["cccl", "cublas", "cudart", "cufft", "nvcc"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=13.0.0,<14.0.0" },
+    { name = "cupy-cuda13x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=14.2.0,<15.0.0" },
     { name = "kaldi-native-fbank", marker = "extra == 'dev'", specifier = ">=1.22.3,<2.0.0" },
     { name = "numpy", specifier = ">=2.0.0,<3.0.0" },
     { name = "omegaconf", specifier = ">=2.3.0,<3.0.0" },
@@ -192,10 +190,10 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1,<10.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16.4,<1.0.0" },
     { name = "sentencepiece", specifier = ">=0.2.0,<1.0.0" },
-    { name = "tensorrt-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda13'", specifier = ">=11.2.1.2,<12.0.0" },
+    { name = "tensorrt-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=11.2.1.2,<12.0.0" },
     { name = "torch", specifier = ">=2.13.0,<3.0.0", index = "https://download.pytorch.org/whl/cpu" },
 ]
-provides-extras = ["cuda13", "dev", "export"]
+provides-extras = ["dev", "export"]
 
 [[package]]
 name = "filelock"

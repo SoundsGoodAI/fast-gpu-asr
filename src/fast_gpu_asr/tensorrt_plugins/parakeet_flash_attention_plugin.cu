@@ -59,14 +59,6 @@ constexpr int32_t kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
 constexpr int32_t kPointerArrayCount = 3;
 constexpr size_t kCublasWorkspaceBytes = 16U << 20;
 constexpr float kLog2E = 1.4426950408889634F;
-constexpr std::array<int32_t, 2> kHalfComputeTactics{
-    kStrictComputeTactic,
-    kFast16FComputeTactic,
-};
-constexpr std::array<int32_t, 2> kBfloat16ComputeTactics{
-    kStrictComputeTactic,
-    kFast16BFComputeTactic,
-};
 
 struct WorkspaceLayout
 {
@@ -320,23 +312,6 @@ bool haveValidShapes(Dims const* inputs, Dims const& output,
         inputs[0], inputs[1], inputs[2], type, layout);
 }
 
-bool isValidTacticForType(int32_t tactic, DataType type) noexcept
-{
-    if (type == DataType::kHALF)
-    {
-        return std::find(kHalfComputeTactics.begin(),
-                   kHalfComputeTactics.end(), tactic)
-            != kHalfComputeTactics.end();
-    }
-    if (type == DataType::kBF16)
-    {
-        return std::find(kBfloat16ComputeTactics.begin(),
-                   kBfloat16ComputeTactics.end(), tactic)
-            != kBfloat16ComputeTactics.end();
-    }
-    return type == DataType::kFLOAT && isCublasComputeTactic(tactic);
-}
-
 template <typename T>
 __device__ __forceinline__ T addQueryBias(T query, T bias)
 {
@@ -575,17 +550,29 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores,
     // One warp owns one query row. Every lane retains up to 16 keys in
     // registers, covering the production limit of 512 frames without shared
     // memory or an intermediate relative-shift tensor. Matching NeMo, valid
-    // lengths mask keys only: nonpositive lengths leave every key at the
-    // -1000 sentinel and therefore produce the eager path's uniform row,
-    // while lengths at or above T leave the row unmasked. Query rows remain
-    // defined because downstream lengths determine which frames are consumed.
+    // lengths mask keys only. A nonpositive length has no valid softmax domain,
+    // so return an all-zero row. Lengths at or above T leave the row unmasked.
+    // Query rows remain defined because downstream lengths determine which
+    // frames are consumed.
+    if (validLength <= 0)
+    {
+        for (int32_t key = lane; key < sequenceLength; key += kWarpSize)
+        {
+            attentionWeights[outputBase + key] = floatToScalar<T>(0.0F);
+        }
+        return;
+    }
+
     float values[MaxSlots];
     float localMaximum = -FLT_MAX;
 #pragma unroll
     for (int32_t slot = 0; slot < MaxSlots; ++slot)
     {
         int32_t const key = lane + slot * kWarpSize;
-        float value = -1000.0F;
+        // A finite valid score must always outrank padding, even when its value
+        // is below the historical -1000 sentinel. -FLT_MAX also keeps the
+        // subsequent exp2f subtraction well-defined for every nonempty row.
+        float value = -FLT_MAX;
         if (slot < numSlots && key < sequenceLength && key < validLength)
         {
             // Transformer-XL relative shift: row q consumes position
@@ -887,48 +874,17 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        if (mInputType == DataType::kHALF)
-        {
-            return static_cast<int32_t>(kHalfComputeTactics.size());
-        }
-        if (mInputType == DataType::kBF16)
-        {
-            return static_cast<int32_t>(kBfloat16ComputeTactics.size());
-        }
-        return static_cast<int32_t>(kCublasComputeTactics.size());
+        return getCublasComputeTacticCount(mInputType);
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        if (mInputType == DataType::kHALF || mInputType == DataType::kBF16)
-        {
-            auto const& validTactics = mInputType == DataType::kHALF
-                ? kHalfComputeTactics
-                : kBfloat16ComputeTactics;
-            if (tactics == nullptr
-                || nbTactics != static_cast<int32_t>(validTactics.size()))
-            {
-                return 1;
-            }
-            std::copy(validTactics.begin(), validTactics.end(), tactics);
-            return 0;
-        }
-        return writeCublasComputeTactics(tactics, nbTactics);
+        return writeCublasComputeTactics(tactics, nbTactics, mInputType);
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
     {
-        // TensorRT uses zero for the untimed default during some build paths.
-        if (tactic == 0)
-        {
-            tactic = kStrictComputeTactic;
-        }
-        if (!isValidTacticForType(tactic, mInputType))
-        {
-            return 1;
-        }
-        mTactic = tactic;
-        return 0;
+        return setCublasComputeTactic(tactic, mTactic, mInputType);
     }
 
     char const* getTimingCacheID() noexcept override
@@ -948,7 +904,7 @@ public:
             || outputs[0].type != inputs[0].type
             || inputs[4].format != TensorFormat::kLINEAR
             || outputs[0].format != TensorFormat::kLINEAR
-            || !isValidTacticForType(mTactic, inputs[0].type))
+            || !isCublasComputeTactic(mTactic, inputs[0].type))
         {
             return 1;
         }
@@ -998,7 +954,12 @@ public:
             return 1;
         }
 
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         // haveValidShapes() has proved that these 64-bit TensorRT dimensions
         // and every product consumed by int32 CUDA/cuBLAS APIs are in range.
@@ -1352,5 +1313,5 @@ extern "C" bool initFastGpuAsrParakeetFlashAttentionPlugin() noexcept
         nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

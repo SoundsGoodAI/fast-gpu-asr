@@ -50,10 +50,10 @@ jobs:
       - name: Compile Python sources
         run: uv run --frozen python -m compileall -q src tests scripts
 
-  python-compatibility:
-    name: Python ${{ matrix.python-version }}
+  python-tests:
+    name: Python ${{ matrix.python-version }} tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -71,10 +71,12 @@ jobs:
         run: uv sync --frozen --extra dev --extra export
       - name: Compile Python sources
         run: uv run --frozen python -m compileall -q src tests scripts
+      - name: Run CPU test suite
+        run: uv run --frozen pytest -q
 
   gpu-tests:
     name: CUDA 13 plugins and wheel
-    needs: [quality, python-compatibility]
+    needs: [quality, python-tests]
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -84,6 +86,13 @@ jobs:
       group: fast-gpu-asr-gpu-ci
       cancel-in-progress: false
     steps:
+      - name: Configure temporary paths
+        run: |
+          {
+            echo "CUPY_CACHE_DIR=${RUNNER_TEMP}/cupy-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "UV_PROJECT_ENVIRONMENT=${RUNNER_TEMP}/fast-gpu-asr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "${GITHUB_ENV}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           clean: true
@@ -93,15 +102,8 @@ jobs:
           enable-cache: false
           python-version: "3.14"
           version: "0.11.21"
-      - name: Configure temporary paths
-        run: |
-          {
-            echo "CUPY_CACHE_DIR=${RUNNER_TEMP}/cupy-cache-${GITHUB_RUN_ID}"
-            echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache-${GITHUB_RUN_ID}"
-            echo "UV_PROJECT_ENVIRONMENT=${RUNNER_TEMP}/fast-gpu-asr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          } >> "${GITHUB_ENV}"
       - name: Install CUDA, export, and test dependencies
-        run: uv sync --frozen --extra cuda13 --extra dev --extra export
+        run: uv sync --frozen --extra dev --extra export
       - name: Configure Python CUDA toolchain
         shell: bash
         run: |
@@ -229,13 +231,14 @@ jobs:
           wheel = Path(os.environ["WHEEL_PATH"])
           wheel_site = Path(os.environ["WHEEL_SITE"]).resolve()
           with zipfile.ZipFile(wheel) as archive:
+              archive_names = set(archive.namelist())
               libraries = {
                   Path(name).name
-                  for name in archive.namelist()
+                  for name in archive_names
                   if name.endswith(".so")
               }
               wheel_metadata = next(
-                  name for name in archive.namelist() if name.endswith("WHEEL")
+                  name for name in archive_names if name.endswith("WHEEL")
               )
               metadata = archive.read(wheel_metadata).decode()
 
@@ -254,16 +257,69 @@ jobs:
               raise RuntimeError(
                   f"Expected plugin libraries {expected_libraries}, got {libraries}."
               )
+          expected_headers = {
+              "fast_gpu_asr/tensorrt_plugins/cublas_tactics.h",
+              "fast_gpu_asr/tensorrt_plugins/plugin_namespace.h",
+          }
+          missing_headers = expected_headers - archive_names
+          if missing_headers:
+              raise RuntimeError(
+                  f"Wheel is missing TensorRT plugin headers {missing_headers}."
+              )
           if "Root-Is-Purelib: false" not in metadata:
               raise RuntimeError("The repaired wheel is incorrectly marked as pure Python.")
 
           sys.path.insert(0, str(wheel_site))
           import fast_gpu_asr
+          import tensorrt as trt
+          from fast_gpu_asr import ASR
+          from fast_gpu_asr.constants import TENSORRT_PLUGIN_NAMESPACE
           from fast_gpu_asr.tensorrt_plugins import load_tensorrt_plugins
 
           if not Path(fast_gpu_asr.__file__).resolve().is_relative_to(wheel_site):
               raise RuntimeError("Smoke test imported the source tree instead of the wheel.")
+          asr_module = sys.modules[ASR.__module__]
+          if not Path(asr_module.__file__).resolve().is_relative_to(wheel_site):
+              raise RuntimeError("Smoke test resolved ASR outside the installed wheel.")
           load_tensorrt_plugins()
+          registries = {
+              "runtime": trt.get_plugin_registry(),
+              "builder": trt.get_builder_plugin_registry(
+                  trt.EngineCapability.STANDARD
+              ),
+          }
+          expected_creators = {
+              "parakeet_conformer_convolution",
+              "parakeet_feature_extractor",
+              "parakeet_flash_attention",
+              "zipformer_attention_value",
+              "zipformer_convolution",
+              "zipformer_downsample",
+              "zipformer_feature_extractor",
+              "zipformer_output_assembly",
+              "zipformer_relative_attention",
+              "zipformer_upsample_bypass",
+          }
+          for registry_name, registry in registries.items():
+              for name in expected_creators:
+                  creator = registry.get_creator(
+                      name, "1", TENSORRT_PLUGIN_NAMESPACE
+                  )
+                  if creator is None:
+                      raise RuntimeError(
+                          f"Missing packaged TensorRT {registry_name} creator {name}."
+                      )
+                  if creator.plugin_namespace != TENSORRT_PLUGIN_NAMESPACE:
+                      raise RuntimeError(
+                          f"{registry_name.title()} creator {name} uses namespace "
+                          f"{creator.plugin_namespace}."
+                      )
+                  for wrong_namespace in ("", "FAST_GPU_ASR", "fast_gpu_asr_typo"):
+                      if registry.get_creator(name, "1", wrong_namespace) is not None:
+                          raise RuntimeError(
+                              f"{registry_name.title()} creator {name} leaked into "
+                              f"namespace {wrong_namespace!r}."
+                          )
           PY
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -12,14 +12,13 @@ import numpy as np
 import tensorrt as trt
 import torch
 
-from ..constants import ZIPFORMER_DECODER_CONTEXTS_FILE
-from ..utils import ASRInferenceError, get_engine
+from ..constants import INT32_MAX, ZIPFORMER_DECODER_CONTEXTS_FILE
+from ..utils import ASRInferenceError, ASRInitializationError, get_engine
 from .gpu_kernels import (
     CTC_COLLAPSE_KERNEL,
     ZIPFORMER_FINALIZE_KERNEL,
     get_zipformer_beam_search_kernels,
 )
-from .transcription import DecoderResult
 
 
 class CTCGreedyDecoder:
@@ -73,7 +72,7 @@ class CTCGreedyDecoder:
 
     def __call__(
         self, log_probs: cp.ndarray, output_lengths: cp.ndarray
-    ) -> DecoderResult:
+    ) -> tuple[list[list[int]], list[list[float]]]:
         """Decode padded CTC log probabilities.
 
         Parameters
@@ -88,8 +87,9 @@ class CTCGreedyDecoder:
 
         Returns
         -------
-        DecoderResult
-            Collapsed non-blank token IDs and token start timestamps in seconds.
+        tuple[list[list[int]], list[list[float]]]
+            Collapsed non-blank token IDs and corresponding token start
+            timestamps in seconds.
 
         Raises
         ------
@@ -100,12 +100,17 @@ class CTCGreedyDecoder:
 
         if log_probs.ndim != 3:
             raise ASRInferenceError(
-                f"Expected rank-3 CTC log probabilities, got shape {log_probs.shape}.",
+                f"Expected rank-3 CTC log probabilities, got shape {log_probs.shape}."
             )
 
         batch_size, num_frames = log_probs.shape[:2]
         if batch_size == 0:
             raise ASRInferenceError("At least one CTC utterance is required.")
+        if num_frames > INT32_MAX:
+            raise ASRInferenceError(
+                "CTC frame count exceeds signed 32-bit kernel indexing: "
+                f"{num_frames} frames, limit={INT32_MAX}."
+            )
         if (
             log_probs.dtype not in (np.float16, np.float32, cp.dtype("bfloat16"))
             or output_lengths.shape != (batch_size,)
@@ -116,7 +121,7 @@ class CTCGreedyDecoder:
                 "Expected float16, float32, or bfloat16 CTC log probabilities and "
                 f"contiguous int32 output lengths with shape {(batch_size,)}, got "
                 f"log-probability dtype {log_probs.dtype} and output lengths with "
-                f"shape {output_lengths.shape} and dtype {output_lengths.dtype}.",
+                f"shape {output_lengths.shape} and dtype {output_lengths.dtype}."
             )
 
         with self.device, self.stream:
@@ -174,9 +179,7 @@ class CTCGreedyDecoder:
                 )
 
             if self.emitted_tokens_host is None or self.emitted_timestamps_host is None:
-                raise ASRInferenceError(
-                    "CTC host output buffers were not initialized.",
-                )
+                raise ASRInferenceError("CTC host output buffers were not initialized.")
 
             if max_emitted > 0:
                 self.emitted_tokens[:, :max_emitted].get(
@@ -193,10 +196,10 @@ class CTCGreedyDecoder:
             token_ids.append(self.emitted_tokens_host[index, :length].tolist())
             timestamps.append(self.emitted_timestamps_host[index, :length].tolist())
 
-        return DecoderResult(token_ids=token_ids, timestamps=timestamps)
+        return token_ids, timestamps
 
 
-class ModifiedBeamSearchDecoder:
+class ZipformerModifiedBeamSearchDecoder:
     """Decode fixed-capacity batches with modified beam search.
 
     Decoder engines with ``beam=1`` (corresponding to an RNN-T greedy decoder) use
@@ -282,7 +285,15 @@ class ModifiedBeamSearchDecoder:
             }
 
             self.decoder = engine.create_execution_context()
-            self.decoder.set_optimization_profile_async(0, self.stream.ptr)
+            if self.decoder is None:
+                raise ASRInitializationError(
+                    "TensorRT could not create the Zipformer decoder execution context."
+                )
+            if not self.decoder.set_optimization_profile_async(0, self.stream.ptr):
+                raise ASRInitializationError(
+                    "TensorRT could not select Zipformer decoder optimization "
+                    "profile 0."
+                )
 
             self.cuda_graph: cp.cuda.graph.Graph | None = None
             self.cuda_graph_signature: tuple[int, ...] | None = None
@@ -311,7 +322,10 @@ class ModifiedBeamSearchDecoder:
                 ("encoder_output", self.encoder_input),
                 ("tokens_log_prob", self.tokens_log_prob),
             ):
-                self.decoder.set_tensor_address(name, binding.data.ptr)
+                if not self.decoder.set_tensor_address(name, binding.data.ptr):
+                    raise ASRInitializationError(
+                        f"TensorRT rejected the Zipformer decoder tensor {name}."
+                    )
 
             context_lookup_path = engine_path.parent / ZIPFORMER_DECODER_CONTEXTS_FILE
             context_lookup = torch.load(
@@ -377,23 +391,24 @@ class ModifiedBeamSearchDecoder:
 
     def __call__(
         self, encoder_output: cp.ndarray, encoder_output_lengths: cp.ndarray
-    ) -> DecoderResult:
+    ) -> tuple[list[list[int]], list[list[float]]]:
         """Decode actual utterances in one fixed-capacity encoder batch.
 
         Parameters
         ----------
         encoder_output : cp.ndarray
             Contiguous FP32, FP16, or BF16 CUDA encoder embeddings with shape
-            ``(actual_batch, num_frames, encoder_dim)``.
+            ``(actual_batch, num_frames, encoder_dim)``. Frames are converted to
+            the decoder engine's floating-point dtype while being staged.
         encoder_output_lengths : cp.ndarray
             Contiguous CUDA ``int32`` valid encoder lengths with shape
             ``(actual_batch,)``.
 
         Returns
         -------
-        DecoderResult
-            Best token IDs and token start timestamps in seconds for each
-            actual utterance.
+        tuple[list[list[int]], list[list[float]]]
+            Best token IDs and corresponding token start timestamps in seconds
+            for each actual utterance.
 
         Raises
         ------
@@ -410,13 +425,12 @@ class ModifiedBeamSearchDecoder:
 
         if encoder_output.ndim != 3:
             raise ASRInferenceError(
-                f"Expected rank-3 encoder output, got shape {encoder_output.shape}.",
+                f"Expected rank-3 encoder output, got shape {encoder_output.shape}."
             )
         actual_batch_size = encoder_output.shape[0]
         if not 0 < actual_batch_size <= self.batch_size:
             raise ASRInferenceError(
-                f"Decoder batch capacity is {self.batch_size}, "
-                f"got {actual_batch_size}.",
+                f"Decoder batch capacity is {self.batch_size}, got {actual_batch_size}."
             )
         if (
             encoder_output.shape[2] != self.encoder_dim
@@ -427,7 +441,7 @@ class ModifiedBeamSearchDecoder:
             raise ASRInferenceError(
                 "Expected contiguous rank-3 encoder output with dimension "
                 f"{self.encoder_dim} and float16, float32, or bfloat16 values, "
-                f"got shape {encoder_output.shape} and dtype {encoder_output.dtype}.",
+                f"got shape {encoder_output.shape} and dtype {encoder_output.dtype}."
             )
         if (
             encoder_output_lengths.shape != (actual_batch_size,)
@@ -437,15 +451,28 @@ class ModifiedBeamSearchDecoder:
             raise ASRInferenceError(
                 "Expected contiguous int32 encoder output lengths with shape "
                 f"{(actual_batch_size,)}, got shape {encoder_output_lengths.shape} "
-                f"and dtype {encoder_output_lengths.dtype}.",
+                f"and dtype {encoder_output_lengths.dtype}."
+            )
+
+        max_frames = encoder_output.shape[1]
+        history_elements = self.batch_size * self.beam * max_frames
+        if history_elements > INT32_MAX:
+            raise ASRInferenceError(
+                "Zipformer token histories exceed signed 32-bit kernel indexing: "
+                f"{history_elements} elements, limit={INT32_MAX}."
+            )
+        encoder_elements = actual_batch_size * max_frames * self.encoder_dim
+        if encoder_elements > INT32_MAX:
+            raise ASRInferenceError(
+                "Zipformer encoder output exceeds signed 32-bit kernel indexing: "
+                f"{encoder_elements} elements, limit={INT32_MAX}."
             )
 
         with self.device, self.stream:
-            max_frames = encoder_output.shape[1]
             if max_frames == 0:
-                return DecoderResult(
-                    token_ids=[[] for _ in range(actual_batch_size)],
-                    timestamps=[[] for _ in range(actual_batch_size)],
+                return (
+                    [[] for _ in range(actual_batch_size)],
+                    [[] for _ in range(actual_batch_size)],
                 )
 
             if max_frames > self.frame_capacity:
@@ -710,4 +737,4 @@ class ModifiedBeamSearchDecoder:
             token_ids.append(tokens[:length].tolist())
             timestamps.append(token_timestamps[:length].tolist())
 
-        return DecoderResult(token_ids=token_ids, timestamps=timestamps)
+        return token_ids, timestamps

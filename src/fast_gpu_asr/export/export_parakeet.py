@@ -28,6 +28,7 @@ from ..constants import (
     PARAKEET_ONNX_FILE,
     PARAKEET_TENSORRT_FILE,
     PRECISION_DTYPES,
+    TOKENIZER_FILE,
     TRANSDUCER_DECODER_TYPES,
 )
 from ..utils import validate_model, validate_model_config
@@ -149,7 +150,7 @@ def extract_member(archive: tarfile.TarFile, filename: str, output_dir: Path) ->
     archive : tarfile.TarFile
         Open Parakeet archive.
     filename : str
-        Required member name or path suffix.
+        Required member basename.
     output_dir : Path
         Directory where the member is extracted using its basename.
 
@@ -162,18 +163,26 @@ def extract_member(archive: tarfile.TarFile, filename: str, output_dir: Path) ->
     ------
     FileNotFoundError
         Raised when no matching member exists or its contents cannot be read.
+    ValueError
+        Raised when multiple regular archive members have the requested
+        basename.
     """
 
-    member = next(
-        (
-            candidate
-            for candidate in archive.getmembers()
-            if candidate.name.endswith(filename)
-        ),
-        None,
-    )
-    if member is None:
+    basename = Path(filename).name
+    members = [
+        candidate
+        for candidate in archive.getmembers()
+        if candidate.isfile() and Path(candidate.name).name == basename
+    ]
+    if not members:
         raise FileNotFoundError(f"Missing {filename} in Parakeet archive.")
+    if len(members) > 1:
+        member_names = sorted(member.name for member in members)
+        raise ValueError(
+            f"Expected one {filename} in Parakeet archive, got {member_names}."
+        )
+
+    member = members[0]
 
     source = archive.extractfile(member)
     if source is None:
@@ -252,14 +261,16 @@ def adjust_state_dict(
     Raises
     ------
     ValueError
-        Raised when a pointwise convolution does not have a singleton kernel
-        dimension and therefore cannot be represented by a linear layer.
+        Raised when renamed checkpoint keys collide, attention projections are
+        incomplete or incompatible, or a pointwise convolution cannot be
+        represented by a linear layer.
     """
 
     adjusted_state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
-    for key, value in state_dict.items():
+    adjusted_sources: dict[str, str] = {}
+    for source_key, value in state_dict.items():
         key = (
-            key.replace("decoder.prediction.embed", "embedding")
+            source_key.replace("decoder.prediction.embed", "embedding")
             .replace("decoder.prediction.dec_rnn.lstm", "lstm")
             .replace("joint.pred", "decoder_proj")
             .replace("joint.enc", "encoder_proj")
@@ -276,31 +287,78 @@ def adjust_state_dict(
             if value.ndim != 3 or value.size(2) != 1:
                 raise ValueError(
                     f"Expected pointwise Conv1d weight {key} to have shape "
-                    f"(out_channels, in_channels, 1), got {tuple(value.shape)}.",
+                    f"(out_channels, in_channels, 1), got {tuple(value.shape)}."
                 )
             value = value.squeeze(2)
         if key.endswith(
             ("feed_forward1.linear2.weight", "feed_forward2.linear2.weight"),
         ):
             value = value * 0.5
+
+        if key in adjusted_state_dict:
+            raise ValueError(
+                f"Checkpoint keys {adjusted_sources[key]} and {source_key} both "
+                f"map to {key}."
+            )
+
         adjusted_state_dict[key] = value
+        adjusted_sources[key] = source_key
 
-    query_suffix = ".self_attn.linear_q.weight"
-    for query_key in tuple(adjusted_state_dict):
-        if not query_key.endswith(query_suffix):
-            continue
+    projection_suffixes = {
+        "query": ".self_attn.linear_q.weight",
+        "key": ".self_attn.linear_k.weight",
+        "value": ".self_attn.linear_v.weight",
+    }
+    projection_prefixes = {
+        key.removesuffix(suffix)
+        for key in adjusted_state_dict
+        for suffix in projection_suffixes.values()
+        if key.endswith(suffix)
+    }
+    for prefix in sorted(projection_prefixes):
+        query_key = f"{prefix}{projection_suffixes['query']}"
+        key_key = f"{prefix}{projection_suffixes['key']}"
+        value_key = f"{prefix}{projection_suffixes['value']}"
+        qkv_key = f"{prefix}.self_attn.linear_qkv.weight"
 
-        prefix = query_key.removesuffix(query_suffix)
-        key_key = f"{prefix}.self_attn.linear_k.weight"
-        value_key = f"{prefix}.self_attn.linear_v.weight"
-        adjusted_state_dict[f"{prefix}.self_attn.linear_qkv.weight"] = torch.cat(
-            (
-                adjusted_state_dict.pop(query_key),
-                adjusted_state_dict.pop(key_key),
-                adjusted_state_dict.pop(value_key),
-            ),
-            dim=0,
+        missing_keys = tuple(
+            key
+            for key in (query_key, key_key, value_key)
+            if key not in adjusted_state_dict
         )
+        if missing_keys:
+            raise ValueError(
+                f"Missing attention projection companions {missing_keys} for {prefix}."
+            )
+        if qkv_key in adjusted_state_dict:
+            raise ValueError(
+                f"Checkpoint contains both split attention projections and {qkv_key}."
+            )
+
+        projections = (
+            adjusted_state_dict[query_key],
+            adjusted_state_dict[key_key],
+            adjusted_state_dict[value_key],
+        )
+        if any(projection.ndim != 2 for projection in projections) or any(
+            projection.shape != projections[0].shape
+            or projection.dtype != projections[0].dtype
+            or projection.device != projections[0].device
+            for projection in projections[1:]
+        ):
+            projection_metadata = tuple(
+                (tuple(projection.shape), projection.dtype, projection.device)
+                for projection in projections
+            )
+            raise ValueError(
+                "Expected matching rank-2 query, key, and value projection "
+                f"weights for {prefix}, got {projection_metadata}."
+            )
+
+        for projection_key in (query_key, key_key, value_key):
+            del adjusted_state_dict[projection_key]
+
+        adjusted_state_dict[qkv_key] = torch.cat(projections, dim=0)
 
     return adjusted_state_dict
 
@@ -424,7 +482,13 @@ def get_subsampling_batch_partitions(
     elements_per_item = (
         model_config.encoder.subsampling_conv_channels * conv1_frames * conv1_features
     )
+
     cask_element_limit = 1 << 31
+    if elements_per_item > cask_element_limit:
+        raise ValueError(
+            "One Parakeet subsampling item exceeds TensorRT CASK's signed "
+            f"32-bit element-offset limit: {elements_per_item} elements."
+        )
 
     partitions = (
         args.batch_size * elements_per_item + cask_element_limit - 1
@@ -528,7 +592,7 @@ def export_model_to_onnx(
     # specialize even though waveform time is dynamic.
     audio_samples = round(args.opt_audio_seconds * model_config.sample_rate)
     audio = torch.zeros(args.batch_size, audio_samples, dtype=torch.float32)
-    audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int32)
+    audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int64)
 
     logger.info("Exporting the batched Parakeet encoder to %s.", encoder_path)
     with torch.inference_mode():
@@ -627,7 +691,12 @@ def export_parakeet(args: argparse.Namespace) -> None:
 
     if not args.model_path.is_file():
         raise FileNotFoundError(
-            f"Parakeet model archive does not exist: {args.model_path}.",
+            f"Parakeet model archive does not exist: {args.model_path}."
+        )
+    if args.model_path.resolve().is_relative_to(args.output_dir.resolve()):
+        raise ValueError(
+            f"Output directory {args.output_dir} contains required source file "
+            f"{args.model_path}."
         )
 
     if args.output_dir.exists():
@@ -664,7 +733,7 @@ def export_parakeet(args: argparse.Namespace) -> None:
         )
         del state_dict
 
-        shutil.copyfile(tokenizer_path, args.output_dir / "bpe.model")
+        shutil.copyfile(tokenizer_path, args.output_dir / TOKENIZER_FILE)
         runtime_config = make_runtime_config(model_config, args)
         logger.info("Parakeet runtime config:\n%s", OmegaConf.to_yaml(runtime_config))
         OmegaConf.save(runtime_config, args.output_dir / MODEL_CONFIG_FILE)
@@ -695,11 +764,12 @@ def export_parakeet(args: argparse.Namespace) -> None:
         args.optimization_level,
     )
 
-    validate_model(args.output_dir, runtime_config)
-
     if not args.debug:
         remove_onnx_artifacts(encoder_onnx_path)
         remove_onnx_artifacts(decoder_onnx_path)
+
+    published_config = OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE)
+    validate_model(args.output_dir, published_config)
 
     logger.info("Parakeet TensorRT export completed in %s.", args.output_dir)
 

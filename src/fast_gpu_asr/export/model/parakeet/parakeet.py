@@ -79,8 +79,6 @@ class ParakeetTDTEncoder(torch.nn.Module):
 
         super().__init__()
 
-        self.dtype = dtype
-
         self.feature_extractor = FeatureExtractor(
             samp_freq,
             frame_shift_ms,
@@ -103,7 +101,7 @@ class ParakeetTDTEncoder(torch.nn.Module):
         )
 
         for module in (self.encoder.pre_encode, *self.encoder.layers):
-            module.to(dtype=self.dtype)
+            module.to(dtype=dtype)
 
     def forward(
         self,
@@ -116,7 +114,7 @@ class ParakeetTDTEncoder(torch.nn.Module):
         ----------
         audio : torch.Tensor[torch.float32]
             Padded waveforms of shape ``(batch_size, num_samples)``.
-        audio_lengths : torch.Tensor[torch.int32]
+        audio_lengths : torch.Tensor[torch.int64]
             Valid sample counts of shape ``(batch_size,)``.
 
         Returns
@@ -131,7 +129,7 @@ class ParakeetTDTEncoder(torch.nn.Module):
         """
 
         features, feature_lengths = self.feature_extractor(audio, audio_lengths)
-        features = features.to(self.dtype)
+        features = features.to(self.encoder.pre_encode.conv1.weight.dtype)
         encoder_out, encoder_out_lengths = self.encoder(features, feature_lengths)
 
         return encoder_out, encoder_out_lengths
@@ -379,9 +377,6 @@ class ConvSubsampling(torch.nn.Module):
             ``torch.int32`` valid lengths.
         """
 
-        partition_size = (
-            x.size(0) + self.batch_partitions - 1
-        ) // self.batch_partitions
         x_lens = (x_lens + 1) // 2
         padding_mask = torch.arange(
             (x.size(1) + 1) // 2, dtype=x_lens.dtype, device=x_lens.device
@@ -393,8 +388,8 @@ class ConvSubsampling(torch.nn.Module):
             conv2_lengths = (x_lens + 1) // 2
             partition_outputs: list[torch.Tensor] = []
             for partition in range(self.batch_partitions):
-                start = partition * partition_size
-                end = min(start + partition_size, x.size(0))
+                start = partition * x.size(0) // self.batch_partitions
+                end = (partition + 1) * x.size(0) // self.batch_partitions
                 partition_output = self.conv1(x[start:end].unsqueeze(1))
                 partition_output = self.relu(
                     partition_output.masked_fill(
@@ -502,16 +497,9 @@ class ConformerConvolution(torch.nn.Module):
         kernel_size : int
             Odd kernel size of the depthwise convolution.
 
-        Raises
-        ------
-        ValueError
-            Raised when ``kernel_size`` is even.
         """
 
         super().__init__()
-
-        if (kernel_size - 1) % 2 != 0:
-            raise ValueError("Conformer convolution kernel size must be odd.")
 
         self.pointwise_conv1 = torch.nn.Linear(model_dim, 2 * model_dim, bias=False)
         self.depthwise_conv = torch.nn.Conv1d(
@@ -572,7 +560,7 @@ class ConformerConvolution(torch.nn.Module):
             )
         else:
             padding_mask = torch.arange(
-                x.size(1), device=output_lengths.device
+                x.size(1), dtype=output_lengths.dtype, device=output_lengths.device
             ).unsqueeze(0) >= output_lengths.unsqueeze(1)
             x = x.masked_fill(padding_mask.unsqueeze(2), 0.0).permute(0, 2, 1)
             x = torch.nn.functional.pad(x, (self.padding, self.padding))

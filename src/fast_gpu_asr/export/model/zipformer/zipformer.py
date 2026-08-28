@@ -144,12 +144,12 @@ class Zipformer2(torch.nn.Module):
         output_dim : int
             The output dimension after final output projection.
         use_ctc : bool
-            Whether the output projection contains a CTC head. If true, log-softmax is
-            applied to the final output.
+            Whether the output projection contains a CTC head. CTC heads return
+            normalized log probabilities.
         dtype : torch.dtype
-            Floating-point dtype used by subsampling, encoder stacks, and the
-            output projection. Supported values are ``torch.float32``,
-            ``torch.float16``, and ``torch.bfloat16``.
+            Floating-point dtype used by subsampling and the encoder stacks.
+            The final output projection remains ``torch.float32`` for both
+            transducer and CTC models.
         """
 
         super().__init__()
@@ -158,7 +158,6 @@ class Zipformer2(torch.nn.Module):
         projection_dim = max(encoder_dims)
         self.projection_dim = projection_dim
         self.ctc = use_ctc
-        self.dtype = dtype
 
         self.feature_extractor = FeatureExtractor(
             samp_freq,
@@ -220,11 +219,10 @@ class Zipformer2(torch.nn.Module):
             self.subsampling,
             *encoders,
             self.downsample_output,
-            self.projection_output,
         ):
-            module.to(dtype=self.dtype)
+            module.to(dtype=dtype)
 
-        if self.dtype == torch.bfloat16:
+        if dtype == torch.bfloat16:
             self.subsampling.conv1.to(dtype=torch.float16)
 
     def forward(
@@ -238,27 +236,28 @@ class Zipformer2(torch.nn.Module):
             Padded waveforms with shape
             ``(batch_size, num_samples + right_padding)``. The runtime appends
             the reflected right context required by the feature extractor.
-        audio_lengths : torch.Tensor[torch.int32]
+        audio_lengths : torch.Tensor[torch.int64]
             Valid sample counts with shape ``(batch_size,)``.
 
         Returns
         -------
         tuple[
-            torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16],
+            torch.Tensor[torch.float32],
             torch.Tensor[torch.int32],
         ]
             Encoder embeddings with shape
             ``(batch_size, num_encoder_frames, output_dim)`` and
-            ``torch.int32`` valid frame counts. Encoder embeddings retain the
-            configured floating-point dtype.
+            ``torch.int32`` valid frame counts. The final projection returns
+            ``torch.float32`` embeddings or CTC log probabilities.
         """
 
         x, x_lens = self.feature_extractor(audio, audio_lengths)
-        x, x_lens = self.subsampling(x.to(self.dtype), x_lens)
+        x, x_lens = self.subsampling(x, x_lens)
 
         padding_mask = torch.arange(
             x.size(1),
-            device=x.device,
+            dtype=x_lens.dtype,
+            device=x_lens.device,
         ).unsqueeze(0) >= x_lens.unsqueeze(1)
 
         # Encoder 1
@@ -321,7 +320,7 @@ class Zipformer2(torch.nn.Module):
 
         output = self.downsample_output(output)
         output_lens = (x_lens + 1) // 2
-        output = self.projection_output(output)
+        output = self.projection_output(output.to(self.projection_output.weight.dtype))
 
         if self.ctc:
             output = torch.nn.functional.log_softmax(output, dim=2)
@@ -535,19 +534,9 @@ class ConvolutionModule(torch.nn.Module):
         kernel_size : int
             The kernel size of the depthwise convolution module.
 
-        Raises
-        ------
-        ValueError
-            Raised when ``kernel_size`` is even.
         """
 
         super().__init__()
-
-        if kernel_size % 2 == 0:
-            raise ValueError(
-                "ConvolutionModule kernel size should be "
-                f"an odd number but got {kernel_size} instead.",
-            )
 
         self.in_proj = torch.nn.Linear(embed_dim, 2 * embed_dim)
         self.depthwise_conv = torch.nn.Conv1d(
@@ -594,7 +583,7 @@ class ConvolutionModule(torch.nn.Module):
             )
         else:
             padding_mask = torch.arange(
-                x.size(1), device=valid_lengths.device
+                x.size(1), dtype=valid_lengths.dtype, device=valid_lengths.device
             ).unsqueeze(0) >= valid_lengths.unsqueeze(1)
             x = x.masked_fill(padding_mask.unsqueeze(2), 0.0).permute(0, 2, 1)
             x = self.depthwise_conv(x)

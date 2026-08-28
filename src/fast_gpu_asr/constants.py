@@ -25,6 +25,7 @@ PARAKEET_DECODER_ONNX_FILE = "tdt_decoder.onnx"
 PARAKEET_DECODER_TENSORRT_FILE = "tdt_decoder.trt"
 PARAKEET_ONNX_FILE = "parakeet.onnx"
 PARAKEET_TENSORRT_FILE = "parakeet.trt"
+TOKENIZER_FILE = "bpe.model"
 ZIPFORMER_DECODER_CONTEXTS_FILE = "decoder_contexts.pt"
 ZIPFORMER_DECODER_ONNX_FILE = "decoder.onnx"
 ZIPFORMER_DECODER_TENSORRT_FILE = "decoder.trt"
@@ -49,6 +50,7 @@ ZIPFORMER_UPSAMPLE_BYPASS_PLUGIN_NAME = "zipformer_upsample_bypass"
 # Amortize thread scheduling over roughly 64 MB of float32 waveform data.
 AUDIO_SAMPLES_PER_WORKER = 16_000_000
 INT32_MAX = (1 << 31) - 1
+PARAKEET_MAX_ENCODER_FRAMES = 512
 # Keep this even so each graph replay restores canonical ping-pong buffer roles.
 TDT_SEARCH_CHUNK_STEPS = 8
 ZIPFORMER_BEAM_SEARCH_THREADS = 512

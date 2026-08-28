@@ -37,6 +37,8 @@ constexpr char const* kPreemphField = "preemph";
 constexpr char const* kZeroLogField = "zero_log";
 constexpr size_t kCublasWorkspaceBytes = 16U << 20;
 constexpr size_t kCublasWorkspaceAlignment = 256;
+constexpr size_t kMaximumWorkspaceBytes =
+    static_cast<size_t>(std::numeric_limits<int32_t>::max());
 constexpr int32_t kThreadsPerBlock = 256;
 constexpr int32_t kWarpSize = 32;
 constexpr int32_t kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
@@ -47,7 +49,21 @@ constexpr int32_t kMaxFrameLength = static_cast<int32_t>(
     (kPortableSharedMemoryBytes - kWarpsPerBlock * sizeof(float)) / sizeof(float));
 constexpr int32_t kMaxFrequencies =
     static_cast<int32_t>(kPortableSharedMemoryBytes / sizeof(cufftComplex));
+// FAST_16F converts the unbounded FP32 power spectrum to FP16 before the mel
+// GEMM. Full-scale PCM can exceed FP16's finite range, so retain only compute
+// modes with an FP32-like exponent range for this projection.
+constexpr std::array<int32_t, 3> kMelProjectionTactics{
+    kStrictComputeTactic,
+    kFast16BFComputeTactic,
+    kFastTF32ComputeTactic,
+};
 static_assert(kThreadsPerBlock % kWarpSize == 0);
+
+bool isMelProjectionTactic(int32_t tactic) noexcept
+{
+    return std::find(kMelProjectionTactics.begin(), kMelProjectionTactics.end(), tactic)
+        != kMelProjectionTactics.end();
+}
 
 struct WorkspaceLayout
 {
@@ -137,10 +153,13 @@ bool makeWorkspaceLayout(
     {
         return false;
     }
-    return true;
+    // TensorRT's surrounding ForeignNode path uses signed 32-bit workspace byte
+    // offsets on supported releases. Reject oversized profiles during build
+    // instead of allowing an internal offset to wrap during tactic execution.
+    return layout.totalBytes <= kMaximumWorkspaceBytes;
 }
 
-__global__ void prepareFrames(float const* audio, int32_t const* audioLengths,
+__global__ void prepareFrames(float const* audio, int64_t const* audioLengths,
     float const* window, float* frames, int32_t* featureLengths, int32_t audioSamples,
     int32_t numFrames, int32_t frameLength, int32_t frameShift, int32_t leftPadding,
     int32_t fftLength, int32_t minFrames, float preemph)
@@ -156,12 +175,19 @@ __global__ void prepareFrames(float const* audio, int32_t const* audioLengths,
     {
         // Exactly one block per utterance owns frame zero, avoiding a separate
         // feature-length kernel and any cross-block synchronization.
-        int64_t const roundedLength =
-            (static_cast<int64_t>(audioLengths[batch]) + frameShift / 2)
-            / frameShift;
-        featureLengths[batch] = roundedLength > minFrames
-            ? static_cast<int32_t>(roundedLength)
-            : minFrames;
+        int64_t validSamples = audioLengths[batch];
+        validSamples = validSamples < 0
+            ? 0 : (validSamples > audioSamples ? audioSamples : validSamples);
+        int64_t const roundedLength = (validSamples + frameShift / 2) / frameShift;
+        // Runtime sample counts live in device memory and therefore cannot be
+        // validated while TensorRT builds the engine. Bound the published length
+        // to the physical output so malformed values cannot make a downstream
+        // layer read beyond the feature tensor.
+        int64_t const minimumLength = minFrames;
+        int64_t const boundedLength =
+            roundedLength > minimumLength ? roundedLength : minimumLength;
+        featureLengths[batch] = static_cast<int32_t>(
+            boundedLength < numFrames ? boundedLength : numFrames);
     }
 
     extern __shared__ float frameSamples[];
@@ -267,7 +293,7 @@ __global__ void finalizeFeatures(float* features, int32_t const* featureLengths,
             index / (static_cast<int64_t>(numFrames) * numFeatures));
         int32_t const frame = static_cast<int32_t>((index / numFeatures) % numFrames);
         int32_t const length = featureLengths[batch];
-        features[index] = frame < length ? logf(fmaxf(features[index], 0x1p-24F)) : zeroLog;
+        features[index] = frame < length ? logf(fmaxf(features[index], 0x1p-23F)) : zeroLog;
         if (elements - index <= stride)
         {
             break;
@@ -308,11 +334,12 @@ bool haveValidShapes(Dims const& audio, Dims const& audioLengths,
         || melFilterbank.nbDims != 2 || features.nbDims != 3
         || featureLengths.nbDims != 1
         || !hasAddressableBytes(audio, sizeof(float))
-        || !hasAddressableBytes(audioLengths, sizeof(int32_t))
+        || !hasAddressableBytes(audioLengths, sizeof(int64_t))
         || !hasAddressableBytes(window, sizeof(float))
         || !hasAddressableBytes(melFilterbank, sizeof(float))
         || !hasAddressableBytes(features, sizeof(float))
         || !hasAddressableBytes(featureLengths, sizeof(int32_t))
+        || !areValidParameters(parameters)
         || audio.d[1] < parameters.leftPadding
         || audioLengths.d[0] != audio.d[0]
         || window.d[0] != parameters.frameLength || melFilterbank.d[0] < 2
@@ -332,24 +359,28 @@ bool haveValidShapes(Dims const& audio, Dims const& audioLengths,
         2LL * (static_cast<int64_t>(melFilterbank.d[0]) - 1);
     int64_t const rows =
         static_cast<int64_t>(audio.d[0]) * features.d[1];
+    WorkspaceLayout layout{};
     return frameNumerator >= 0 && expectedFrames == features.d[1]
         && fftLength >= parameters.frameLength
         && fftLength <= std::numeric_limits<int32_t>::max() - 2
         && melFilterbank.d[0] <= kMaxFrequencies && rows >= 1
-        && rows <= std::numeric_limits<int32_t>::max();
+        && rows <= std::numeric_limits<int32_t>::max()
+        && makeWorkspaceLayout(rows, static_cast<int32_t>(fftLength),
+            static_cast<int32_t>(melFilterbank.d[0]), layout);
 }
 
 // Convert normalized audio to Kaldi-compatible log-mel features. The plugin
 // keeps framing and windowing, batched cuFFT, power extraction, mel projection,
 // and padding finalization on one CUDA stream. Features remain FP32 throughout,
 // and the second output contains valid frame counts for every waveform.
-class FeaturePlugin final : public IPluginV3,
-                            public IPluginV3OneCore,
-                            public IPluginV3OneBuild,
-                            public IPluginV3OneRuntime
+class ZipformerFeaturePlugin final : public IPluginV3,
+                                     public IPluginV3OneCore,
+                                     public IPluginV3OneBuild,
+                                     public IPluginV3OneRuntime
 {
 public:
-    explicit FeaturePlugin(FeatureParameters parameters, int32_t tactic = kStrictComputeTactic)
+    explicit ZipformerFeaturePlugin(
+        FeatureParameters parameters, int32_t tactic = kStrictComputeTactic) noexcept
         : mParameters(parameters), mTactic(tactic)
     {
         int const timingCacheLength = std::snprintf(mTimingCacheId.data(), mTimingCacheId.size(),
@@ -365,7 +396,7 @@ public:
         initializeFields();
     }
 
-    ~FeaturePlugin() override
+    ~ZipformerFeaturePlugin() override
     {
         if (mPlan != 0)
         {
@@ -390,7 +421,8 @@ public:
 
     IPluginV3* clone() noexcept override
     {
-        auto* plugin = new (std::nothrow) FeaturePlugin(mParameters, mTactic);
+        auto* plugin =
+            new (std::nothrow) ZipformerFeaturePlugin(mParameters, mTactic);
         if (plugin == nullptr || !plugin->mInitialized)
         {
             delete plugin;
@@ -428,7 +460,7 @@ public:
             || inputs[2].desc.dims.nbDims != 1 || inputs[3].desc.dims.nbDims != 2
             || outputs[0].desc.dims.nbDims != 3 || outputs[1].desc.dims.nbDims != 1
             || inputs[0].desc.type != DataType::kFLOAT
-            || inputs[1].desc.type != DataType::kINT32
+            || inputs[1].desc.type != DataType::kINT64
             || inputs[2].desc.type != DataType::kFLOAT
             || inputs[3].desc.type != DataType::kFLOAT
             || outputs[0].desc.type != DataType::kFLOAT
@@ -456,7 +488,7 @@ public:
     {
         if (outputTypes == nullptr || inputTypes == nullptr
             || nbInputs != kInputCount || nbOutputs != kOutputCount
-            || inputTypes[0] != DataType::kFLOAT || inputTypes[1] != DataType::kINT32
+            || inputTypes[0] != DataType::kFLOAT || inputTypes[1] != DataType::kINT64
             || inputTypes[2] != DataType::kFLOAT || inputTypes[3] != DataType::kFLOAT)
         {
             return 1;
@@ -525,7 +557,8 @@ public:
         {
             return false;
         }
-        auto const type = pos == 1 || pos == 5 ? DataType::kINT32 : DataType::kFLOAT;
+        auto const type = pos == 1 ? DataType::kINT64
+            : (pos == 5 ? DataType::kINT32 : DataType::kFLOAT);
         return inOut[pos].desc.format == TensorFormat::kLINEAR && inOut[pos].desc.type == type;
     }
 
@@ -549,23 +582,37 @@ public:
         WorkspaceLayout layout{};
         return makeWorkspaceLayout(rows, static_cast<int32_t>(fftLength64),
                    static_cast<int32_t>(frequencies64), layout)
-            ? layout.totalBytes
-            : 0;
+            ? layout.totalBytes : 0;
     }
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kCublasComputeTactics.size());
+        return static_cast<int32_t>(kMelProjectionTactics.size());
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        return writeCublasComputeTactics(tactics, nbTactics);
+        if (tactics == nullptr
+            || nbTactics != static_cast<int32_t>(kMelProjectionTactics.size()))
+        {
+            return 1;
+        }
+        std::copy(kMelProjectionTactics.begin(), kMelProjectionTactics.end(), tactics);
+        return 0;
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
     {
-        return setCublasComputeTactic(tactic, mTactic);
+        if (tactic == 0)
+        {
+            tactic = kStrictComputeTactic;
+        }
+        if (!isMelProjectionTactic(tactic))
+        {
+            return 1;
+        }
+        mTactic = tactic;
+        return 0;
     }
 
     char const* getTimingCacheID() noexcept override
@@ -581,7 +628,7 @@ public:
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
             || nbOutputs != kOutputCount
             || inputs[0].type != DataType::kFLOAT
-            || inputs[1].type != DataType::kINT32
+            || inputs[1].type != DataType::kINT64
             || inputs[2].type != DataType::kFLOAT
             || inputs[3].type != DataType::kFLOAT
             || outputs[0].type != DataType::kFLOAT
@@ -592,7 +639,7 @@ public:
             || inputs[3].format != TensorFormat::kLINEAR
             || outputs[0].format != TensorFormat::kLINEAR
             || outputs[1].format != TensorFormat::kLINEAR
-            || !isCublasComputeTactic(mTactic) || !mInitialized
+            || !isMelProjectionTactic(mTactic) || !mInitialized
             || !haveValidShapes(inputs[0].dims, inputs[1].dims, inputs[2].dims,
                 inputs[3].dims, outputs[0].dims, outputs[1].dims, mParameters))
         {
@@ -616,7 +663,8 @@ public:
         mPlan = 0;
         mPlanRows = 0;
         mPlanLength = 0;
-        mStream = nullptr;
+        mCufftStream = nullptr;
+        mCublasWorkspace = nullptr;
         // A cuFFT plan fixes both transform length and batch count. Construct a
         // replacement before publishing its dimensions; a failed plan therefore
         // cannot be mistaken for a valid cached plan by enqueue().
@@ -649,7 +697,7 @@ public:
             || inputs[2] == nullptr || inputs[3] == nullptr || outputs[0] == nullptr
             || outputs[1] == nullptr || workspace == nullptr || mPlan == 0
             || !mInitialized || inputDesc[0].type != DataType::kFLOAT
-            || inputDesc[1].type != DataType::kINT32
+            || inputDesc[1].type != DataType::kINT64
             || inputDesc[2].type != DataType::kFLOAT
             || inputDesc[3].type != DataType::kFLOAT
             || outputDesc[0].type != DataType::kFLOAT
@@ -660,7 +708,7 @@ public:
             || inputDesc[3].format != TensorFormat::kLINEAR
             || outputDesc[0].format != TensorFormat::kLINEAR
             || outputDesc[1].format != TensorFormat::kLINEAR
-            || !isCublasComputeTactic(mTactic)
+            || !isMelProjectionTactic(mTactic)
             || !haveValidShapes(inputDesc[0].dims, inputDesc[1].dims,
                 inputDesc[2].dims, inputDesc[3].dims, outputDesc[0].dims,
                 outputDesc[1].dims, mParameters))
@@ -685,8 +733,12 @@ public:
             return 1;
         }
 
-        // Clear caller launch status so checks below cover only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         auto* workspaceBytes = static_cast<unsigned char*>(workspace);
         auto* frames = reinterpret_cast<float*>(workspaceBytes);
@@ -695,22 +747,33 @@ public:
         auto* power = frames;
         auto* cublasWorkspace = workspaceBytes + layout.cublasOffset;
 
-        // All library calls and custom kernels run in-order on TensorRT's stream.
-        // Updating handle state only when the stream changes avoids repeated host
-        // API work while preserving correctness across execution contexts.
-        if (stream != mStream)
+        // A rebuilt cuFFT plan starts on stream 0, while the independent cuBLAS
+        // handle retains its previous stream. Track both bindings separately so
+        // a dynamic shape change followed by stream 0 cannot leave cuBLAS racing
+        // the plan and custom kernels on an older nondefault stream.
+        if (stream != mCufftStream)
         {
-            if (cufftSetStream(mPlan, stream) != CUFFT_SUCCESS
-                || cublasSetStream(mCublas, stream) != CUBLAS_STATUS_SUCCESS)
+            if (cufftSetStream(mPlan, stream) != CUFFT_SUCCESS)
             {
                 return 1;
             }
-            mStream = stream;
+            mCufftStream = stream;
+        }
+        if (stream != mCublasStream)
+        {
+            if (cublasSetStream(mCublas, stream) != CUBLAS_STATUS_SUCCESS)
+            {
+                return 1;
+            }
+            mCublasStream = stream;
+            // cublasSetStream resets the handle workspace even when TensorRT
+            // reuses the same workspace address across executions.
+            mCublasWorkspace = nullptr;
         }
 
         prepareFrames<<<static_cast<uint32_t>(rows), kThreadsPerBlock,
             static_cast<size_t>(mParameters.frameLength) * sizeof(float), stream>>>(
-            static_cast<float const*>(inputs[0]), static_cast<int32_t const*>(inputs[1]),
+            static_cast<float const*>(inputs[0]), static_cast<int64_t const*>(inputs[1]),
             static_cast<float const*>(inputs[2]), frames, static_cast<int32_t*>(outputs[1]),
             audioSamples, numFrames, mParameters.frameLength, mParameters.frameShift,
             mParameters.leftPadding, fftLength, mParameters.minFrames, mParameters.preemph);
@@ -725,11 +788,21 @@ public:
         powerSpectrumInPlace<<<powerBlocks, kThreadsPerBlock,
             static_cast<size_t>(frequencies) * sizeof(cufftComplex), stream>>>(
             reinterpret_cast<cufftComplex const*>(frames), power, rows, frequencies);
-        if (cudaGetLastError() != cudaSuccess
-            || cublasSetWorkspace(mCublas, cublasWorkspace, kCublasWorkspaceBytes)
-                != CUBLAS_STATUS_SUCCESS)
+        if (cudaGetLastError() != cudaSuccess)
         {
             return 1;
+        }
+        // TensorRT normally reuses one context workspace across executions.
+        // Avoid repeating the host-side cuBLAS update unless either its base
+        // allocation or this dynamic shape's aligned FFT prefix changed.
+        if (cublasWorkspace != mCublasWorkspace)
+        {
+            if (cublasSetWorkspace(mCublas, cublasWorkspace, kCublasWorkspaceBytes)
+                != CUBLAS_STATUS_SUCCESS)
+            {
+                return 1;
+            }
+            mCublasWorkspace = cublasWorkspace;
         }
         float const alpha = 1.0F;
         float const beta = 0.0F;
@@ -769,7 +842,7 @@ public:
     }
 
 private:
-    friend class FeaturePluginCreator;
+    friend class ZipformerFeaturePluginCreator;
 
     void initializeFields() noexcept
     {
@@ -787,7 +860,9 @@ private:
     FeatureParameters mParameters{};
     cublasHandle_t mCublas{nullptr};
     cufftHandle mPlan{};
-    cudaStream_t mStream{nullptr};
+    cudaStream_t mCublasStream{nullptr};
+    cudaStream_t mCufftStream{nullptr};
+    void* mCublasWorkspace{nullptr};
     int32_t mPlanRows{};
     int32_t mPlanLength{};
     int32_t mTactic{kStrictComputeTactic};
@@ -797,10 +872,10 @@ private:
     PluginFieldCollection mFields{};
 };
 
-class FeaturePluginCreator final : public IPluginCreatorV3One
+class ZipformerFeaturePluginCreator final : public IPluginCreatorV3One
 {
 public:
-    FeaturePluginCreator()
+    ZipformerFeaturePluginCreator() noexcept
     {
         mAttributes = {{
             {kFrameLengthField, nullptr, PluginFieldType::kINT32, 1},
@@ -924,7 +999,7 @@ public:
             return nullptr;
         }
 
-        auto* plugin = new (std::nothrow) FeaturePlugin(parameters);
+        auto* plugin = new (std::nothrow) ZipformerFeaturePlugin(parameters);
         if (plugin == nullptr || !plugin->mInitialized)
         {
             delete plugin;
@@ -946,10 +1021,10 @@ extern "C" bool initFastGpuAsrZipformerFeaturePlugin() noexcept
 
     // Runtime and builder use separate registries. Treat an existing creator as
     // success so repeated package imports remain harmless.
-    static FeaturePluginCreator runtimeCreator;
-    static FeaturePluginCreator builderCreator;
+    static ZipformerFeaturePluginCreator runtimeCreator;
+    static ZipformerFeaturePluginCreator builderCreator;
     auto ensureRegistered = [](IPluginRegistry* registry,
-                                FeaturePluginCreator& creator) noexcept {
+                                ZipformerFeaturePluginCreator& creator) noexcept {
         if (registry == nullptr)
         {
             return false;
@@ -969,5 +1044,5 @@ extern "C" bool initFastGpuAsrZipformerFeaturePlugin() noexcept
         nvinfer1::getBuilderPluginRegistry(nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

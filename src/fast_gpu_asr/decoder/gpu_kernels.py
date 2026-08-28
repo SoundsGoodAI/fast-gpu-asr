@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 
-"""CuPy-compiled CUDA kernels for CTC, Zipformer, and Parakeet decoding."""
+"""CuPy-compiled CUDA kernels for CTC, Zipformer, and Parakeet decoding.
+
+Runtime validation bounds fixed engine tensors and configured search tables to
+signed 32-bit indexing, while kernels clamp device-resident output lengths. The
+search state remains on the GPU and is safe to replay from CUDA graphs; CTC
+widens flattened offsets because its output stride comes directly from a dynamic
+frame count.
+"""
 
 from functools import cache
 
@@ -193,7 +200,8 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
         const int utterance = blockIdx.x;
         const int thread = threadIdx.x;
         const int hypothesis_base = utterance * beam;
-        const int context_base = hypothesis_base * context_size;
+        const long long context_base =
+            static_cast<long long>(hypothesis_base) * context_size;
         const int node_capacity = beam * max_frames;
         const int node_base = utterance * node_capacity;
 
@@ -408,8 +416,10 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                 next_nodes[hypothesis_base + index] = -1;
                 next_lengths[hypothesis_base + index] = 0;
                 next_hashes[hypothesis_base + index] = 0;
+                const long long output_context_base =
+                    static_cast<long long>(hypothesis_base + index) * context_size;
                 for (int context = 0; context < context_size; ++context) {
-                    contexts[(hypothesis_base + index) * context_size + context] = 0;
+                    contexts[output_context_base + context] = 0;
                 }
             }
 
@@ -433,8 +443,10 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                 int duplicate = -1;
                 for (int output = 0; output < output_count; ++output) {
                     const int output_index = hypothesis_base + output;
-                    // Length plus a 64-bit rolling history hash avoids repeatedly
-                    // walking compact backpointer chains in this serial merge.
+                    // Length plus a 64-bit rolling history fingerprint avoids
+                    // repeatedly walking compact backpointer chains here. A hash
+                    // collision is possible in principle but negligibly likely;
+                    // exact chain comparison would dominate this serial merge.
                     if (
                         next_lengths[output_index] != candidate_length
                         || next_hashes[output_index] != candidate_hash
@@ -471,19 +483,21 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                 }
 
                 const int output_index = hypothesis_base + output_count;
+                const long long output_context_base =
+                    static_cast<long long>(output_index) * context_size;
                 next_scores[output_index] = selected_scores[rank];
                 next_nodes[output_index] = candidate_node;
                 next_lengths[output_index] = candidate_length;
                 next_hashes[output_index] = candidate_hash;
                 if (emitted) {
                     for (int context = 0; context < context_size - 1; ++context) {
-                        contexts[output_index * context_size + context] =
+                        contexts[output_context_base + context] =
                             current_contexts[parent * context_size + context + 1];
                     }
-                    contexts[output_index * context_size + context_size - 1] = token;
+                    contexts[output_context_base + context_size - 1] = token;
                 } else {
                     for (int context = 0; context < context_size; ++context) {
-                        contexts[output_index * context_size + context] =
+                        contexts[output_context_base + context] =
                             current_contexts[parent * context_size + context];
                     }
                 }
@@ -513,6 +527,10 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
 
                 const int output_index = hypothesis_base + output;
                 const int best_index = hypothesis_base + best;
+                const long long output_context_base =
+                    static_cast<long long>(output_index) * context_size;
+                const long long best_context_base =
+                    static_cast<long long>(best_index) * context_size;
                 const float score = next_scores[output_index];
                 next_scores[output_index] = next_scores[best_index];
                 next_scores[best_index] = score;
@@ -530,16 +548,17 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                 next_hashes[best_index] = hash;
 
                 for (int context = 0; context < context_size; ++context) {
-                    const int value = contexts[output_index * context_size + context];
-                    contexts[output_index * context_size + context] =
-                        contexts[best_index * context_size + context];
-                    contexts[best_index * context_size + context] = value;
+                    const int value = contexts[output_context_base + context];
+                    contexts[output_context_base + context] =
+                        contexts[best_context_base + context];
+                    contexts[best_context_base + context] = value;
                 }
             }
 
             for (int hypothesis = 0; hypothesis < beam; ++hypothesis) {
                 int lookup_index = 0;
-                const int context_index = (hypothesis_base + hypothesis) * context_size;
+                const long long context_index =
+                    static_cast<long long>(hypothesis_base + hypothesis) * context_size;
                 for (int context = 0; context < context_size; ++context) {
                     lookup_index = lookup_index * context_lookup_values
                         + contexts[context_index + context] + 1;
@@ -823,6 +842,70 @@ TDT_VALUE_HELPERS_SOURCE = r"""
             reinterpret_cast<float*>(values)[index] = value;
         }
     }
+
+    __device__ __forceinline__ int tdt_clamp_output_length(
+        int requested_length,
+        int num_frames
+    ) {
+        return requested_length < 0
+            ? 0
+            : (requested_length < num_frames ? requested_length : num_frames);
+    }
+
+    __device__ __forceinline__ void stage_tdt_encoder_input(
+        const void* encoder_output_raw,
+        void* encoder_input_raw,
+        int output_base,
+        int input_base,
+        int encoder_dim,
+        int encoder_output_dtype,
+        int encoder_input_dtype,
+        bool active,
+        int thread
+    ) {
+        const bool same_dtype = encoder_output_dtype == encoder_input_dtype;
+        const int packed_elements = encoder_output_dtype == TDT_FLOAT32 ? 4 : 8;
+        const bool can_copy_16_bytes = same_dtype
+            && encoder_dim % packed_elements == 0;
+        if (can_copy_16_bytes) {
+            // CUDA allocations are naturally aligned. Divisible row widths keep
+            // every row 16-byte aligned, so one bitwise path serves all dtypes.
+            const int encoder_vectors = encoder_dim / packed_elements;
+            const uint4* encoder_output = reinterpret_cast<const uint4*>(
+                encoder_output_raw
+            );
+            uint4* encoder_input = reinterpret_cast<uint4*>(encoder_input_raw);
+            const int output_vector_base = output_base / packed_elements;
+            const int input_vector_base = input_base / packed_elements;
+            for (
+                int feature = thread;
+                feature < encoder_vectors;
+                feature += blockDim.x
+            ) {
+                encoder_input[input_vector_base + feature] = active
+                    ? encoder_output[output_vector_base + feature]
+                    : make_uint4(0, 0, 0, 0);
+            }
+            return;
+        }
+
+        // The scalar path also converts values when encoder precisions differ.
+        for (int feature = thread; feature < encoder_dim; feature += blockDim.x) {
+            const float value = active
+                ? load_tdt_value(
+                    encoder_output_raw,
+                    output_base + feature,
+                    encoder_output_dtype
+                )
+                : 0.0F;
+            store_tdt_value(
+                encoder_input_raw,
+                input_base + feature,
+                encoder_input_dtype,
+                value
+            );
+        }
+    }
     """
 
 TDT_TOPK_HELPERS_SOURCE = r"""
@@ -836,7 +919,7 @@ TDT_TOPK_HELPERS_SOURCE = r"""
         return CUDART_NAN_F;
     }
 
-    __device__ __forceinline__ bool score_is_better(
+    __device__ __forceinline__ bool tdt_score_is_better(
         float score,
         int index,
         float other_score,
@@ -845,11 +928,13 @@ TDT_TOPK_HELPERS_SOURCE = r"""
         return score > other_score || (score == other_score && index < other_index);
     }
 
-    __device__ __forceinline__ void warp_best(float& score, int& index) {
+    __device__ __forceinline__ void tdt_warp_best(float& score, int& index) {
+        // Every caller launches complete warps and keeps all lanes active through
+        // the reduction, so the full-warp mask is valid here.
         for (int offset = 16; offset > 0; offset /= 2) {
             const float other_score = __shfl_down_sync(0xffffffff, score, offset);
             const int other_index = __shfl_down_sync(0xffffffff, index, offset);
-            if (score_is_better(other_score, other_index, score, index)) {
+            if (tdt_score_is_better(other_score, other_index, score, index)) {
                 score = other_score;
                 index = other_index;
             }
@@ -858,7 +943,10 @@ TDT_TOPK_HELPERS_SOURCE = r"""
     """
 
 TDT_SCORE_HELPERS_SOURCE = r"""
-    __device__ __forceinline__ float merge_log_scores(float first, float second) {
+    __device__ __forceinline__ float tdt_merge_log_scores(
+        float first,
+        float second
+    ) {
         // Stable two-term logaddexp. Preserve infinities explicitly because
         // subtracting -infinity from itself would otherwise produce NaN.
         const float maximum = fmaxf(first, second);
@@ -867,14 +955,14 @@ TDT_SCORE_HELPERS_SOURCE = r"""
             : maximum + logf(expf(first - maximum) + expf(second - maximum));
     }
 
-    __device__ __forceinline__ double length_normalized_score(
+    __device__ __forceinline__ double tdt_length_normalized_score(
         float score,
         int length
     ) {
         return static_cast<double>(score) / (length > 0 ? length : 1);
     }
 
-    __device__ __forceinline__ int advance_tdt_time(
+    __device__ __forceinline__ int tdt_advance_time(
         int time_index,
         int duration,
         bool force_advance,
@@ -886,6 +974,30 @@ TDT_SCORE_HELPERS_SOURCE = r"""
         return advanced_time < output_length
             ? static_cast<int>(advanced_time)
             : output_length;
+    }
+
+    __device__ __forceinline__ void tdt_advance_search_state(
+        bool emitted,
+        int duration,
+        int time_index,
+        int symbols_at_timestep,
+        int max_symbols_per_timestep,
+        int output_length,
+        int& next_time_index,
+        int& next_symbols_at_timestep
+    ) {
+        next_symbols_at_timestep = 0;
+        bool force_advance = false;
+        if (emitted && duration == 0) {
+            next_symbols_at_timestep = symbols_at_timestep + 1;
+            if (next_symbols_at_timestep >= max_symbols_per_timestep) {
+                force_advance = true;
+                next_symbols_at_timestep = 0;
+            }
+        }
+        next_time_index = tdt_advance_time(
+            time_index, duration, force_advance, output_length
+        );
     }
     """
 
@@ -913,10 +1025,11 @@ TDT_PREPARE_INPUTS_KERNEL = cp.RawKernel(
         const int hypothesis = blockIdx.x;
         const int utterance = hypothesis / beam;
         const int thread = threadIdx.x;
-        const bool active =
-            utterance < actual_batch_size
-            && isfinite(hypothesis_scores[hypothesis])
-            && time_indexes[hypothesis] < output_lengths[utterance];
+        const int output_length = utterance < actual_batch_size
+            ? tdt_clamp_output_length(output_lengths[utterance], num_frames)
+            : 0;
+        const bool active = isfinite(hypothesis_scores[hypothesis])
+            && time_indexes[hypothesis] < output_length;
 
         if (thread == 0) {
             targets[hypothesis] = active ? last_tokens[hypothesis] : 0;
@@ -925,67 +1038,17 @@ TDT_PREPARE_INPUTS_KERNEL = cp.RawKernel(
         const int frame = min(time_indexes[hypothesis], num_frames - 1);
         const int output_base = (utterance * num_frames + frame) * encoder_dim;
         const int input_base = hypothesis * encoder_dim;
-        // CUDA allocations are naturally aligned. Divisible row widths permit
-        // 16-byte copies of eight 16-bit or four FP32 values without conversion.
-        if (
-            encoder_output_dtype == encoder_input_dtype
-            && encoder_output_dtype != TDT_FLOAT32
-            && encoder_dim % 8 == 0
-        ) {
-            const uint4* encoder_output = reinterpret_cast<const uint4*>(
-                encoder_output_raw
-            );
-            uint4* encoder_input = reinterpret_cast<uint4*>(encoder_input_raw);
-            const int encoder_vectors = encoder_dim / 8;
-            const int output_vector_base = output_base / 8;
-            const int input_vector_base = input_base / 8;
-            for (
-                int feature = thread;
-                feature < encoder_vectors;
-                feature += blockDim.x
-            ) {
-                encoder_input[input_vector_base + feature] = active
-                    ? encoder_output[output_vector_base + feature]
-                    : make_uint4(0, 0, 0, 0);
-            }
-        } else if (
-            encoder_output_dtype == TDT_FLOAT32
-            && encoder_input_dtype == TDT_FLOAT32
-            && encoder_dim % 4 == 0
-        ) {
-            const float4* encoder_output = reinterpret_cast<const float4*>(
-                encoder_output_raw
-            );
-            float4* encoder_input = reinterpret_cast<float4*>(encoder_input_raw);
-            const int encoder_vectors = encoder_dim / 4;
-            const int output_vector_base = output_base / 4;
-            const int input_vector_base = input_base / 4;
-            for (
-                int feature = thread;
-                feature < encoder_vectors;
-                feature += blockDim.x
-            ) {
-                encoder_input[input_vector_base + feature] = active
-                    ? encoder_output[output_vector_base + feature]
-                    : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            }
-        } else {
-            for (int feature = thread; feature < encoder_dim; feature += blockDim.x) {
-                const float value = active
-                    ? load_tdt_value(
-                        encoder_output_raw,
-                        output_base + feature,
-                        encoder_output_dtype
-                    )
-                    : 0.0F;
-                store_tdt_value(
-                    encoder_input_raw,
-                    input_base + feature,
-                    encoder_input_dtype,
-                    value
-                );
-            }
-        }
+        stage_tdt_encoder_input(
+            encoder_output_raw,
+            encoder_input_raw,
+            output_base,
+            input_base,
+            encoder_dim,
+            encoder_output_dtype,
+            encoder_input_dtype,
+            active,
+            thread
+        );
     }
     """,
     "tdt_prepare_inputs",
@@ -1040,12 +1103,12 @@ TDT_SELECT_TOKENS_KERNEL = cp.RawKernel(
             int best_index = vocab_size;
             for (int token = thread; token < vocab_size; token += blockDim.x) {
                 const float score = candidate_scores[token];
-                if (score_is_better(score, token, best_score, best_index)) {
+                if (tdt_score_is_better(score, token, best_score, best_index)) {
                     best_score = score;
                     best_index = token;
                 }
             }
-            warp_best(best_score, best_index);
+            tdt_warp_best(best_score, best_index);
             if (lane == 0) {
                 reduction_scores[warp] = best_score;
                 reduction_indexes[warp] = best_index;
@@ -1059,7 +1122,7 @@ TDT_SELECT_TOKENS_KERNEL = cp.RawKernel(
                 best_index = lane < num_warps
                     ? reduction_indexes[lane]
                     : vocab_size;
-                warp_best(best_score, best_index);
+                tdt_warp_best(best_score, best_index);
                 if (lane == 0) {
                     top_token_scores[hypothesis * beam + rank] = best_score;
                     top_token_indexes[hypothesis * beam + rank] = best_index;
@@ -1093,7 +1156,6 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         const int* parent_indexes,
         const unsigned char* use_output_state,
         const void* encoder_output_raw,
-        const int* output_lengths,
         const float* hypothesis_scores,
         const int* time_indexes,
         const int* last_tokens,
@@ -1101,10 +1163,10 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         void* next_state_2_raw,
         void* encoder_input_raw,
         int* targets,
+        int output_length,
         int decoder_capacity,
         int hidden_dim,
         int state_layers,
-        int actual_batch_size,
         int num_frames,
         int encoder_dim,
         int beam,
@@ -1181,7 +1243,9 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         // batch, so this product matches all recurrent-state buffer layouts.
         const int decoder_capacity = static_cast<int>(gridDim.x) * beam;
         const int hypothesis_base = utterance * beam;
-        const int output_length = output_lengths[utterance];
+        const int output_length = utterance < actual_batch_size
+            ? tdt_clamp_output_length(output_lengths[utterance], num_frames)
+            : 0;
         const int token_candidates_per_parent = duration_count * beam;
         const int token_candidate_count = beam * token_candidates_per_parent;
         const int candidate_count =
@@ -1295,12 +1359,12 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 candidate += blockDim.x
             ) {
                 const float score = candidate_scores[candidate];
-                if (score_is_better(score, candidate, best_score, best_index)) {
+                if (tdt_score_is_better(score, candidate, best_score, best_index)) {
                     best_score = score;
                     best_index = candidate;
                 }
             }
-            warp_best(best_score, best_index);
+            tdt_warp_best(best_score, best_index);
             if (lane == 0) {
                 reduction_scores[warp] = best_score;
                 reduction_indexes[warp] = best_index;
@@ -1314,7 +1378,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 best_index = lane < num_warps
                     ? reduction_indexes[lane]
                     : candidate_count;
-                warp_best(best_score, best_index);
+                tdt_warp_best(best_score, best_index);
                 if (lane == 0) {
                     selected_scores[rank] = best_score;
                     selected_indexes[rank] = best_index;
@@ -1327,9 +1391,12 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         if (thread == 0) {
             const int node_base = utterance * beam * token_stride;
             int unique_count = 0;
-            // Histories are represented by rolling hashes and backpointer
-            // lengths. Equal hash, length, and time identifies paths whose
-            // scores must be combined before beam pruning.
+            // History length, time, and a 64-bit rolling fingerprint identify a
+            // path. Active paths must also agree on their zero-duration symbol
+            // count because that state controls the future force-advance rule.
+            // Exact backpointer-chain comparison would make this serial section
+            // substantially slower; the residual collision probability is
+            // negligible.
             for (int rank = 0; rank < beam; ++rank) {
                 const int candidate = selected_indexes[rank];
                 const bool emitted = candidate < token_candidate_count;
@@ -1363,16 +1430,17 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                     ? hypothesis_hashes[parent_index] * 1099511628211ULL
                         + static_cast<unsigned long long>(token + 1)
                     : hypothesis_hashes[parent_index];
-                const bool force_advance =
-                    emitted
-                    && durations[duration_index] == 0
-                    && symbols_at_timestep[parent_index] + 1
-                        >= max_symbols_per_timestep;
-                const int candidate_time = advance_tdt_time(
-                    time_indexes[parent_index],
+                int candidate_time;
+                int candidate_symbols;
+                tdt_advance_search_state(
+                    emitted,
                     durations[duration_index],
-                    force_advance,
-                    output_length
+                    time_indexes[parent_index],
+                    symbols_at_timestep[parent_index],
+                    max_symbols_per_timestep,
+                    output_length,
+                    candidate_time,
+                    candidate_symbols
                 );
 
                 int duplicate = -1;
@@ -1415,21 +1483,26 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                             * 1099511628211ULL
                             + static_cast<unsigned long long>(existing_token + 1)
                         : hypothesis_hashes[existing_parent_index];
-                    const bool existing_force_advance =
-                        existing_emitted
-                        && durations[existing_duration_index] == 0
-                        && symbols_at_timestep[existing_parent_index] + 1
-                            >= max_symbols_per_timestep;
-                    const int existing_time = advance_tdt_time(
-                        time_indexes[existing_parent_index],
+                    int existing_time;
+                    int existing_symbols;
+                    tdt_advance_search_state(
+                        existing_emitted,
                         durations[existing_duration_index],
-                        existing_force_advance,
-                        output_length
+                        time_indexes[existing_parent_index],
+                        symbols_at_timestep[existing_parent_index],
+                        max_symbols_per_timestep,
+                        output_length,
+                        existing_time,
+                        existing_symbols
                     );
                     if (
                         existing_length == candidate_length
                         && existing_hash == candidate_hash
                         && existing_time == candidate_time
+                        && (
+                            candidate_time >= output_length
+                            || existing_symbols == candidate_symbols
+                        )
                     ) {
                         duplicate = output;
                         break;
@@ -1437,7 +1510,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 }
 
                 if (duplicate >= 0) {
-                    selected_scores[duplicate] = merge_log_scores(
+                    selected_scores[duplicate] = tdt_merge_log_scores(
                         selected_scores[duplicate], selected_scores[rank]
                     );
                     continue;
@@ -1447,7 +1520,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 ++unique_count;
             }
 
-            const int retained_count = min(unique_count, beam);
+            const int retained_count = unique_count;
             for (int output = 0; output < retained_count; ++output) {
                 int best = output;
                 for (
@@ -1496,20 +1569,17 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
 
                 const int parent_index = hypothesis_base + parent;
                 const int parent_length = hypothesis_lengths[parent_index];
-                int candidate_symbols = 0;
-                bool force_advance = false;
-                if (emitted && durations[duration_index] == 0) {
-                    candidate_symbols = symbols_at_timestep[parent_index] + 1;
-                    if (candidate_symbols >= max_symbols_per_timestep) {
-                        force_advance = true;
-                        candidate_symbols = 0;
-                    }
-                }
-                const int candidate_time = advance_tdt_time(
-                    time_indexes[parent_index],
+                int candidate_time;
+                int candidate_symbols;
+                tdt_advance_search_state(
+                    emitted,
                     durations[duration_index],
-                    force_advance,
-                    output_length
+                    time_indexes[parent_index],
+                    symbols_at_timestep[parent_index],
+                    max_symbols_per_timestep,
+                    output_length,
+                    candidate_time,
+                    candidate_symbols
                 );
 
                 int candidate_node = hypothesis_nodes[parent_index];
@@ -1552,9 +1622,9 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 if (next_time_indexes[output_index] >= output_length) {
                     if (
                         !isfinite(completed_scores[utterance])
-                        || length_normalized_score(
+                        || tdt_length_normalized_score(
                             next_scores[output_index], length + 1
-                        ) > length_normalized_score(
+                        ) > tdt_length_normalized_score(
                             completed_scores[utterance],
                             completed_lengths[utterance] + 1
                         )
@@ -1613,7 +1683,6 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 parent_indexes,
                 use_output_state,
                 encoder_output_raw,
-                output_lengths,
                 next_scores,
                 next_time_indexes,
                 next_last_tokens,
@@ -1621,10 +1690,10 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 next_state_2_raw,
                 encoder_input_raw,
                 targets,
+                output_length,
                 decoder_capacity,
                 hidden_dim,
                 state_layers,
-                actual_batch_size,
                 num_frames,
                 encoder_dim,
                 beam,
@@ -1646,7 +1715,6 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         const int* parent_indexes,
         const unsigned char* use_output_state,
         const void* encoder_output_raw,
-        const int* output_lengths,
         const float* hypothesis_scores,
         const int* time_indexes,
         const int* last_tokens,
@@ -1654,10 +1722,10 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         void* next_state_2_raw,
         void* encoder_input_raw,
         int* targets,
+        int output_length,
         int decoder_capacity,
         int hidden_dim,
         int state_layers,
-        int actual_batch_size,
         int num_frames,
         int encoder_dim,
         int beam,
@@ -1675,11 +1743,12 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
             }
             return;
         }
-        // Route both recurrent tensors from the predictor output after emission,
-        // or preserve their input state after a blank. Aligned paths move eight
-        // 16-bit values or four FP32 values per 16-byte transaction.
-        if (state_dtype != TDT_FLOAT32 && hidden_dim % 8 == 0) {
-            const int hidden_vectors = hidden_dim / 8;
+        // Route recurrent state from the predictor output after emission, or
+        // preserve its input after a blank. A bitwise uint4 path moves 16 bytes
+        // at once for every supported precision when rows are suitably aligned.
+        const int packed_state_elements = state_dtype == TDT_FLOAT32 ? 4 : 8;
+        if (hidden_dim % packed_state_elements == 0) {
+            const int hidden_vectors = hidden_dim / packed_state_elements;
             const uint4* input_state_1 = reinterpret_cast<const uint4*>(
                 input_state_1_raw
             );
@@ -1694,42 +1763,6 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
             );
             uint4* next_state_1 = reinterpret_cast<uint4*>(next_state_1_raw);
             uint4* next_state_2 = reinterpret_cast<uint4*>(next_state_2_raw);
-            for (
-                int state_vector = thread;
-                state_vector < state_layers * hidden_vectors;
-                state_vector += blockDim.x
-            ) {
-                const int layer = state_vector / hidden_vectors;
-                const int hidden_vector = state_vector - layer * hidden_vectors;
-                const int destination =
-                    (layer * decoder_capacity + hypothesis) * hidden_vectors
-                    + hidden_vector;
-                const int source =
-                    (layer * decoder_capacity + parent) * hidden_vectors
-                    + hidden_vector;
-                next_state_1[destination] = output_state
-                    ? output_state_1[source]
-                    : input_state_1[source];
-                next_state_2[destination] = output_state
-                    ? output_state_2[source]
-                    : input_state_2[source];
-            }
-        } else if (state_dtype == TDT_FLOAT32 && hidden_dim % 4 == 0) {
-            const int hidden_vectors = hidden_dim / 4;
-            const float4* input_state_1 = reinterpret_cast<const float4*>(
-                input_state_1_raw
-            );
-            const float4* input_state_2 = reinterpret_cast<const float4*>(
-                input_state_2_raw
-            );
-            const float4* output_state_1 = reinterpret_cast<const float4*>(
-                output_state_1_raw
-            );
-            const float4* output_state_2 = reinterpret_cast<const float4*>(
-                output_state_2_raw
-            );
-            float4* next_state_1 = reinterpret_cast<float4*>(next_state_1_raw);
-            float4* next_state_2 = reinterpret_cast<float4*>(next_state_2_raw);
             for (
                 int state_vector = thread;
                 state_vector < state_layers * hidden_vectors;
@@ -1827,74 +1860,23 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         }
 
         // Stage the retained hypothesis's next encoder frame and predictor token.
-        // Scalar loads also perform dtype conversion when encoder precisions differ.
         const int utterance = hypothesis / beam;
-        const bool active =
-            utterance < actual_batch_size
-            && isfinite(hypothesis_scores[hypothesis])
-            && time_indexes[hypothesis] < output_lengths[utterance];
+        const bool active = isfinite(hypothesis_scores[hypothesis])
+            && time_indexes[hypothesis] < output_length;
         const int frame = min(time_indexes[hypothesis], num_frames - 1);
         const int output_base = (utterance * num_frames + frame) * encoder_dim;
         const int input_base = hypothesis * encoder_dim;
-        if (
-            encoder_output_dtype == encoder_input_dtype
-            && encoder_output_dtype != TDT_FLOAT32
-            && encoder_dim % 8 == 0
-        ) {
-            const int encoder_vectors = encoder_dim / 8;
-            const uint4* encoder_output = reinterpret_cast<const uint4*>(
-                encoder_output_raw
-            );
-            uint4* encoder_input = reinterpret_cast<uint4*>(encoder_input_raw);
-            const int output_vector_base = output_base / 8;
-            const int input_vector_base = input_base / 8;
-            for (
-                int feature = thread;
-                feature < encoder_vectors;
-                feature += blockDim.x
-            ) {
-                encoder_input[input_vector_base + feature] = active
-                    ? encoder_output[output_vector_base + feature]
-                    : make_uint4(0, 0, 0, 0);
-            }
-        } else if (
-            encoder_output_dtype == TDT_FLOAT32
-            && encoder_input_dtype == TDT_FLOAT32
-            && encoder_dim % 4 == 0
-        ) {
-            const int encoder_vectors = encoder_dim / 4;
-            const float4* encoder_output = reinterpret_cast<const float4*>(
-                encoder_output_raw
-            );
-            float4* encoder_input = reinterpret_cast<float4*>(encoder_input_raw);
-            const int output_vector_base = output_base / 4;
-            const int input_vector_base = input_base / 4;
-            for (
-                int feature = thread;
-                feature < encoder_vectors;
-                feature += blockDim.x
-            ) {
-                encoder_input[input_vector_base + feature] = active
-                    ? encoder_output[output_vector_base + feature]
-                    : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            }
-        } else {
-            for (int feature = thread; feature < encoder_dim; feature += blockDim.x) {
-                const float value = active
-                    ? load_tdt_value(
-                        encoder_output_raw,
-                        output_base + feature,
-                        encoder_output_dtype
-                    )
-                    : 0.0F;
-                store_tdt_value(
-                    encoder_input_raw,
-                    input_base + feature,
-                    encoder_input_dtype,
-                    value
-                );
-            }
-        }
+        stage_tdt_encoder_input(
+            encoder_output_raw,
+            encoder_input_raw,
+            output_base,
+            input_base,
+            encoder_dim,
+            encoder_output_dtype,
+            encoder_input_dtype,
+            active,
+            thread
+        );
         if (thread == 0) {
             targets[hypothesis] = active ? last_tokens[hypothesis] : 0;
         }
@@ -1933,13 +1915,13 @@ TDT_FINALIZE_KERNEL = cp.RawKernel(
         int selected_node;
         int selected_length;
         if (!use_completed) {
-            double selected_score = length_normalized_score(
+            double selected_score = tdt_length_normalized_score(
                 hypothesis_scores[selected_hypothesis],
                 hypothesis_lengths[selected_hypothesis] + 1
             );
             for (int hypothesis = 1; hypothesis < beam; ++hypothesis) {
                 const int index = utterance * beam + hypothesis;
-                const double score = length_normalized_score(
+                const double score = tdt_length_normalized_score(
                     hypothesis_scores[index], hypothesis_lengths[index] + 1
                 );
                 if (score > selected_score) {

@@ -89,7 +89,7 @@ def build_plugin(
 
 
 def main() -> None:
-    """Compile every plugin, then atomically replace each installed library.
+    """Compile every plugin, then replace each installed library in place.
 
     Raises
     ------
@@ -155,6 +155,9 @@ def main() -> None:
         for output_path in output_paths:
             if not output_path.is_file():
                 raise RuntimeError(f"Compiler output not found: {output_path}")
+            if output_path.stat().st_size == 0:
+                raise RuntimeError(f"Compiler output is empty: {output_path}")
+
         for output_path in output_paths:
             output_path.replace(source_dir / output_path.name)
 

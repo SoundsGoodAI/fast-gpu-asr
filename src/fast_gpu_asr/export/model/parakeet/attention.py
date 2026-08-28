@@ -23,17 +23,9 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
             Number of attention heads.
         n_feat : int
             Input and output hidden dimension. It must be divisible by ``n_head``.
-
-        Raises
-        ------
-        ValueError
-            Raised when ``n_feat`` is not divisible by ``n_head``.
         """
 
         super().__init__()
-
-        if n_feat % n_head != 0:
-            raise ValueError(f"n_feat={n_feat} must be divisible by n_head={n_head}.")
 
         self.h = n_head
         self.d_k = n_feat // n_head
@@ -116,11 +108,16 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
                 content_scores + position_scores[:, :, :, :num_frames]
             ) / self.s_d_k
             key_padding_mask = torch.arange(
-                num_frames, device=output_lengths.device
+                num_frames, dtype=output_lengths.dtype, device=output_lengths.device
             ).unsqueeze(0) >= output_lengths.unsqueeze(1)
             weights = torch.softmax(
-                scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), -1000.0),
+                scores.masked_fill(
+                    key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+                ),
                 dim=3,
+            )
+            weights = weights.masked_fill(
+                (output_lengths <= 0).reshape(batch_size, 1, 1, 1), 0.0
             ).to(v.dtype)
             x = (
                 torch.matmul(weights, v.permute(0, 2, 1, 3))

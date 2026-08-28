@@ -16,7 +16,12 @@ import tensorrt as trt
 from cuda.bindings import runtime
 
 from ..constants import AUDIO_SAMPLES_PER_WORKER
-from ..utils import ASRInferenceError, get_engine, get_names
+from ..utils import (
+    ASRInferenceError,
+    ASRInitializationError,
+    get_engine,
+    get_names,
+)
 
 
 class Encoder:
@@ -65,10 +70,19 @@ class Encoder:
                 for name in input_names + output_names
             }
             self.stream = stream
+
             self.encoder = engine.create_execution_context(
                 trt.ExecutionContextAllocationStrategy.USER_MANAGED
             )
-            self.encoder.set_optimization_profile_async(0, self.stream.ptr)
+            if self.encoder is None:
+                raise ASRInitializationError(
+                    "TensorRT could not create the encoder execution context."
+                )
+            if not self.encoder.set_optimization_profile_async(0, self.stream.ptr):
+                raise ASRInitializationError(
+                    "TensorRT could not select encoder optimization profile 0."
+                )
+
             self.aux_streams = [
                 cp.cuda.Stream(null=False, non_blocking=True, ptds=False)
                 for _ in range(engine.num_aux_streams)
@@ -94,6 +108,8 @@ class Encoder:
             self.cuda_graph: cp.cuda.graph.Graph | None = None
             self.cuda_graph_shape: tuple[int, ...] | None = None
             self.cuda_graph_supported = True
+            self.host_transfer_event = cp.cuda.Event(disable_timing=True)
+            self.host_transfer_pending = False
             audio_copy_workers = min(
                 self.batch_size,
                 cpu_count() or 1,
@@ -185,7 +201,7 @@ class Encoder:
         batch_size = len(audios)
         if not 0 < batch_size <= self.batch_size:
             raise ASRInferenceError(
-                f"Expected 1 to {self.batch_size} audio waveforms, got {batch_size}.",
+                f"Expected 1 to {self.batch_size} audio waveforms, got {batch_size}."
             )
 
         prepared_audios = []
@@ -193,8 +209,7 @@ class Encoder:
         for audio in audios:
             if audio.ndim != 1 or audio.size == 0:
                 raise ASRInferenceError(
-                    "Expected non-empty one-dimensional mono audio, got "
-                    f"{audio.shape}.",
+                    f"Expected non-empty one-dimensional mono audio, got {audio.shape}."
                 )
             audio = audio.astype(np.float32, copy=False)
             prepared_audios.append(audio)
@@ -204,23 +219,23 @@ class Encoder:
         if num_samples > self.max_samples:
             max_seconds = self.max_samples / self.sample_rate
             raise ASRInferenceError(
-                f"Audio exceeds the {max_seconds:.3f}-second TensorRT profile.",
+                f"Audio exceeds the {max_seconds:.3f}-second TensorRT profile."
             )
 
         with self.device, self.stream:
+            if self.host_transfer_pending:
+                self.host_transfer_event.synchronize()
+                self.host_transfer_pending = False
+
             audio_shape = (self.batch_size, num_samples + self.right_padding_samples)
             audio_elements = prod(audio_shape)
             shape_changed = audio_shape != self.cuda_graph_shape
             if shape_changed and self.cuda_graph is not None:
-                growing_shape = (
-                    self.cuda_graph_shape is not None
-                    and audio_elements > prod(self.cuda_graph_shape)
-                )
-                if growing_shape:
-                    # Wait for the old graph before reclaiming its cached allocations.
-                    self.stream.synchronize()
+                self.stream.synchronize()
                 self.cuda_graph = None
-                if growing_shape:
+                if self.cuda_graph_shape is not None and audio_elements > prod(
+                    self.cuda_graph_shape
+                ):
                     (status,) = runtime.cudaDeviceGraphMemTrim(self.device.id)
                     if status != runtime.cudaError_t.cudaSuccess:
                         raise ASRInferenceError(
@@ -229,6 +244,9 @@ class Encoder:
                         )
 
             if self.audio is None or self.audio.size < audio_elements:
+                if self.audio is not None:
+                    # TensorRT may still be reading the previous input allocation.
+                    self.stream.synchronize()
                 self.cuda_graph, self.cuda_graph_shape = None, None
                 self.audio = cp.empty(audio_elements, dtype=self.dtypes["audio"])
                 self.audio_host = cpx.empty_pinned(
@@ -254,32 +272,64 @@ class Encoder:
             if batch_size < self.batch_size:
                 audio[batch_size:].fill(0.0)
 
-            if audio_copy_workers > 1:
-                chunk_size = (batch_size + audio_copy_workers - 1) // audio_copy_workers
-                futures = {
-                    self.audio_copy_pool.submit(
-                        self.copy_audio_range,
-                        prepared_audios,
-                        audio_host,
-                        start,
-                        min(start + chunk_size, batch_size),
-                    ): (start, min(start + chunk_size, batch_size))
-                    for start in range(0, batch_size, chunk_size)
-                }
-                for future in as_completed(futures):
-                    future.result()
-                    start, end = futures[future]
-                    audio[start:end].set(audio_host[start:end], stream=self.stream)
-            else:
-                self.copy_audio_range(prepared_audios, audio_host, 0, batch_size)
-                audio[:batch_size].set(audio_host[:batch_size], stream=self.stream)
+            transfer_enqueued = False
+            try:
+                if audio_copy_workers > 1:
+                    first_error: Exception | None = None
+                    chunk_size = (
+                        batch_size + audio_copy_workers - 1
+                    ) // audio_copy_workers
+                    futures = {
+                        self.audio_copy_pool.submit(
+                            self.copy_audio_range,
+                            prepared_audios,
+                            audio_host,
+                            start,
+                            min(start + chunk_size, batch_size),
+                        ): (start, min(start + chunk_size, batch_size))
+                        for start in range(0, batch_size, chunk_size)
+                    }
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                            if first_error is None:
+                                start, end = futures[future]
+                                audio[start:end].set(
+                                    audio_host[start:end], stream=self.stream
+                                )
+                                transfer_enqueued = True
+                        except Exception as error:
+                            if first_error is None:
+                                first_error = error
 
-            self.lengths.set(self.lengths_host, stream=self.stream)
-            self.encoder.set_input_shape("audio", audio_shape)
+                    if first_error is not None:
+                        raise first_error
+                else:
+                    self.copy_audio_range(prepared_audios, audio_host, 0, batch_size)
+                    audio[:batch_size].set(audio_host[:batch_size], stream=self.stream)
+                    transfer_enqueued = True
+
+                self.lengths.set(self.lengths_host, stream=self.stream)
+                transfer_enqueued = True
+                self.host_transfer_event.record(self.stream)
+                self.host_transfer_pending = True
+            except:
+                # Drain any queued DMA before the pinned staging buffer is reusable.
+                if transfer_enqueued:
+                    self.stream.synchronize()
+                self.host_transfer_pending = False
+                raise
+
+            if not self.encoder.set_input_shape("audio", audio_shape):
+                raise ASRInferenceError(
+                    f"TensorRT rejected encoder input shape {audio_shape}."
+                )
 
             context_memory_size = self.encoder.update_device_memory_size_for_shapes()
             if context_memory_size > self.context_memory_size:
-                self.stream.synchronize()
+                if self.context_memory is not None:
+                    # TensorRT may still use the previous context allocation.
+                    self.stream.synchronize()
                 self.cuda_graph, self.cuda_graph_shape = None, None
                 self.context_memory = cp.cuda.Memory(context_memory_size)
                 self.context_memory_size = context_memory_size
@@ -293,6 +343,9 @@ class Encoder:
                 self.encoder_output is None
                 or self.encoder_output.size < output_elements
             ):
+                if self.encoder_output is not None:
+                    # TensorRT or the decoder may still use the previous allocation.
+                    self.stream.synchronize()
                 self.cuda_graph, self.cuda_graph_shape = None, None
                 self.encoder_output = cp.empty(
                     output_elements, dtype=self.dtypes["encoder_output"]
@@ -304,12 +357,16 @@ class Encoder:
 
             encoder_output = self.encoder_output[:output_elements].reshape(output_shape)
 
-            self.encoder.set_tensor_address("audio", audio.data.ptr)
-            self.encoder.set_tensor_address("audio_lengths", self.lengths.data.ptr)
-            self.encoder.set_tensor_address("encoder_output", encoder_output.data.ptr)
-            self.encoder.set_tensor_address(
-                "encoder_output_lengths", self.output_lengths.data.ptr
-            )
+            for name, binding in (
+                ("audio", audio),
+                ("audio_lengths", self.lengths),
+                ("encoder_output", encoder_output),
+                ("encoder_output_lengths", self.output_lengths),
+            ):
+                if not self.encoder.set_tensor_address(name, binding.data.ptr):
+                    raise ASRInferenceError(
+                        f"TensorRT rejected encoder tensor address for {name}."
+                    )
 
             if self.aux_streams:
                 self.encoder.set_aux_streams(

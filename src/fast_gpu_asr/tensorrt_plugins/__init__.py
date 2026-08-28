@@ -38,9 +38,15 @@ def load_tensorrt_plugins() -> None:
         registration fails.
     """
 
-    import_module("tensorrt_libs")
-    for library_name in CUDA_RUNTIME_LIBRARIES:
-        load_nvidia_dynamic_lib(library_name)
+    try:
+        import_module("tensorrt_libs")
+        for library_name in CUDA_RUNTIME_LIBRARIES:
+            load_nvidia_dynamic_lib(library_name)
+    except (ImportError, OSError, RuntimeError) as error:
+        raise RuntimeError(
+            "Failed to load the TensorRT and CUDA runtime dependencies required "
+            f"by native plugins: {error}"
+        ) from error
 
     plugin_dir = Path(__file__).resolve().parent
     for library_name, initializer_name in PLUGIN_INITIALIZERS:

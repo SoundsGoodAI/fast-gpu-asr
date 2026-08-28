@@ -108,7 +108,8 @@ bool haveValidShapes(Dims const* inputs, Dims const& output,
     }
 
     // Requiring every band boundary to fall on 16 bytes lets the kernel copy
-    // complete uint4 values without scalar prologues or tails.
+    // complete uint4 values without scalar prologues or tails. Equal adjacent
+    // widths are valid and simply make the corresponding channel band empty.
     int64_t const encoder4Bytes =
         static_cast<int64_t>(inputs[3].d[2]) * elementBytes;
     int64_t const encoder5Bytes =
@@ -142,6 +143,8 @@ __global__ void assembleOutput(uint4 const* __restrict__ encoder4,
         // aligned channel-band layout.
         int32_t const channel = index % outputVectors;
         int64_t const frame = index / outputVectors;
+        // Source and destination retain the same channel coordinate. Only the
+        // source row stride changes as the encoder width narrows.
         if (channel < encoder6Vectors)
         {
             output[index] = encoder6[frame * encoder6Vectors + channel];
@@ -427,8 +430,12 @@ public:
         int32_t const blocks = static_cast<int32_t>(
             std::min(requiredBlocks, kMaxBlocks));
 
-        // Clear caller launch status so the check below covers only this invocation.
-        static_cast<void>(cudaGetLastError());
+        // Preserve errors from earlier asynchronous work instead of silently
+        // attributing success to this invocation.
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return 1;
+        }
 
         assembleOutput<<<blocks, kThreadsPerBlock, 0, stream>>>(
             static_cast<uint4 const*>(inputs[3]),
@@ -537,5 +544,5 @@ extern "C" bool initFastGpuAsrZipformerOutputAssemblyPlugin() noexcept
         nvinfer1::EngineCapability::kSTANDARD);
     bool const builderRegistered =
         ensureRegistered(builderRegistry, builderCreator);
-    return runtimeRegistered || builderRegistered;
+    return runtimeRegistered && builderRegistered;
 }

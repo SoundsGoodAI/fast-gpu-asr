@@ -63,7 +63,7 @@ class FeatureExtractor(torch.nn.Module):
         self.preemph = preemph
         self.n_mels = n_mels
         self.n_fft = 2 ** (self.frame_length - 1).bit_length()
-        self.log_eps = 2**-24
+        self.log_eps = torch.finfo(torch.float32).eps
         self.zero_log = ZERO_LOG
 
         frame_positions = torch.arange(self.frame_length, dtype=torch.float32)
@@ -109,7 +109,7 @@ class FeatureExtractor(torch.nn.Module):
             Padded normalized waveforms with shape
             ``(batch_size, num_samples + frame_length // 2)``. The runtime
             appends the reflected right context after each valid waveform.
-        audio_lengths : torch.Tensor[torch.int32]
+        audio_lengths : torch.Tensor[torch.int64]
             Valid sample counts with shape ``(batch_size,)``.
 
         Returns
@@ -136,7 +136,7 @@ class FeatureExtractor(torch.nn.Module):
                     "zero_log": self.zero_log,
                     "plugin_namespace": TENSORRT_PLUGIN_NAMESPACE,
                 },
-                dtypes=(torch.float32, audio_lengths.dtype),
+                dtypes=(torch.float32, torch.int32),
                 shapes=((audio.shape[0], num_frames, self.n_mels), audio_lengths.shape),
                 version=ONNX_OPSET_VERSION,
             )
@@ -160,11 +160,15 @@ class FeatureExtractor(torch.nn.Module):
             torch.clamp(power_spectrum @ self.mel_filterbank, min=self.log_eps)
         )
 
+        audio_lengths = audio_lengths.clamp(min=0, max=audio.size(1))
         feature_lengths = (audio_lengths + self.frame_shift // 2) // self.frame_shift
-        feature_lengths = torch.clamp(feature_lengths, min=self.min_frames)
+        feature_lengths = torch.clamp(
+            feature_lengths, min=self.min_frames, max=features.size(1)
+        ).to(torch.int32)
         padding_mask = torch.arange(
             features.size(1),
-            device=features.device,
+            dtype=feature_lengths.dtype,
+            device=feature_lengths.device,
         ).unsqueeze(0) >= feature_lengths.unsqueeze(1)
         features = features.masked_fill(padding_mask.unsqueeze(2), self.zero_log)
 

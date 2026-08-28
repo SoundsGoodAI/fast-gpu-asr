@@ -114,7 +114,7 @@ class FeatureExtractor(torch.nn.Module):
         ----------
         audio : torch.Tensor[torch.float32]
             Padded mono waveforms with shape ``(batch_size, num_samples)``.
-        audio_lengths : torch.Tensor[torch.int32]
+        audio_lengths : torch.Tensor[torch.int64]
             Valid sample counts with shape ``(batch_size,)``.
 
         Returns
@@ -139,7 +139,7 @@ class FeatureExtractor(torch.nn.Module):
                     "eps": self.eps,
                     "plugin_namespace": TENSORRT_PLUGIN_NAMESPACE,
                 },
-                dtypes=(torch.float32, audio_lengths.dtype),
+                dtypes=(torch.float32, torch.int32),
                 shapes=(
                     (audio.shape[0], num_frames, self.mel_filterbank.shape[1]),
                     audio_lengths.shape,
@@ -148,6 +148,7 @@ class FeatureExtractor(torch.nn.Module):
             )
             return features, feature_lengths
 
+        audio_lengths = audio_lengths.clamp(min=0, max=audio.size(1))
         audio = torch.cat(
             (audio[:, :1], audio[:, 1:] - self.preemph * audio[:, : audio.size(1) - 1]),
             dim=1,
@@ -164,22 +165,33 @@ class FeatureExtractor(torch.nn.Module):
         power_spectrum = spectrum.real**2 + spectrum.imag**2
         features = torch.log(power_spectrum @ self.mel_filterbank + self.log_eps)
 
-        feature_lengths = audio_lengths // self.hop_length
+        feature_lengths = (audio_lengths // self.hop_length).to(torch.int32)
         frame_mask = torch.arange(
             features.size(1),
             dtype=feature_lengths.dtype,
             device=feature_lengths.device,
         ).unsqueeze(0) >= feature_lengths.unsqueeze(1)
         valid_frames = (~frame_mask).unsqueeze(2).to(features.dtype)
-        means = torch.sum(features * valid_frames, dim=1, keepdim=True)
-        means = means / feature_lengths.unsqueeze(1).unsqueeze(2)
+        normalization_lengths = feature_lengths.clamp_min(1).unsqueeze(1).unsqueeze(2)
+        # Center before reducing so a constant feature sequence has an exactly
+        # representable zero mean, matching the plugin's Welford accumulator.
+        offset = features[:, :1]
+        means = (
+            offset
+            + torch.sum((features - offset) * valid_frames, dim=1, keepdim=True)
+            / normalization_lengths
+        )
         features = (features - means).masked_fill(frame_mask.unsqueeze(2), 0.0)
         stds = (
             torch.sqrt(
                 torch.sum(features**2, dim=1, keepdim=True)
-                / (feature_lengths.unsqueeze(1).unsqueeze(2) - 1)
+                / (normalization_lengths - 1).clamp_min(1)
             )
             + self.eps
         )
 
-        return features / stds, feature_lengths
+        features = (features / stds).masked_fill(
+            (feature_lengths < 2).unsqueeze(1).unsqueeze(2), 0.0
+        )
+
+        return features, feature_lengths

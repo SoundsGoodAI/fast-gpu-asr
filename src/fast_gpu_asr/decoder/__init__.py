@@ -4,7 +4,7 @@
 """GPU-resident decoding for Zipformer and Parakeet encoder outputs.
 
 This internal package implements Zipformer CTC greedy and modified transducer
-beam search, Parakeet TDT modified beam search, their shared result container,
+beam search, Parakeet TDT modified beam search, SentencePiece postprocessing,
 and the CUDA kernels used by both decoder families. Decoder instances execute
 on the encoder's CuPy stream and transfer only final token IDs and timestamps
 to host memory.
