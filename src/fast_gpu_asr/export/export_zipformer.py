@@ -805,12 +805,13 @@ def export_zipformer(args: argparse.Namespace) -> None:
             args.optimization_level,
         )
 
-    validate_model(args.output_dir, runtime_config)
-
     if not args.debug:
         remove_onnx_artifacts(encoder_onnx_path)
         if decoder_onnx_path is not None:
             remove_onnx_artifacts(decoder_onnx_path)
+
+    published_config = OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE)
+    validate_model(args.output_dir, published_config)
 
     logger.info("Zipformer TensorRT export completed in %s.", args.output_dir)
 

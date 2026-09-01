@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-if [[ "$#" -gt 1 ]]; then
+if [[ "$#" -gt 1 || ( "$#" -eq 1 && -z "$1" ) ]]; then
     printf 'Usage: %s [wheel-directory]\n' "${0##*/}" >&2
     exit 2
 fi

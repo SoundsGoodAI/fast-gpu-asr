@@ -70,12 +70,12 @@ class BinaryWheel(bdist_wheel):
                 f"sources={sorted(source_names)}, libraries={sorted(library_names)}."
             )
 
-        empty_libraries = sorted(
-            path.name for path in libraries if path.stat().st_size == 0
+        empty_artifacts = sorted(
+            path.name for path in (*sources, *libraries) if path.stat().st_size == 0
         )
-        if empty_libraries:
+        if empty_artifacts:
             raise FileError(
-                f"TensorRT plugin libraries must not be empty: {empty_libraries}."
+                f"TensorRT plugin artifacts must not be empty: {empty_artifacts}."
             )
 
         super().run()
