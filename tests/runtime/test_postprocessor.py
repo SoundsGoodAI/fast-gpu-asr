@@ -153,9 +153,7 @@ def real_postprocessor(tmp_path_factory: pytest.TempPathFactory) -> PostProcesso
 
 
 def postprocess_one(
-    postprocessor: PostProcessor,
-    token_ids: list[int],
-    timestamps: list[float],
+    postprocessor: PostProcessor, token_ids: list[int], timestamps: list[float]
 ) -> tuple[str, list[tuple[str, float, float]]]:
     """Postprocess one 100 ms utterance.
 
@@ -175,16 +173,12 @@ def postprocess_one(
     """
 
     texts, word_timestamps = postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [token_ids],
-        [timestamps],
+        [np.zeros(100, dtype=np.float32)], [token_ids], [timestamps]
     )
     return texts[0], word_timestamps[0]
 
 
-def test_postprocessor_groups_sentencepiece_words(
-    postprocessor: PostProcessor,
-) -> None:
+def test_postprocessor_groups_sentencepiece_words(postprocessor: PostProcessor) -> None:
     assert postprocess_one(postprocessor, [1, 5, 2], [0.0, 0.02, 0.04]) == (
         "1x 2",
         [("1x", 0.0, 0.04), ("2", 0.04, 0.1)],
@@ -203,11 +197,7 @@ def test_postprocessor_handles_standalone_boundaries(
         [[0.01, 0.02, 0.04, 0.08], [0.0, 0.03, 0.04], [0.01, 0.02]],
     ) == (
         ["2", "1 x", ""],
-        [
-            [("2", 0.01, 0.1)],
-            [("1", 0.0, 0.03), ("x", 0.03, 0.1)],
-            [],
-        ],
+        [[("2", 0.01, 0.1)], [("1", 0.0, 0.03), ("x", 0.03, 0.1)], []],
     )
 
 
@@ -229,9 +219,7 @@ def test_postprocessor_batches_fallback_words(postprocessor: PostProcessor) -> N
     ]
 
 
-def test_postprocessor_handles_empty_inputs(
-    postprocessor: PostProcessor,
-) -> None:
+def test_postprocessor_handles_empty_inputs(postprocessor: PostProcessor) -> None:
     audio = np.zeros(100, dtype=np.float32)
     texts, word_timestamps = postprocessor(
         [audio, audio, audio], [[], [1], []], [[], [0.01], []]
@@ -283,9 +271,7 @@ def test_postprocessor_handles_real_sentencepiece_special_tokens(
     assert postprocess_one(real_postprocessor, token_ids, timestamps) == expected
 
 
-def test_postprocessor_rejects_unaligned_batches(
-    postprocessor: PostProcessor,
-) -> None:
+def test_postprocessor_rejects_unaligned_batches(postprocessor: PostProcessor) -> None:
     audio = np.zeros(100, dtype=np.float32)
     inputs = (([], [[]], [[]]), ([audio], [[]], []))
 
@@ -298,16 +284,10 @@ def test_postprocessor_rejects_unaligned_token_timestamps(
     postprocessor: PostProcessor,
 ) -> None:
     with pytest.raises(ASRInferenceError, match="counts differ"):
-        postprocessor(
-            [np.zeros(100, dtype=np.float32)],
-            [[1, 1]],
-            [[0.0]],
-        )
+        postprocessor([np.zeros(100, dtype=np.float32)], [[1, 1]], [[0.0]])
 
 
-def test_postprocessor_rejects_invalid_timestamps(
-    postprocessor: PostProcessor,
-) -> None:
+def test_postprocessor_rejects_invalid_timestamps(postprocessor: PostProcessor) -> None:
     for timestamps in ([-0.01], [float("nan")], [0.04, 0.02]):
         with pytest.raises(
             ASRInferenceError, match="finite, non-negative, nondecreasing"
@@ -315,13 +295,8 @@ def test_postprocessor_rejects_invalid_timestamps(
             postprocess_one(postprocessor, [1] * len(timestamps), timestamps)
 
 
-def test_postprocessor_rejects_malformed_audio(
-    postprocessor: PostProcessor,
-) -> None:
-    for audio in (
-        np.zeros(0, dtype=np.float32),
-        np.zeros((1, 100), dtype=np.float32),
-    ):
+def test_postprocessor_rejects_malformed_audio(postprocessor: PostProcessor) -> None:
+    for audio in (np.zeros(0, dtype=np.float32), np.zeros((1, 100), dtype=np.float32)):
         with pytest.raises(ASRInferenceError, match="nonempty one-dimensional"):
             postprocessor([audio], [[]], [[]])
 

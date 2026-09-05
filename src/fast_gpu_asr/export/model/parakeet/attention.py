@@ -128,9 +128,7 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
                 .reshape(batch_size, num_frames, self.h * self.d_k)
             )
 
-        x = self.linear_out(x)
-
-        return x
+        return self.linear_out(x)
 
 
 class RelPositionalEncoding(torch.nn.Module):
@@ -156,7 +154,7 @@ class RelPositionalEncoding(torch.nn.Module):
 
         div_term = torch.exp(
             torch.arange(0, model_dim, 2, dtype=torch.float32)
-            * -(torch.log(torch.tensor(10000.0)) / model_dim),
+            * -(torch.log(torch.tensor(10000.0)) / model_dim)
         )
         positions = torch.arange(
             max_len - 1, -max_len, -1, dtype=torch.float32
@@ -185,6 +183,4 @@ class RelPositionalEncoding(torch.nn.Module):
         center_pos = self.pos_emb.size(0) // 2 + 1
         start_pos = center_pos - x.size(1)
         end_pos = center_pos + x.size(1) - 1
-        pos_emb = self.pos_emb[start_pos:end_pos].unsqueeze(0)
-
-        return pos_emb
+        return self.pos_emb[start_pos:end_pos].unsqueeze(0)

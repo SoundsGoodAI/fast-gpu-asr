@@ -37,8 +37,7 @@ constexpr char const* kPreemphField = "preemph";
 constexpr char const* kZeroLogField = "zero_log";
 constexpr size_t kCublasWorkspaceBytes = 16U << 20;
 constexpr size_t kCublasWorkspaceAlignment = 256;
-constexpr size_t kMaximumWorkspaceBytes =
-    static_cast<size_t>(std::numeric_limits<int32_t>::max());
+constexpr size_t kMaximumWorkspaceBytes = static_cast<size_t>(std::numeric_limits<int32_t>::max());
 constexpr int32_t kThreadsPerBlock = 256;
 constexpr int32_t kWarpSize = 32;
 constexpr int32_t kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
@@ -62,7 +61,7 @@ static_assert(kThreadsPerBlock % kWarpSize == 0);
 bool isMelProjectionTactic(int32_t tactic) noexcept
 {
     return std::find(kMelProjectionTactics.begin(), kMelProjectionTactics.end(), tactic)
-        != kMelProjectionTactics.end();
+           != kMelProjectionTactics.end();
 }
 
 struct WorkspaceLayout
@@ -113,8 +112,7 @@ bool hasAddressableBytes(Dims const& dims, size_t elementBytes) noexcept
         std::numeric_limits<int64_t>::max() / static_cast<int64_t>(elementBytes);
     for (int32_t index = 0; index < dims.nbDims; ++index)
     {
-        if (dims.d[index] < 1
-            || dims.d[index] > std::numeric_limits<int32_t>::max()
+        if (dims.d[index] < 1 || dims.d[index] > std::numeric_limits<int32_t>::max()
             || elements > maxElements / dims.d[index])
         {
             return false;
@@ -159,10 +157,10 @@ bool makeWorkspaceLayout(
     return layout.totalBytes <= kMaximumWorkspaceBytes;
 }
 
-__global__ void prepareFrames(float const* audio, int64_t const* audioLengths,
-    float const* window, float* frames, int32_t* featureLengths, int32_t audioSamples,
-    int32_t numFrames, int32_t frameLength, int32_t frameShift, int32_t leftPadding,
-    int32_t fftLength, int32_t minFrames, float preemph)
+__global__ void prepareFrames(float const* audio, int64_t const* audioLengths, float const* window,
+    float* frames, int32_t* featureLengths, int32_t audioSamples, int32_t numFrames,
+    int32_t frameLength, int32_t frameShift, int32_t leftPadding, int32_t fftLength,
+    int32_t minFrames, float preemph)
 {
     // One block owns one frame. Threads cooperatively reflect the left edge,
     // stage samples, and compute the frame mean before applying pre-emphasis and
@@ -176,26 +174,24 @@ __global__ void prepareFrames(float const* audio, int64_t const* audioLengths,
         // Exactly one block per utterance owns frame zero, avoiding a separate
         // feature-length kernel and any cross-block synchronization.
         int64_t validSamples = audioLengths[batch];
-        validSamples = validSamples < 0
-            ? 0 : (validSamples > audioSamples ? audioSamples : validSamples);
+        validSamples =
+            validSamples < 0 ? 0 : (validSamples > audioSamples ? audioSamples : validSamples);
         int64_t const roundedLength = (validSamples + frameShift / 2) / frameShift;
         // Runtime sample counts live in device memory and therefore cannot be
         // validated while TensorRT builds the engine. Bound the published length
         // to the physical output so malformed values cannot make a downstream
         // layer read beyond the feature tensor.
         int64_t const minimumLength = minFrames;
-        int64_t const boundedLength =
-            roundedLength > minimumLength ? roundedLength : minimumLength;
-        featureLengths[batch] = static_cast<int32_t>(
-            boundedLength < numFrames ? boundedLength : numFrames);
+        int64_t const boundedLength = roundedLength > minimumLength ? roundedLength : minimumLength;
+        featureLengths[batch] =
+            static_cast<int32_t>(boundedLength < numFrames ? boundedLength : numFrames);
     }
 
     extern __shared__ float frameSamples[];
     float sum = 0.0F;
     for (int32_t sample = thread; sample < frameLength; sample += blockDim.x)
     {
-        int64_t const source =
-            static_cast<int64_t>(frame) * frameShift + sample;
+        int64_t const source = static_cast<int64_t>(frame) * frameShift + sample;
         int64_t const index =
             source < leftPadding ? leftPadding - 1 - source : source - leftPadding;
         float const value = audio[static_cast<int64_t>(batch) * audioSamples + index];
@@ -279,18 +275,17 @@ __global__ void powerSpectrumInPlace(
     }
 }
 
-__global__ void finalizeFeatures(float* features, int32_t const* featureLengths,
-    int64_t elements, int32_t numFrames, int32_t numFeatures, float zeroLog)
+__global__ void finalizeFeatures(float* features, int32_t const* featureLengths, int64_t elements,
+    int32_t numFrames, int32_t numFeatures, float zeroLog)
 {
     // Apply Kaldi's energy floor before log and overwrite model-padding frames
     // with the log value produced by an all-zero waveform.
-    int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x
-        + threadIdx.x;
+    int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t const stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     while (index < elements)
     {
-        int32_t const batch = static_cast<int32_t>(
-            index / (static_cast<int64_t>(numFrames) * numFeatures));
+        int32_t const batch =
+            static_cast<int32_t>(index / (static_cast<int64_t>(numFrames) * numFeatures));
         int32_t const frame = static_cast<int32_t>((index / numFeatures) % numFrames);
         int32_t const length = featureLengths[batch];
         features[index] = frame < length ? logf(fmaxf(features[index], 0x1p-23F)) : zeroLog;
@@ -315,58 +310,50 @@ struct FeatureParameters
 bool areValidParameters(FeatureParameters const& parameters) noexcept
 {
     return parameters.frameLength >= 2 && parameters.frameLength <= kMaxFrameLength
-        && parameters.frameShift >= 1
-        && parameters.frameShift <= parameters.frameLength && parameters.leftPadding >= 0
-        && parameters.leftPadding < parameters.frameLength && parameters.minFrames >= 1
-        && std::isfinite(parameters.preemph) && parameters.preemph >= 0.0F
-        && parameters.preemph < 1.0F && std::isfinite(parameters.zeroLog);
+           && parameters.frameShift >= 1 && parameters.frameShift <= parameters.frameLength
+           && parameters.leftPadding >= 0 && parameters.leftPadding < parameters.frameLength
+           && parameters.minFrames >= 1 && std::isfinite(parameters.preemph)
+           && parameters.preemph >= 0.0F && parameters.preemph < 1.0F
+           && std::isfinite(parameters.zeroLog);
 }
 
-bool haveValidShapes(Dims const& audio, Dims const& audioLengths,
-    Dims const& window, Dims const& melFilterbank, Dims const& features,
-    Dims const& featureLengths, FeatureParameters const& parameters) noexcept
+bool haveValidShapes(Dims const& audio, Dims const& audioLengths, Dims const& window,
+    Dims const& melFilterbank, Dims const& features, Dims const& featureLengths,
+    FeatureParameters const& parameters) noexcept
 {
     // Kernels and library calls use these descriptors for pointer arithmetic.
     // Validate the complete tensor relationship at every optimization-profile
     // point and again at runtime, including enough audio for the reflected
     // left context.
     if (audio.nbDims != 2 || audioLengths.nbDims != 1 || window.nbDims != 1
-        || melFilterbank.nbDims != 2 || features.nbDims != 3
-        || featureLengths.nbDims != 1
+        || melFilterbank.nbDims != 2 || features.nbDims != 3 || featureLengths.nbDims != 1
         || !hasAddressableBytes(audio, sizeof(float))
         || !hasAddressableBytes(audioLengths, sizeof(int64_t))
         || !hasAddressableBytes(window, sizeof(float))
         || !hasAddressableBytes(melFilterbank, sizeof(float))
         || !hasAddressableBytes(features, sizeof(float))
-        || !hasAddressableBytes(featureLengths, sizeof(int32_t))
-        || !areValidParameters(parameters)
-        || audio.d[1] < parameters.leftPadding
-        || audioLengths.d[0] != audio.d[0]
-        || window.d[0] != parameters.frameLength || melFilterbank.d[0] < 2
-        || melFilterbank.d[1] < 1 || features.d[0] != audio.d[0]
-        || features.d[1] < parameters.minFrames
-        || features.d[2] != melFilterbank.d[1]
-        || featureLengths.d[0] != audio.d[0])
+        || !hasAddressableBytes(featureLengths, sizeof(int32_t)) || !areValidParameters(parameters)
+        || audio.d[1] < parameters.leftPadding || audioLengths.d[0] != audio.d[0]
+        || window.d[0] != parameters.frameLength || melFilterbank.d[0] < 2 || melFilterbank.d[1] < 1
+        || features.d[0] != audio.d[0] || features.d[1] < parameters.minFrames
+        || features.d[2] != melFilterbank.d[1] || featureLengths.d[0] != audio.d[0])
     {
         return false;
     }
 
-    int64_t const frameNumerator = static_cast<int64_t>(audio.d[1])
-        + parameters.leftPadding - parameters.frameLength;
-    int64_t const expectedFrames =
-        frameNumerator / parameters.frameShift + 1;
-    int64_t const fftLength =
-        2LL * (static_cast<int64_t>(melFilterbank.d[0]) - 1);
-    int64_t const rows =
-        static_cast<int64_t>(audio.d[0]) * features.d[1];
+    int64_t const frameNumerator =
+        static_cast<int64_t>(audio.d[1]) + parameters.leftPadding - parameters.frameLength;
+    int64_t const expectedFrames = frameNumerator / parameters.frameShift + 1;
+    int64_t const fftLength = 2LL * (static_cast<int64_t>(melFilterbank.d[0]) - 1);
+    int64_t const rows = static_cast<int64_t>(audio.d[0]) * features.d[1];
     WorkspaceLayout layout{};
     return frameNumerator >= 0 && expectedFrames == features.d[1]
-        && fftLength >= parameters.frameLength
-        && fftLength <= std::numeric_limits<int32_t>::max() - 2
-        && melFilterbank.d[0] <= kMaxFrequencies && rows >= 1
-        && rows <= std::numeric_limits<int32_t>::max()
-        && makeWorkspaceLayout(rows, static_cast<int32_t>(fftLength),
-            static_cast<int32_t>(melFilterbank.d[0]), layout);
+           && fftLength >= parameters.frameLength
+           && fftLength <= std::numeric_limits<int32_t>::max() - 2
+           && melFilterbank.d[0] <= kMaxFrequencies && rows >= 1
+           && rows <= std::numeric_limits<int32_t>::max()
+           && makeWorkspaceLayout(rows, static_cast<int32_t>(fftLength),
+               static_cast<int32_t>(melFilterbank.d[0]), layout);
 }
 
 // Convert normalized audio to Kaldi-compatible log-mel features. The plugin
@@ -378,7 +365,7 @@ class ZipformerFeaturePlugin final : public IPluginV3,
                                      public IPluginV3OneBuild,
                                      public IPluginV3OneRuntime
 {
-public:
+  public:
     explicit ZipformerFeaturePlugin(
         FeatureParameters parameters, int32_t tactic = kStrictComputeTactic) noexcept
         : mParameters(parameters), mTactic(tactic)
@@ -389,10 +376,10 @@ public:
             parameters.frameLength, parameters.frameShift, parameters.leftPadding,
             parameters.minFrames, static_cast<double>(parameters.preemph),
             static_cast<double>(parameters.zeroLog));
-        bool const validTimingCacheId = timingCacheLength > 0
-            && static_cast<size_t>(timingCacheLength) < mTimingCacheId.size();
+        bool const validTimingCacheId =
+            timingCacheLength > 0 && static_cast<size_t>(timingCacheLength) < mTimingCacheId.size();
         mInitialized = areValidParameters(parameters) && validTimingCacheId
-            && cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS;
+                       && cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS;
         initializeFields();
     }
 
@@ -421,8 +408,7 @@ public:
 
     IPluginV3* clone() noexcept override
     {
-        auto* plugin =
-            new (std::nothrow) ZipformerFeaturePlugin(mParameters, mTactic);
+        auto* plugin = new (std::nothrow) ZipformerFeaturePlugin(mParameters, mTactic);
         if (plugin == nullptr || !plugin->mInitialized)
         {
             delete plugin;
@@ -431,39 +417,24 @@ public:
         return plugin;
     }
 
-    char const* getPluginName() const noexcept override
-    {
-        return kPluginName;
-    }
+    char const* getPluginName() const noexcept override { return kPluginName; }
 
-    char const* getPluginVersion() const noexcept override
-    {
-        return kPluginVersion;
-    }
+    char const* getPluginVersion() const noexcept override { return kPluginVersion; }
 
-    char const* getPluginNamespace() const noexcept override
-    {
-        return kPluginNamespace;
-    }
+    char const* getPluginNamespace() const noexcept override { return kPluginNamespace; }
 
-    int32_t getNbOutputs() const noexcept override
-    {
-        return kOutputCount;
-    }
+    int32_t getNbOutputs() const noexcept override { return kOutputCount; }
 
     int32_t configurePlugin(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
         DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) noexcept override
     {
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount
-            || inputs[0].desc.dims.nbDims != 2 || inputs[1].desc.dims.nbDims != 1
-            || inputs[2].desc.dims.nbDims != 1 || inputs[3].desc.dims.nbDims != 2
-            || outputs[0].desc.dims.nbDims != 3 || outputs[1].desc.dims.nbDims != 1
-            || inputs[0].desc.type != DataType::kFLOAT
-            || inputs[1].desc.type != DataType::kINT64
-            || inputs[2].desc.type != DataType::kFLOAT
-            || inputs[3].desc.type != DataType::kFLOAT
-            || outputs[0].desc.type != DataType::kFLOAT
+            || nbOutputs != kOutputCount || inputs[0].desc.dims.nbDims != 2
+            || inputs[1].desc.dims.nbDims != 1 || inputs[2].desc.dims.nbDims != 1
+            || inputs[3].desc.dims.nbDims != 2 || outputs[0].desc.dims.nbDims != 3
+            || outputs[1].desc.dims.nbDims != 1 || inputs[0].desc.type != DataType::kFLOAT
+            || inputs[1].desc.type != DataType::kINT64 || inputs[2].desc.type != DataType::kFLOAT
+            || inputs[3].desc.type != DataType::kFLOAT || outputs[0].desc.type != DataType::kFLOAT
             || outputs[1].desc.type != DataType::kINT32
             || inputs[0].desc.format != TensorFormat::kLINEAR
             || inputs[1].desc.format != TensorFormat::kLINEAR
@@ -471,25 +442,25 @@ public:
             || inputs[3].desc.format != TensorFormat::kLINEAR
             || outputs[0].desc.format != TensorFormat::kLINEAR
             || outputs[1].desc.format != TensorFormat::kLINEAR || !mInitialized
-            || !haveValidShapes(inputs[0].min, inputs[1].min, inputs[2].min,
-                inputs[3].min, outputs[0].min, outputs[1].min, mParameters)
-            || !haveValidShapes(inputs[0].opt, inputs[1].opt, inputs[2].opt,
-                inputs[3].opt, outputs[0].opt, outputs[1].opt, mParameters)
-            || !haveValidShapes(inputs[0].max, inputs[1].max, inputs[2].max,
-                inputs[3].max, outputs[0].max, outputs[1].max, mParameters))
+            || !haveValidShapes(inputs[0].min, inputs[1].min, inputs[2].min, inputs[3].min,
+                outputs[0].min, outputs[1].min, mParameters)
+            || !haveValidShapes(inputs[0].opt, inputs[1].opt, inputs[2].opt, inputs[3].opt,
+                outputs[0].opt, outputs[1].opt, mParameters)
+            || !haveValidShapes(inputs[0].max, inputs[1].max, inputs[2].max, inputs[3].max,
+                outputs[0].max, outputs[1].max, mParameters))
         {
             return 1;
         }
         return 0;
     }
 
-    int32_t getOutputDataTypes(DataType* outputTypes, int32_t nbOutputs,
-        DataType const* inputTypes, int32_t nbInputs) const noexcept override
+    int32_t getOutputDataTypes(DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes,
+        int32_t nbInputs) const noexcept override
     {
-        if (outputTypes == nullptr || inputTypes == nullptr
-            || nbInputs != kInputCount || nbOutputs != kOutputCount
-            || inputTypes[0] != DataType::kFLOAT || inputTypes[1] != DataType::kINT64
-            || inputTypes[2] != DataType::kFLOAT || inputTypes[3] != DataType::kFLOAT)
+        if (outputTypes == nullptr || inputTypes == nullptr || nbInputs != kInputCount
+            || nbOutputs != kOutputCount || inputTypes[0] != DataType::kFLOAT
+            || inputTypes[1] != DataType::kINT64 || inputTypes[2] != DataType::kFLOAT
+            || inputTypes[3] != DataType::kFLOAT)
         {
             return 1;
         }
@@ -498,18 +469,16 @@ public:
         return 0;
     }
 
-    int32_t getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
-        DimsExprs const* shapeInputs, int32_t nbShapeInputs, DimsExprs* outputs,
-        int32_t nbOutputs, IExprBuilder& builder) noexcept override
+    int32_t getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* shapeInputs,
+        int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs,
+        IExprBuilder& builder) noexcept override
     {
         static_cast<void>(shapeInputs);
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount
-            || nbShapeInputs != 0 || inputs[0].nbDims != 2 || inputs[1].nbDims != 1
-            || inputs[2].nbDims != 1 || inputs[3].nbDims != 2
-            || inputs[0].d[0] == nullptr || inputs[0].d[1] == nullptr
-            || inputs[1].d[0] == nullptr || inputs[2].d[0] == nullptr
-            || inputs[3].d[0] == nullptr || inputs[3].d[1] == nullptr
+            || nbOutputs != kOutputCount || nbShapeInputs != 0 || inputs[0].nbDims != 2
+            || inputs[1].nbDims != 1 || inputs[2].nbDims != 1 || inputs[3].nbDims != 2
+            || inputs[0].d[0] == nullptr || inputs[0].d[1] == nullptr || inputs[1].d[0] == nullptr
+            || inputs[2].d[0] == nullptr || inputs[3].d[0] == nullptr || inputs[3].d[1] == nullptr
             || !mInitialized)
         {
             return 1;
@@ -521,14 +490,12 @@ public:
         {
             return 1;
         }
-        auto* numerator =
-            builder.operation(DimensionOperation::kSUM, *inputs[0].d[1], *offset);
+        auto* numerator = builder.operation(DimensionOperation::kSUM, *inputs[0].d[1], *offset);
         if (numerator == nullptr)
         {
             return 1;
         }
-        auto* frames =
-            builder.operation(DimensionOperation::kFLOOR_DIV, *numerator, *frameShift);
+        auto* frames = builder.operation(DimensionOperation::kFLOOR_DIV, *numerator, *frameShift);
         if (frames == nullptr)
         {
             return 1;
@@ -548,17 +515,16 @@ public:
         return 0;
     }
 
-    bool supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
-        int32_t nbOutputs) noexcept override
+    bool supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut,
+        int32_t nbInputs, int32_t nbOutputs) noexcept override
     {
-        if (inOut == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount || pos < 0
+        if (inOut == nullptr || nbInputs != kInputCount || nbOutputs != kOutputCount || pos < 0
             || pos >= kInputCount + kOutputCount)
         {
             return false;
         }
-        auto const type = pos == 1 ? DataType::kINT64
-            : (pos == 5 ? DataType::kINT32 : DataType::kFLOAT);
+        auto const type =
+            pos == 1 ? DataType::kINT64 : (pos == 5 ? DataType::kINT32 : DataType::kFLOAT);
         return inOut[pos].desc.format == TensorFormat::kLINEAR && inOut[pos].desc.type == type;
     }
 
@@ -569,8 +535,8 @@ public:
         // runtime layout for smaller shapes is always a prefix of this buffer.
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
             || nbOutputs != kOutputCount
-            || !haveValidShapes(inputs[0].max, inputs[1].max, inputs[2].max,
-                inputs[3].max, outputs[0].max, outputs[1].max, mParameters))
+            || !haveValidShapes(inputs[0].max, inputs[1].max, inputs[2].max, inputs[3].max,
+                outputs[0].max, outputs[1].max, mParameters))
         {
             return 0;
         }
@@ -582,19 +548,19 @@ public:
         WorkspaceLayout layout{};
         return makeWorkspaceLayout(rows, static_cast<int32_t>(fftLength64),
                    static_cast<int32_t>(frequencies64), layout)
-            ? layout.totalBytes : 0;
+                   ? layout.totalBytes
+                   : 0;
     }
 
     int32_t getNbTactics() noexcept override
     {
-        return deviceSupportsAmpereCompute()
-            ? static_cast<int32_t>(kMelProjectionTactics.size()) : 1;
+        return deviceSupportsAmpereCompute() ? static_cast<int32_t>(kMelProjectionTactics.size())
+                                             : 1;
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        if (tactics == nullptr
-            || nbTactics != getNbTactics())
+        if (tactics == nullptr || nbTactics != getNbTactics())
         {
             return 1;
         }
@@ -627,30 +593,25 @@ public:
         PluginTensorDesc const* outputs, int32_t nbOutputs) noexcept override
     {
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount
-            || inputs[0].type != DataType::kFLOAT
-            || inputs[1].type != DataType::kINT64
-            || inputs[2].type != DataType::kFLOAT
-            || inputs[3].type != DataType::kFLOAT
-            || outputs[0].type != DataType::kFLOAT
-            || outputs[1].type != DataType::kINT32
-            || inputs[0].format != TensorFormat::kLINEAR
+            || nbOutputs != kOutputCount || inputs[0].type != DataType::kFLOAT
+            || inputs[1].type != DataType::kINT64 || inputs[2].type != DataType::kFLOAT
+            || inputs[3].type != DataType::kFLOAT || outputs[0].type != DataType::kFLOAT
+            || outputs[1].type != DataType::kINT32 || inputs[0].format != TensorFormat::kLINEAR
             || inputs[1].format != TensorFormat::kLINEAR
             || inputs[2].format != TensorFormat::kLINEAR
             || inputs[3].format != TensorFormat::kLINEAR
             || outputs[0].format != TensorFormat::kLINEAR
-            || outputs[1].format != TensorFormat::kLINEAR
-            || !isMelProjectionTactic(mTactic) || !mInitialized
-            || !haveValidShapes(inputs[0].dims, inputs[1].dims, inputs[2].dims,
-                inputs[3].dims, outputs[0].dims, outputs[1].dims, mParameters))
+            || outputs[1].format != TensorFormat::kLINEAR || !isMelProjectionTactic(mTactic)
+            || !mInitialized
+            || !haveValidShapes(inputs[0].dims, inputs[1].dims, inputs[2].dims, inputs[3].dims,
+                outputs[0].dims, outputs[1].dims, mParameters))
         {
             return 1;
         }
 
         int64_t const frequencies = inputs[3].dims.d[0];
         int64_t const fftLength64 = 2LL * (frequencies - 1);
-        int64_t const rows64 =
-            static_cast<int64_t>(inputs[0].dims.d[0]) * outputs[0].dims.d[1];
+        int64_t const rows64 = static_cast<int64_t>(inputs[0].dims.d[0]) * outputs[0].dims.d[1];
         int32_t const rows = static_cast<int32_t>(rows64);
         int32_t const fftLength = static_cast<int32_t>(fftLength64);
         if (mPlan != 0 && rows == mPlanRows && fftLength == mPlanLength)
@@ -691,28 +652,24 @@ public:
     }
 
     int32_t enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override
+        void const* const* inputs, void* const* outputs, void* workspace,
+        cudaStream_t stream) noexcept override
     {
-        if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr
-            || outputs == nullptr || inputs[0] == nullptr || inputs[1] == nullptr
-            || inputs[2] == nullptr || inputs[3] == nullptr || outputs[0] == nullptr
-            || outputs[1] == nullptr || workspace == nullptr || mPlan == 0
-            || !mInitialized || inputDesc[0].type != DataType::kFLOAT
-            || inputDesc[1].type != DataType::kINT64
-            || inputDesc[2].type != DataType::kFLOAT
-            || inputDesc[3].type != DataType::kFLOAT
-            || outputDesc[0].type != DataType::kFLOAT
-            || outputDesc[1].type != DataType::kINT32
+        if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr || outputs == nullptr
+            || inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr
+            || inputs[3] == nullptr || outputs[0] == nullptr || outputs[1] == nullptr
+            || workspace == nullptr || mPlan == 0 || !mInitialized
+            || inputDesc[0].type != DataType::kFLOAT || inputDesc[1].type != DataType::kINT64
+            || inputDesc[2].type != DataType::kFLOAT || inputDesc[3].type != DataType::kFLOAT
+            || outputDesc[0].type != DataType::kFLOAT || outputDesc[1].type != DataType::kINT32
             || inputDesc[0].format != TensorFormat::kLINEAR
             || inputDesc[1].format != TensorFormat::kLINEAR
             || inputDesc[2].format != TensorFormat::kLINEAR
             || inputDesc[3].format != TensorFormat::kLINEAR
             || outputDesc[0].format != TensorFormat::kLINEAR
-            || outputDesc[1].format != TensorFormat::kLINEAR
-            || !isMelProjectionTactic(mTactic)
-            || !haveValidShapes(inputDesc[0].dims, inputDesc[1].dims,
-                inputDesc[2].dims, inputDesc[3].dims, outputDesc[0].dims,
-                outputDesc[1].dims, mParameters))
+            || outputDesc[1].format != TensorFormat::kLINEAR || !isMelProjectionTactic(mTactic)
+            || !haveValidShapes(inputDesc[0].dims, inputDesc[1].dims, inputDesc[2].dims,
+                inputDesc[3].dims, outputDesc[0].dims, outputDesc[1].dims, mParameters))
         {
             return 1;
         }
@@ -726,9 +683,8 @@ public:
         int32_t const transformStride = fftLength + 2;
         int64_t const rows = static_cast<int64_t>(batch) * numFrames;
         WorkspaceLayout layout{};
-        if (batch < 1 || audioSamples < 1 || numFrames < mParameters.minFrames
-            || numFeatures < 1 || frequencies < 2 || rows != mPlanRows
-            || fftLength != mPlanLength
+        if (batch < 1 || audioSamples < 1 || numFrames < mParameters.minFrames || numFeatures < 1
+            || frequencies < 2 || rows != mPlanRows || fftLength != mPlanLength
             || !makeWorkspaceLayout(rows, fftLength, frequencies, layout))
         {
             return 1;
@@ -780,12 +736,11 @@ public:
             mParameters.leftPadding, fftLength, mParameters.minFrames, mParameters.preemph);
         if (cudaGetLastError() != cudaSuccess
             || cufftExecR2C(mPlan, frames, reinterpret_cast<cufftComplex*>(frames))
-                != CUFFT_SUCCESS)
+                   != CUFFT_SUCCESS)
         {
             return 1;
         }
-        int32_t const powerBlocks = static_cast<int32_t>(std::min<int64_t>(
-            kMaxBlocks, rows));
+        int32_t const powerBlocks = static_cast<int32_t>(std::min<int64_t>(kMaxBlocks, rows));
         powerSpectrumInPlace<<<powerBlocks, kThreadsPerBlock,
             static_cast<size_t>(frequencies) * sizeof(cufftComplex), stream>>>(
             reinterpret_cast<cufftComplex const*>(frames), power, rows, frequencies);
@@ -811,18 +766,17 @@ public:
         // transform stride. Together with row-major [frequencies, features] mel
         // storage it forms the desired product when viewed as transposed
         // column-major matrices, so cuBLAS writes [rows, features] without copies.
-        cublasStatus_t const gemm = cublasGemmEx(mCublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            numFeatures, static_cast<int32_t>(rows), frequencies, &alpha, inputs[3],
-            CUDA_R_32F, numFeatures, power, CUDA_R_32F, transformStride, &beta, outputs[0],
-            CUDA_R_32F, numFeatures, getCublasComputeType(mTactic), CUBLAS_GEMM_DEFAULT);
+        cublasStatus_t const gemm = cublasGemmEx(mCublas, CUBLAS_OP_N, CUBLAS_OP_N, numFeatures,
+            static_cast<int32_t>(rows), frequencies, &alpha, inputs[3], CUDA_R_32F, numFeatures,
+            power, CUDA_R_32F, transformStride, &beta, outputs[0], CUDA_R_32F, numFeatures,
+            getCublasComputeType(mTactic), CUBLAS_GEMM_DEFAULT);
         if (gemm != CUBLAS_STATUS_SUCCESS)
         {
             return 1;
         }
         int64_t const featureElements = rows * numFeatures;
-        int32_t const finalizeBlocks = static_cast<int32_t>(std::min<int64_t>(
-            kMaxBlocks, featureElements / kThreadsPerBlock
-                + (featureElements % kThreadsPerBlock != 0)));
+        int32_t const finalizeBlocks = static_cast<int32_t>(std::min<int64_t>(kMaxBlocks,
+            featureElements / kThreadsPerBlock + (featureElements % kThreadsPerBlock != 0)));
         finalizeFeatures<<<finalizeBlocks, kThreadsPerBlock, 0, stream>>>(
             static_cast<float*>(outputs[0]), static_cast<int32_t const*>(outputs[1]),
             featureElements, numFrames, numFeatures, mParameters.zeroLog);
@@ -837,12 +791,9 @@ public:
         return clone();
     }
 
-    PluginFieldCollection const* getFieldsToSerialize() noexcept override
-    {
-        return &mFields;
-    }
+    PluginFieldCollection const* getFieldsToSerialize() noexcept override { return &mFields; }
 
-private:
+  private:
     friend class ZipformerFeaturePluginCreator;
 
     void initializeFields() noexcept
@@ -875,7 +826,7 @@ private:
 
 class ZipformerFeaturePluginCreator final : public IPluginCreatorV3One
 {
-public:
+  public:
     ZipformerFeaturePluginCreator() noexcept
     {
         mAttributes = {{
@@ -889,25 +840,13 @@ public:
         mFields = {static_cast<int32_t>(mAttributes.size()), mAttributes.data()};
     }
 
-    char const* getPluginName() const noexcept override
-    {
-        return kPluginName;
-    }
+    char const* getPluginName() const noexcept override { return kPluginName; }
 
-    char const* getPluginVersion() const noexcept override
-    {
-        return kPluginVersion;
-    }
+    char const* getPluginVersion() const noexcept override { return kPluginVersion; }
 
-    char const* getPluginNamespace() const noexcept override
-    {
-        return kPluginNamespace;
-    }
+    char const* getPluginNamespace() const noexcept override { return kPluginNamespace; }
 
-    PluginFieldCollection const* getFieldNames() noexcept override
-    {
-        return &mFields;
-    }
+    PluginFieldCollection const* getFieldNames() noexcept override { return &mFields; }
 
     IPluginV3* createPlugin(char const* name, PluginFieldCollection const* fields,
         TensorRTPhase phase) noexcept override
@@ -978,20 +917,18 @@ public:
             }
 
             uint32_t const fieldBit = 1U << fieldIndex;
-            if ((foundFields & fieldBit) != 0 || field.type != expectedType
-                || field.length != 1 || field.data == nullptr)
+            if ((foundFields & fieldBit) != 0 || field.type != expectedType || field.length != 1
+                || field.data == nullptr)
             {
                 return nullptr;
             }
             if (expectedType == PluginFieldType::kINT32)
             {
-                *static_cast<int32_t*>(destination) =
-                    *static_cast<int32_t const*>(field.data);
+                *static_cast<int32_t*>(destination) = *static_cast<int32_t const*>(field.data);
             }
             else
             {
-                *static_cast<float*>(destination) =
-                    *static_cast<float const*>(field.data);
+                *static_cast<float*>(destination) = *static_cast<float const*>(field.data);
             }
             foundFields |= fieldBit;
         }
@@ -1009,7 +946,7 @@ public:
         return plugin;
     }
 
-private:
+  private:
     std::array<PluginField, 6> mAttributes{};
     PluginFieldCollection mFields{};
 };
@@ -1024,26 +961,23 @@ extern "C" bool initFastGpuAsrZipformerFeaturePlugin() noexcept
     // success so repeated package imports remain harmless.
     static ZipformerFeaturePluginCreator runtimeCreator;
     static ZipformerFeaturePluginCreator builderCreator;
-    auto ensureRegistered = [](IPluginRegistry* registry,
-                                ZipformerFeaturePluginCreator& creator) noexcept {
+    auto ensureRegistered =
+        [](IPluginRegistry* registry, ZipformerFeaturePluginCreator& creator) noexcept
+    {
         if (registry == nullptr)
         {
             return false;
         }
-        if (registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace)
-            != nullptr)
+        if (registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace) != nullptr)
         {
             return true;
         }
         return registry->registerCreator(creator, kPluginNamespace)
-            || registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace)
-                != nullptr;
+               || registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace) != nullptr;
     };
-    bool const runtimeRegistered =
-        ensureRegistered(getPluginRegistry(), runtimeCreator);
+    bool const runtimeRegistered = ensureRegistered(getPluginRegistry(), runtimeCreator);
     auto* builderRegistry =
         nvinfer1::getBuilderPluginRegistry(nvinfer1::EngineCapability::kSTANDARD);
-    bool const builderRegistered =
-        ensureRegistered(builderRegistry, builderCreator);
+    bool const builderRegistered = ensureRegistered(builderRegistry, builderCreator);
     return runtimeRegistered && builderRegistered;
 }

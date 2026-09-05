@@ -35,9 +35,7 @@ SHAPE_CASES = (
     pytest.param((2, 7, CHANNELS), (0, 1), id="zero-and-one-valid-frame"),
     pytest.param((2, 17, CHANNELS), (17, 5), id="mixed-lengths"),
     pytest.param(
-        (3, 65, CHANNELS),
-        (INT32_MIN, 34, INT32_MAX),
-        id="clamped-length-extremes",
+        (3, 65, CHANNELS), (INT32_MIN, 34, INT32_MAX), id="clamped-length-extremes"
     ),
     pytest.param((1, 514, CHANNELS), (513,), id="thread-block-boundary"),
 )
@@ -567,9 +565,7 @@ def assert_run_matches_reference(
 
 @pytest.mark.parametrize("shape,lengths", SHAPE_CASES)
 def test_zipformer_convolution_plugin_matches_reference(
-    convolution_engine,
-    shape: tuple[int, int, int],
-    lengths: tuple[int, ...],
+    convolution_engine, shape: tuple[int, int, int], lengths: tuple[int, ...]
 ) -> None:
     _, engine, case = convolution_engine
     inputs = make_inputs(shape, lengths, case.kernel_size)
@@ -620,8 +616,7 @@ def test_zipformer_convolution_plugin_handles_activation_extremes(
 
 @pytest.mark.parametrize("case", ADDITIONAL_LAYOUT_CASES, ids=lambda case: case.name)
 def test_zipformer_convolution_plugin_supports_additional_layouts(
-    plugin_creator,
-    case: EngineCase,
+    plugin_creator, case: EngineCase
 ) -> None:
     *_, creator = plugin_creator
     result = build_convolution_engine(creator, case, (1, 129, 685))
@@ -760,8 +755,7 @@ def test_zipformer_convolution_plugin_accepts_valid_static_contract(
     ),
 )
 def test_zipformer_convolution_plugin_rejects_invalid_contracts(
-    plugin_creator,
-    overrides: dict[str, InputSpec],
+    plugin_creator, overrides: dict[str, InputSpec]
 ) -> None:
     *_, creator = plugin_creator
     assert build_engine(creator, VALID_INPUT_SPECS | overrides) is None
@@ -801,8 +795,7 @@ def test_zipformer_convolution_plugin_rejects_invalid_input_count(
     "length_batches", ((2, 2, 3), (1, 1, 3), (1, 2, 2)), ids=("min", "opt", "max")
 )
 def test_zipformer_convolution_plugin_rejects_invalid_profile_endpoints(
-    plugin_creator,
-    length_batches: tuple[int, int, int],
+    plugin_creator, length_batches: tuple[int, int, int]
 ) -> None:
     *_, creator = plugin_creator
     assert (
@@ -827,8 +820,7 @@ def test_zipformer_convolution_creator_rejects_fields(plugin_creator) -> None:
 
 @pytest.mark.parametrize("case", ENGINE_CASES, ids=lambda case: case.name)
 def test_zipformer_convolution_builds_with_constants(
-    plugin_creator,
-    case: EngineCase,
+    plugin_creator, case: EngineCase
 ) -> None:
     *_, creator = plugin_creator
     rng = np.random.default_rng(20260819)

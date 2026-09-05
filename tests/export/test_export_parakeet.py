@@ -79,10 +79,7 @@ def make_model_config() -> DictConfig:
             "decoder": {
                 "blank_as_pad": True,
                 "vocab_size": 1024,
-                "prednet": {
-                    "pred_hidden": 640,
-                    "pred_rnn_layers": 2,
-                },
+                "prednet": {"pred_hidden": 640, "pred_rnn_layers": 2},
             },
             "joint": {
                 "jointnet": {
@@ -93,7 +90,7 @@ def make_model_config() -> DictConfig:
                 "num_extra_outputs": 5,
             },
             "decoding": {"greedy": {"max_symbols": 10}},
-        },
+        }
     )
 
 
@@ -125,8 +122,7 @@ def make_export_args() -> argparse.Namespace:
 
 @pytest.mark.parametrize("use_symlink", (False, True), ids=("direct", "symlink"))
 def test_export_parakeet_rejects_destination_containing_source(
-    tmp_path: Path,
-    use_symlink: bool,
+    tmp_path: Path, use_symlink: bool
 ) -> None:
     output_dir = tmp_path / "bundle"
     output_dir.mkdir()
@@ -166,8 +162,7 @@ def test_export_parakeet_rejects_missing_source_before_replacing_output(
 
 
 def test_export_parakeet_replaces_output_before_extraction(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_path = tmp_path / "model.nemo"
     model_path.write_bytes(b"source")
@@ -220,11 +215,7 @@ def test_export_parakeet_replaces_output_before_extraction(
         pytest.param("transducer_greedy_search", 1, 1, False, id="greedy-already-one"),
         pytest.param("transducer_greedy_search", 6, 1, True, id="greedy-override"),
         pytest.param(
-            "transducer_modified_beam_search",
-            6,
-            6,
-            False,
-            id="modified-beam-preserved",
+            "transducer_modified_beam_search", 6, 6, False, id="modified-beam-preserved"
         ),
     ),
 )
@@ -265,11 +256,7 @@ def test_export_parakeet_applies_decoder_beam_policy(
         observed_beams.append(args.beam)
         raise RuntimeError("stop export")
 
-    monkeypatch.setattr(
-        parakeet_exporter,
-        "extract_parakeet_archive",
-        stop_export,
-    )
+    monkeypatch.setattr(parakeet_exporter, "extract_parakeet_archive", stop_export)
 
     with (
         caplog.at_level("WARNING", logger=parakeet_exporter.__name__),
@@ -348,8 +335,7 @@ def test_main_configures_logging_and_runs_export(
 
 
 def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def record_export(module, inputs, path, **kwargs) -> None:
         """Check the inference context while Mock records the ONNX arguments.
@@ -390,10 +376,7 @@ def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
     assert export.call_count == 2
     encoder_call, decoder_call = export.call_args_list
     for export_call, module, path in zip(
-        export.call_args_list,
-        (encoder, decoder),
-        paths,
-        strict=True,
+        export.call_args_list, (encoder, decoder), paths, strict=True
     ):
         assert export_call.args[0] is module
         assert export_call.args[2] == path
@@ -407,10 +390,7 @@ def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
     assert encoder_call.kwargs == {
         "input_names": ("audio", "audio_lengths"),
         "output_names": ("encoder_output", "encoder_output_lengths"),
-        "dynamic_shapes": {
-            "audio": {1: torch.export.Dim.DYNAMIC},
-            "audio_lengths": {},
-        },
+        "dynamic_shapes": {"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
         "opset_version": parakeet_exporter.ONNX_OPSET_VERSION,
     }
     torch.testing.assert_close(
@@ -466,9 +446,7 @@ def test_export_parakeet_validates_exact_published_artifacts(
     torch.save(OrderedDict({"decoder.prediction.embed.weight": weight}), checkpoint)
     with tarfile.open(args.model_path, "w") as archive:
         add_archive_member(
-            archive,
-            "model_config.yaml",
-            OmegaConf.to_yaml(source_config).encode(),
+            archive, "model_config.yaml", OmegaConf.to_yaml(source_config).encode()
         )
         add_archive_member(archive, "model_weights.ckpt", checkpoint.getvalue())
         add_archive_member(archive, "artifacts/source.model", b"tokenizer")
@@ -505,9 +483,7 @@ def test_export_parakeet_validates_exact_published_artifacts(
         )
         for path in paths:
             onnx.save(
-                onnx.helper.make_model(
-                    onnx.helper.make_graph([], path.stem, [], []),
-                ),
+                onnx.helper.make_model(onnx.helper.make_graph([], path.stem, [], [])),
                 path,
             )
         return paths
@@ -584,10 +560,7 @@ def test_export_parakeet_validates_exact_published_artifacts(
     config, state_dict, *settings = construct_model.call_args.args
     assert config == source_config
     torch.testing.assert_close(
-        state_dict,
-        OrderedDict({"embedding.weight": weight}),
-        rtol=0,
-        atol=0,
+        state_dict, OrderedDict({"embedding.weight": weight}), rtol=0, atol=0
     )
     assert settings == [partitions, torch.float16, torch.bfloat16]
     export_onnx_mock.assert_called_once_with(encoder, decoder, source_config, args)
@@ -675,11 +648,7 @@ def test_make_model_wires_configuration_and_state_dicts(
     model_config.joint.num_extra_outputs = 7
 
     encoder, decoder = make_model(
-        model_config,
-        state_dict,
-        3,
-        torch.float16,
-        torch.bfloat16,
+        model_config, state_dict, 3, torch.float16, torch.bfloat16
     )
 
     assert encoder is make_encoder.return_value
@@ -776,8 +745,7 @@ def test_make_parakeet_runtime_config(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "decoder_type",
-    ("transducer_modified_beam_search", "transducer_greedy_search"),
+    "decoder_type", ("transducer_modified_beam_search", "transducer_greedy_search")
 )
 def test_validate_parakeet_accepts_beam_one(decoder_type: str) -> None:
     model_config = make_model_config()
@@ -836,17 +804,11 @@ def test_validate_parakeet_rejects_decoder_tensor_volume_overflow(
         ("decoder.vocab_size", 4_000_000, "decoder embedding weight"),
         ("decoder.prednet.pred_hidden", 25_000, "decoder recurrent weight"),
         ("joint.jointnet.joint_hidden", 3_000_000, "encoder projection weight"),
-        (
-            "joint.jointnet.joint_hidden",
-            2_086_000,
-            "output projection weight",
-        ),
+        ("joint.jointnet.joint_hidden", 2_086_000, "output projection weight"),
     ),
 )
 def test_validate_parakeet_rejects_parameter_tensor_overflow(
-    field: str,
-    value: int,
-    parameter_name: str,
+    field: str, value: int, parameter_name: str
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -878,8 +840,7 @@ def test_validate_parakeet_rejects_encoder_decoder_interface_mismatch() -> None:
     ),
 )
 def test_validate_parakeet_rejects_invalid_tdt_durations(
-    durations: list[float | int],
-    message: str,
+    durations: list[float | int], message: str
 ) -> None:
     model_config = make_model_config()
     model_config.model_defaults.tdt_durations = durations
@@ -930,9 +891,7 @@ def test_validate_parakeet_rejects_audio_sample_dimension_overflow() -> None:
     ),
 )
 def test_validate_parakeet_rejects_invalid_export_arguments(
-    field: str,
-    value: float | int | str,
-    message: str,
+    field: str, value: float | int | str, message: str
 ) -> None:
     args = make_export_args()
     setattr(args, field, value)
@@ -958,8 +917,7 @@ def test_validate_parakeet_rejects_invalid_export_arguments(
     ),
 )
 def test_validate_parakeet_accepts_equivalent_fixed_values(
-    field: str,
-    value: bool | float | int,
+    field: str, value: bool | float | int
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -978,8 +936,7 @@ def test_validate_parakeet_accepts_omitted_optional_preprocessor_defaults() -> N
 @pytest.mark.parametrize("field", ("encoder_precision", "decoder_precision"))
 @pytest.mark.parametrize("value", ("fp8", None, True, ["fp32"]))
 def test_validate_parakeet_rejects_unsupported_precision(
-    field: str,
-    value: bool | list[str] | str | None,
+    field: str, value: bool | list[str] | str | None
 ) -> None:
     args = make_export_args()
     setattr(args, field, value)
@@ -1027,9 +984,7 @@ def test_validate_parakeet_rejects_unaligned_fp32_convolution_channels() -> None
 
 
 @pytest.mark.parametrize("precision", ("fp16", "bf16"))
-def test_validate_parakeet_accepts_paired_convolution_channels(
-    precision: str,
-) -> None:
+def test_validate_parakeet_accepts_paired_convolution_channels(precision: str) -> None:
     model_config = make_model_config()
     model_config.encoder.d_model = 1026
     model_config.encoder.n_heads = 2
@@ -1098,8 +1053,7 @@ def test_validate_parakeet_flash_attention_capacity_boundary() -> None:
     ),
 )
 def test_validate_parakeet_rejects_unsupported_fixed_values(
-    field: str,
-    value: bool | float | int | str | list[int] | None,
+    field: str, value: bool | float | int | str | list[int] | None
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -1129,8 +1083,7 @@ def test_validate_parakeet_rejects_nonsequence_attention_context(
 
 @pytest.mark.parametrize(("window_size", "n_fft"), ((0.016, 256), (0.033, 1024)))
 def test_validate_parakeet_rejects_fft_size_mismatch(
-    window_size: float,
-    n_fft: int,
+    window_size: float, n_fft: int
 ) -> None:
     model_config = make_model_config()
     model_config.preprocessor.window_size = window_size
@@ -1151,12 +1104,10 @@ def test_validate_parakeet_rejects_feature_workspace_overflow_boundary() -> None
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "expected_partitions"),
-    ((64, 1), (128, 2), (131, 3), (256, 4)),
+    ("batch_size", "expected_partitions"), ((64, 1), (128, 2), (131, 3), (256, 4))
 )
 def test_subsampling_batch_uses_minimum_cask_safe_partitions(
-    batch_size: int,
-    expected_partitions: int,
+    batch_size: int, expected_partitions: int
 ) -> None:
     args = make_export_args()
     args.batch_size = batch_size
@@ -1205,9 +1156,7 @@ def test_subsampling_batch_cask_single_item_boundary() -> None:
 
 
 def add_archive_member(
-    archive: tarfile.TarFile,
-    name: str,
-    data: bytes = b"data",
+    archive: tarfile.TarFile, name: str, data: bytes = b"data"
 ) -> None:
     """Add one regular in-memory file to a test tar archive.
 
@@ -1235,17 +1184,13 @@ def add_archive_member(
     ids=("nemo-uri", "archive-path"),
 )
 def test_extract_parakeet_archive_resolves_tokenizer_reference(
-    tmp_path: Path,
-    tokenizer_reference: str,
-    tokenizer_name: str,
+    tmp_path: Path, tokenizer_reference: str, tokenizer_name: str
 ) -> None:
     archive_path = tmp_path / "model.nemo"
     config = OmegaConf.create({"tokenizer": {"model_path": tokenizer_reference}})
     with tarfile.open(archive_path, "w") as archive:
         add_archive_member(
-            archive,
-            "model/model_config.yaml",
-            OmegaConf.to_yaml(config).encode(),
+            archive, "model/model_config.yaml", OmegaConf.to_yaml(config).encode()
         )
         add_archive_member(archive, "model/model_weights.ckpt", b"checkpoint")
         add_archive_member(archive, "artifacts/tokenizer.model", b"wrong")
@@ -1254,8 +1199,7 @@ def test_extract_parakeet_archive_resolves_tokenizer_reference(
     output_dir.mkdir()
 
     config_path, checkpoint_path, tokenizer_path = extract_parakeet_archive(
-        archive_path,
-        output_dir,
+        archive_path, output_dir
     )
 
     assert config_path == output_dir / "model_config.yaml"
@@ -1271,8 +1215,7 @@ def test_extract_parakeet_archive_resolves_tokenizer_reference(
     ("model_config.yaml", "model_weights.ckpt", "custom_tokenizer.model"),
 )
 def test_extract_parakeet_archive_rejects_missing_required_member(
-    tmp_path: Path,
-    missing_name: str,
+    tmp_path: Path, missing_name: str
 ) -> None:
     archive_path = tmp_path / "model.nemo"
     config = OmegaConf.create(
@@ -1350,8 +1293,7 @@ def test_extract_member_rejects_nonregular_member(tmp_path: Path) -> None:
 
 
 def test_extract_member_rejects_unreadable_member(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     archive_path = tmp_path / "model.nemo"
     with tarfile.open(archive_path, "w") as archive:
@@ -1397,19 +1339,14 @@ def test_validate_parakeet_rejects_wrong_scalar_types(field: str, value: str) ->
 
 
 @pytest.mark.parametrize(
-    "field",
-    ("preprocessor.window_stride", "preprocessor.window_size"),
+    "field", ("preprocessor.window_stride", "preprocessor.window_size")
 )
 @pytest.mark.parametrize(
     "value",
-    (
-        pytest.param(float("nan"), id="nan"),
-        pytest.param(float("inf"), id="infinity"),
-    ),
+    (pytest.param(float("nan"), id="nan"), pytest.param(float("inf"), id="infinity")),
 )
 def test_validate_parakeet_rejects_nonfinite_feature_timing(
-    field: str,
-    value: float,
+    field: str, value: float
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -1431,9 +1368,7 @@ def test_validate_parakeet_rejects_nonfinite_feature_timing(
     ),
 )
 def test_validate_parakeet_rejects_invalid_feature_values(
-    field: str,
-    value: float | int,
-    message: str,
+    field: str, value: float | int, message: str
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -1500,7 +1435,7 @@ def test_adjust_state_dict_converts_complete_parakeet_layout() -> None:
         "encoder.layers.0.feed_forward2.linear2.weight": second_feed_forward_weight
         * 0.5,
         "encoder.layers.0.self_attn.linear_qkv.weight": torch.cat(
-            (query_weight, key_weight, value_weight),
+            (query_weight, key_weight, value_weight)
         ),
         "embedding.weight": embedding_weight,
         "lstm.weight_ih_l0": lstm_weight,
@@ -1522,22 +1457,15 @@ def test_adjust_state_dict_converts_complete_parakeet_layout() -> None:
 @pytest.mark.parametrize(
     ("source_key", "expected_key"),
     (
-        (
-            "decoder.prediction.dec_rnn.lstm.weight_hh_l1",
-            "lstm.weight_hh_l1",
-        ),
-        (
-            "decoder.prediction.dec_rnn.lstm.bias_ih_l1",
-            "lstm.bias_ih_l1",
-        ),
+        ("decoder.prediction.dec_rnn.lstm.weight_hh_l1", "lstm.weight_hh_l1"),
+        ("decoder.prediction.dec_rnn.lstm.bias_ih_l1", "lstm.bias_ih_l1"),
         ("joint.joint_net.2.bias", "output_proj.bias"),
         ("joint.pred.bias", "decoder_proj.bias"),
         ("joint.enc.bias", "encoder_proj.bias"),
     ),
 )
 def test_adjust_state_dict_preserves_parameter_suffixes_when_renaming(
-    source_key: str,
-    expected_key: str,
+    source_key: str, expected_key: str
 ) -> None:
     parameter = torch.arange(4, dtype=torch.float32)
 
@@ -1577,13 +1505,10 @@ def test_adjust_state_dict_fuses_every_attention_layer() -> None:
 @pytest.mark.parametrize("pointwise_layer", ("pointwise_conv1", "pointwise_conv2"))
 @pytest.mark.parametrize("shape", ((4, 4), (4, 4, 2)))
 def test_adjust_state_dict_rejects_invalid_pointwise_weight_shape(
-    pointwise_layer: str,
-    shape: tuple[int, ...],
+    pointwise_layer: str, shape: tuple[int, ...]
 ) -> None:
     state_dict = OrderedDict(
-        {
-            f"encoder.layers.0.conv.{pointwise_layer}.weight": torch.ones(shape),
-        }
+        {f"encoder.layers.0.conv.{pointwise_layer}.weight": torch.ones(shape)}
     )
 
     with pytest.raises(ValueError, match="Expected pointwise Conv1d weight"):
@@ -1591,9 +1516,7 @@ def test_adjust_state_dict_rejects_invalid_pointwise_weight_shape(
 
 
 @pytest.mark.parametrize(
-    "reverse_order",
-    (False, True),
-    ids=("target-first", "alias-first"),
+    "reverse_order", (False, True), ids=("target-first", "alias-first")
 )
 def test_adjust_state_dict_rejects_alias_collision(reverse_order: bool) -> None:
     items = (
@@ -1611,10 +1534,7 @@ def test_adjust_state_dict_rejects_missing_attention_projection(
     missing_projection: str,
 ) -> None:
     state_dict = OrderedDict(
-        (
-            f"encoder.layers.0.self_attn.linear_{projection}.weight",
-            torch.ones(2, 2),
-        )
+        (f"encoder.layers.0.self_attn.linear_{projection}.weight", torch.ones(2, 2))
         for projection in ("q", "k", "v")
         if projection != missing_projection
     )
@@ -1647,17 +1567,13 @@ def test_adjust_state_dict_rejects_split_and_fused_attention_projections() -> No
     ),
 )
 def test_adjust_state_dict_rejects_incompatible_attention_projections(
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: str,
+    shape: tuple[int, ...], dtype: torch.dtype, device: str
 ) -> None:
     state_dict = OrderedDict(
         {
             "encoder.layers.0.self_attn.linear_q.weight": torch.ones(2, 4),
             "encoder.layers.0.self_attn.linear_k.weight": torch.ones(
-                shape,
-                dtype=dtype,
-                device=device,
+                shape, dtype=dtype, device=device
             ),
             "encoder.layers.0.self_attn.linear_v.weight": torch.ones(2, 4),
         }

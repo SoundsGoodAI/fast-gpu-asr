@@ -105,8 +105,7 @@ def make_random_tensor(
         Standard-normal CPU samples in the requested shape and dtype.
     """
 
-    generator = torch.Generator().manual_seed(seed)
-    return torch.randn(shape, generator=generator).to(dtype)
+    return torch.randn(shape, generator=torch.Generator().manual_seed(seed)).to(dtype)
 
 
 def get_onnx_shape(value: onnx.ValueInfoProto) -> tuple[int | str, ...]:

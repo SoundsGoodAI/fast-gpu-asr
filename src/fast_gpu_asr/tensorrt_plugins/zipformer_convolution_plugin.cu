@@ -69,11 +69,9 @@ constexpr bool isValidTactic(int32_t tactic) noexcept
 
 template <std::size_t Size>
 int32_t writeConvolutionTactics(
-    std::array<int32_t, Size> const& validTactics, int32_t* tactics,
-    int32_t nbTactics) noexcept
+    std::array<int32_t, Size> const& validTactics, int32_t* tactics, int32_t nbTactics) noexcept
 {
-    if (tactics == nullptr
-        || nbTactics != static_cast<int32_t>(validTactics.size()))
+    if (tactics == nullptr || nbTactics != static_cast<int32_t>(validTactics.size()))
     {
         return 1;
     }
@@ -83,8 +81,7 @@ int32_t writeConvolutionTactics(
 
 constexpr bool isSupportedDataType(DataType type) noexcept
 {
-    return type == DataType::kFLOAT || type == DataType::kHALF
-        || type == DataType::kBF16;
+    return type == DataType::kFLOAT || type == DataType::kHALF || type == DataType::kBF16;
 }
 
 constexpr int32_t dataTypeBytes(DataType type) noexcept
@@ -98,16 +95,12 @@ constexpr int32_t dataTypeBytes(DataType type) noexcept
     }
 }
 
-constexpr int32_t vectorWidth(DataType type) noexcept
-{
-    return type == DataType::kFLOAT ? 4 : 2;
-}
+constexpr int32_t vectorWidth(DataType type) noexcept { return type == DataType::kFLOAT ? 4 : 2; }
 
 __device__ __forceinline__ float swooshR(float value)
 {
     float const shifted = value - 1.0F;
-    float const softplus = fmaxf(shifted, 0.0F)
-        + log1pf(__expf(-fabsf(shifted)));
+    float const softplus = fmaxf(shifted, 0.0F) + log1pf(__expf(-fabsf(shifted)));
     return softplus - 0.08F * value - 0.313261687F;
 }
 
@@ -119,12 +112,10 @@ bool hasAddressableBytes(Dims const& dims, int32_t elementBytes) noexcept
     }
 
     int64_t elements = 1;
-    int64_t const maxElements =
-        std::numeric_limits<int64_t>::max() / elementBytes;
+    int64_t const maxElements = std::numeric_limits<int64_t>::max() / elementBytes;
     for (int32_t index = 0; index < dims.nbDims; ++index)
     {
-        if (dims.d[index] < 1
-            || dims.d[index] > std::numeric_limits<int32_t>::max()
+        if (dims.d[index] < 1 || dims.d[index] > std::numeric_limits<int32_t>::max()
             || elements > maxElements / dims.d[index])
         {
             return false;
@@ -134,13 +125,12 @@ bool hasAddressableBytes(Dims const& dims, int32_t elementBytes) noexcept
     return true;
 }
 
-bool haveValidShapes(Dims const* inputs, Dims const& output,
-    DataType type) noexcept
+bool haveValidShapes(Dims const* inputs, Dims const& output, DataType type) noexcept
 {
     int32_t const elementBytes = dataTypeBytes(type);
-    if (inputs == nullptr || inputs[0].nbDims != 3 || inputs[1].nbDims != 1
-        || inputs[2].nbDims != 2 || inputs[3].nbDims != 1
-        || output.nbDims != 3 || !hasAddressableBytes(inputs[0], elementBytes)
+    if (inputs == nullptr || inputs[0].nbDims != 3 || inputs[1].nbDims != 1 || inputs[2].nbDims != 2
+        || inputs[3].nbDims != 1 || output.nbDims != 3
+        || !hasAddressableBytes(inputs[0], elementBytes)
         || !hasAddressableBytes(inputs[1], sizeof(int32_t))
         || !hasAddressableBytes(inputs[2], elementBytes)
         || !hasAddressableBytes(inputs[3], elementBytes)
@@ -151,26 +141,23 @@ bool haveValidShapes(Dims const* inputs, Dims const& output,
 
     int32_t const channels = static_cast<int32_t>(inputs[0].d[2]);
     int32_t const kernelSize = static_cast<int32_t>(inputs[2].d[0]);
-    return inputs[1].d[0] == inputs[0].d[0] && kernelSize % 2 == 1
-        && inputs[2].d[1] == channels && inputs[3].d[0] == channels
-        && channels % vectorWidth(type) == 0
-        && output.d[0] == inputs[0].d[0]
-        && output.d[1] == inputs[0].d[1]
-        && output.d[2] == channels;
+    return inputs[1].d[0] == inputs[0].d[0] && kernelSize % 2 == 1 && inputs[2].d[1] == channels
+           && inputs[3].d[0] == channels && channels % vectorWidth(type) == 0
+           && output.d[0] == inputs[0].d[0] && output.d[1] == inputs[0].d[1]
+           && output.d[2] == channels;
 }
 
 // One thread evaluates one packed channel vector at one (batch, frame)
 // position. Consecutive threads therefore access consecutive channels, while
 // the grid-stride loop covers tensors larger than CUDA's one-dimensional grid.
 // The kernel applies masked depthwise convolution followed by Swoosh-R.
-__global__ void zipformerConvolutionFloat4(
-    float const* __restrict__ x, int32_t const* __restrict__ validLengths,
-    float const* __restrict__ weight, float const* __restrict__ bias,
-    int64_t numElements, int32_t sequenceLength, int32_t numChannels,
-    int32_t kernelSize, float* __restrict__ output)
+__global__ void zipformerConvolutionFloat4(float const* __restrict__ x,
+    int32_t const* __restrict__ validLengths, float const* __restrict__ weight,
+    float const* __restrict__ bias, int64_t numElements, int32_t sequenceLength,
+    int32_t numChannels, int32_t kernelSize, float* __restrict__ output)
 {
     for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
+        index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
     {
         int32_t const channelGroups = numChannels / 4;
         int32_t const channel = static_cast<int32_t>(index % channelGroups) * 4;
@@ -178,22 +165,21 @@ __global__ void zipformerConvolutionFloat4(
         int32_t const frame = static_cast<int32_t>(frameIndex % sequenceLength);
         int32_t const batch = static_cast<int32_t>(frameIndex / sequenceLength);
         int32_t const requestedLength = validLengths[batch];
-        int32_t const validLength = requestedLength < 0
-            ? 0
-            : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
+        int32_t const validLength =
+            requestedLength < 0
+                ? 0
+                : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
         int32_t const padding = kernelSize / 2;
         float4 value = *reinterpret_cast<float4 const*>(bias + channel);
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
         {
-            int64_t const inputFrame =
-                static_cast<int64_t>(frame) + kernel - padding;
+            int64_t const inputFrame = static_cast<int64_t>(frame) + kernel - padding;
             if (inputFrame >= 0 && inputFrame < validLength)
             {
                 int64_t const inputIndex =
-                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame)
-                    * numChannels + channel;
-                float4 const inputValue =
-                    *reinterpret_cast<float4 const*>(x + inputIndex);
+                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame) * numChannels
+                    + channel;
+                float4 const inputValue = *reinterpret_cast<float4 const*>(x + inputIndex);
                 float4 const weightValue = *reinterpret_cast<float4 const*>(
                     weight + static_cast<int64_t>(kernel) * numChannels + channel);
                 value.x = fmaf(inputValue.x, weightValue.x, value.x);
@@ -210,24 +196,18 @@ __global__ void zipformerConvolutionFloat4(
     }
 }
 
-template <typename T>
-struct LowPrecisionOps;
+template <typename T> struct LowPrecisionOps;
 
-template <>
-struct LowPrecisionOps<half>
+template <> struct LowPrecisionOps<half>
 {
     using Pair = half2;
 
-    static __device__ __forceinline__ Pair fma(
-        Pair input, Pair weight, Pair value)
+    static __device__ __forceinline__ Pair fma(Pair input, Pair weight, Pair value)
     {
         return __hfma2(input, weight, value);
     }
 
-    static __device__ __forceinline__ float2 toFloat(Pair value)
-    {
-        return __half22float2(value);
-    }
+    static __device__ __forceinline__ float2 toFloat(Pair value) { return __half22float2(value); }
 
     static __device__ __forceinline__ Pair fromFloat(float x, float y)
     {
@@ -235,13 +215,11 @@ struct LowPrecisionOps<half>
     }
 };
 
-template <>
-struct LowPrecisionOps<__nv_bfloat16>
+template <> struct LowPrecisionOps<__nv_bfloat16>
 {
     using Pair = __nv_bfloat162;
 
-    static __device__ __forceinline__ Pair fma(
-        Pair input, Pair weight, Pair value)
+    static __device__ __forceinline__ Pair fma(Pair input, Pair weight, Pair value)
     {
         // BF16 engines require SM80; keep this specialization compilable for SM75.
 #if __CUDA_ARCH__ >= 800
@@ -274,14 +252,12 @@ __device__ __forceinline__ typename LowPrecisionOps<T>::Pair swooshRPair(
     return Ops::fromFloat(swooshR(converted.x), swooshR(converted.y));
 }
 
-template <typename T>
-struct alignas(16) PackedEightChannels
+template <typename T> struct alignas(16) PackedEightChannels
 {
     typename LowPrecisionOps<T>::Pair values[4];
 };
 
-template <typename T>
-struct alignas(8) PackedFourChannels
+template <typename T> struct alignas(8) PackedFourChannels
 {
     typename LowPrecisionOps<T>::Pair values[2];
 };
@@ -308,16 +284,15 @@ enum class LowPrecisionKernel : int32_t
 // kernels keeps their indexing and boundary behavior identical while each
 // specialization still compiles to its native storage and conversion ops.
 template <typename T>
-__global__ void zipformerConvolutionPair(
-    T const* __restrict__ x, int32_t const* __restrict__ validLengths,
-    T const* __restrict__ weight, T const* __restrict__ bias,
-    int64_t numElements, int32_t sequenceLength, int32_t numChannels,
+__global__ void zipformerConvolutionPair(T const* __restrict__ x,
+    int32_t const* __restrict__ validLengths, T const* __restrict__ weight,
+    T const* __restrict__ bias, int64_t numElements, int32_t sequenceLength, int32_t numChannels,
     int32_t kernelSize, T* __restrict__ output)
 {
     using Ops = LowPrecisionOps<T>;
     using Pair = typename Ops::Pair;
     for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
+        index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
     {
         int32_t const channelPairs = numChannels / 2;
         int32_t const channel = static_cast<int32_t>(index % channelPairs) * 2;
@@ -325,28 +300,28 @@ __global__ void zipformerConvolutionPair(
         int32_t const frame = static_cast<int32_t>(frameIndex % sequenceLength);
         int32_t const batch = static_cast<int32_t>(frameIndex / sequenceLength);
         int32_t const requestedLength = validLengths[batch];
-        int32_t const validLength = requestedLength < 0
-            ? 0
-            : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
+        int32_t const validLength =
+            requestedLength < 0
+                ? 0
+                : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
         int32_t const padding = kernelSize / 2;
         Pair value = *reinterpret_cast<Pair const*>(bias + channel);
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
         {
-            int64_t const inputFrame =
-                static_cast<int64_t>(frame) + kernel - padding;
+            int64_t const inputFrame = static_cast<int64_t>(frame) + kernel - padding;
             if (inputFrame >= 0 && inputFrame < validLength)
             {
                 int64_t const inputIndex =
-                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame)
-                    * numChannels + channel;
+                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame) * numChannels
+                    + channel;
                 Pair const inputValue = *reinterpret_cast<Pair const*>(x + inputIndex);
                 Pair const weightValue = *reinterpret_cast<Pair const*>(
                     weight + static_cast<int64_t>(kernel) * numChannels + channel);
                 value = Ops::fma(inputValue, weightValue, value);
             }
         }
-        *reinterpret_cast<Pair*>(output + frameIndex * numChannels + channel)
-            = swooshRPair<T>(value);
+        *reinterpret_cast<Pair*>(output + frameIndex * numChannels + channel) =
+            swooshRPair<T>(value);
     }
 }
 
@@ -360,30 +335,27 @@ __global__ void zipformerConvolutionPair(
 // shared-memory staging barrier. One thread handles an eight-channel vector for
 // one frame pair; for odd sequence lengths the unused second result is not stored.
 template <typename T>
-__global__ void zipformerConvolutionAdjacentFrames(
-    T const* __restrict__ x, int32_t const* __restrict__ validLengths,
-    T const* __restrict__ weight, T const* __restrict__ bias,
-    int64_t numElements, int32_t sequenceLength, int32_t numChannels,
+__global__ void zipformerConvolutionAdjacentFrames(T const* __restrict__ x,
+    int32_t const* __restrict__ validLengths, T const* __restrict__ weight,
+    T const* __restrict__ bias, int64_t numElements, int32_t sequenceLength, int32_t numChannels,
     int32_t kernelSize, T* __restrict__ output)
 {
     using Ops = LowPrecisionOps<T>;
     using Packed = PackedEightChannels<T>;
     int32_t const channelGroups = numChannels / 8;
-    int32_t const framePairs =
-        sequenceLength / 2 + sequenceLength % 2;
+    int32_t const framePairs = sequenceLength / 2 + sequenceLength % 2;
     for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
+        index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
     {
         int32_t const channel = static_cast<int32_t>(index % channelGroups) * 8;
         int64_t const framePairIndex = index / channelGroups;
-        int32_t const frame =
-            static_cast<int32_t>(framePairIndex % framePairs) * 2;
-        int32_t const batch =
-            static_cast<int32_t>(framePairIndex / framePairs);
+        int32_t const frame = static_cast<int32_t>(framePairIndex % framePairs) * 2;
+        int32_t const batch = static_cast<int32_t>(framePairIndex / framePairs);
         int32_t const requestedLength = validLengths[batch];
-        int32_t const validLength = requestedLength < 0
-            ? 0
-            : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
+        int32_t const validLength =
+            requestedLength < 0
+                ? 0
+                : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
         int32_t const padding = kernelSize / 2;
         Packed value0 = *reinterpret_cast<Packed const*>(bias + channel);
         Packed value1 = value0;
@@ -393,9 +365,7 @@ __global__ void zipformerConvolutionAdjacentFrames(
         if (inputFrame >= 0 && inputFrame < validLength)
         {
             int64_t const inputIndex =
-                (static_cast<int64_t>(batch) * sequenceLength + inputFrame)
-                    * numChannels
-                + channel;
+                (static_cast<int64_t>(batch) * sequenceLength + inputFrame) * numChannels + channel;
             inputValue0 = *reinterpret_cast<Packed const*>(x + inputIndex);
         }
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
@@ -405,8 +375,7 @@ __global__ void zipformerConvolutionAdjacentFrames(
             if (inputFrame >= 0 && inputFrame < validLength)
             {
                 int64_t const inputIndex =
-                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame)
-                        * numChannels
+                    (static_cast<int64_t>(batch) * sequenceLength + inputFrame) * numChannels
                     + channel;
                 inputValue1 = *reinterpret_cast<Packed const*>(x + inputIndex);
             }
@@ -416,11 +385,9 @@ __global__ void zipformerConvolutionAdjacentFrames(
             for (int32_t pair = 0; pair < 4; ++pair)
             {
                 value0.values[pair] = Ops::fma(
-                    inputValue0.values[pair], weightValue.values[pair],
-                    value0.values[pair]);
+                    inputValue0.values[pair], weightValue.values[pair], value0.values[pair]);
                 value1.values[pair] = Ops::fma(
-                    inputValue1.values[pair], weightValue.values[pair],
-                    value1.values[pair]);
+                    inputValue1.values[pair], weightValue.values[pair], value1.values[pair]);
             }
             inputValue0 = inputValue1;
         }
@@ -432,8 +399,7 @@ __global__ void zipformerConvolutionAdjacentFrames(
             value1.values[pair] = swooshRPair<T>(value1.values[pair]);
         }
         int64_t const outputIndex =
-            (static_cast<int64_t>(batch) * sequenceLength + frame) * numChannels
-            + channel;
+            (static_cast<int64_t>(batch) * sequenceLength + frame) * numChannels + channel;
         *reinterpret_cast<Packed*>(output + outputIndex) = value0;
         if (frame + 1 < sequenceLength)
         {
@@ -443,9 +409,9 @@ __global__ void zipformerConvolutionAdjacentFrames(
 }
 
 template <typename T>
-__device__ __forceinline__ PackedFourChannels<T> loadFourChannels(
-    T const* x, int32_t batch, int64_t frame, int32_t validLength,
-    int32_t sequenceLength, int32_t numChannels, int32_t channel)
+__device__ __forceinline__ PackedFourChannels<T> loadFourChannels(T const* x, int32_t batch,
+    int64_t frame, int32_t validLength, int32_t sequenceLength, int32_t numChannels,
+    int32_t channel)
 {
     using Packed = PackedFourChannels<T>;
     if (frame < 0 || frame >= validLength)
@@ -453,8 +419,7 @@ __device__ __forceinline__ PackedFourChannels<T> loadFourChannels(
         return {};
     }
     int64_t const inputIndex =
-        (static_cast<int64_t>(batch) * sequenceLength + frame) * numChannels
-        + channel;
+        (static_cast<int64_t>(batch) * sequenceLength + frame) * numChannels + channel;
     return *reinterpret_cast<Packed const*>(x + inputIndex);
 }
 
@@ -466,10 +431,9 @@ __device__ __forceinline__ PackedFourChannels<T> loadFourChannels(
 // extra accumulators can trade cache traffic for register pressure differently
 // across sequence lengths and GPU families.
 template <typename T>
-__global__ void zipformerConvolutionFourFrames(
-    T const* __restrict__ x, int32_t const* __restrict__ validLengths,
-    T const* __restrict__ weight, T const* __restrict__ bias,
-    int64_t numElements, int32_t sequenceLength, int32_t numChannels,
+__global__ void zipformerConvolutionFourFrames(T const* __restrict__ x,
+    int32_t const* __restrict__ validLengths, T const* __restrict__ weight,
+    T const* __restrict__ bias, int64_t numElements, int32_t sequenceLength, int32_t numChannels,
     int32_t kernelSize, T* __restrict__ output)
 {
     using Ops = LowPrecisionOps<T>;
@@ -477,18 +441,17 @@ __global__ void zipformerConvolutionFourFrames(
     int32_t const channelGroups = numChannels / 4;
     int32_t const frameGroups = sequenceLength / 4 + (sequenceLength % 4 != 0);
     for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
+        index < numElements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
     {
         int32_t const channel = static_cast<int32_t>(index % channelGroups) * 4;
         int64_t const frameGroupIndex = index / channelGroups;
-        int32_t const frame =
-            static_cast<int32_t>(frameGroupIndex % frameGroups) * 4;
-        int32_t const batch =
-            static_cast<int32_t>(frameGroupIndex / frameGroups);
+        int32_t const frame = static_cast<int32_t>(frameGroupIndex % frameGroups) * 4;
+        int32_t const batch = static_cast<int32_t>(frameGroupIndex / frameGroups);
         int32_t const requestedLength = validLengths[batch];
-        int32_t const validLength = requestedLength < 0
-            ? 0
-            : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
+        int32_t const validLength =
+            requestedLength < 0
+                ? 0
+                : (requestedLength < sequenceLength ? requestedLength : sequenceLength);
         int32_t const padding = kernelSize / 2;
         Packed value0 = *reinterpret_cast<Packed const*>(bias + channel);
         Packed value1 = value0;
@@ -497,36 +460,28 @@ __global__ void zipformerConvolutionFourFrames(
 
         int64_t inputFrame = static_cast<int64_t>(frame) - padding;
         Packed inputValue0 = loadFourChannels(
-            x, batch, inputFrame, validLength, sequenceLength, numChannels,
-            channel);
+            x, batch, inputFrame, validLength, sequenceLength, numChannels, channel);
         Packed inputValue1 = loadFourChannels(
-            x, batch, inputFrame + 1, validLength, sequenceLength,
-            numChannels, channel);
+            x, batch, inputFrame + 1, validLength, sequenceLength, numChannels, channel);
         Packed inputValue2 = loadFourChannels(
-            x, batch, inputFrame + 2, validLength, sequenceLength,
-            numChannels, channel);
+            x, batch, inputFrame + 2, validLength, sequenceLength, numChannels, channel);
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
         {
             Packed const inputValue3 = loadFourChannels(
-                x, batch, inputFrame + 3, validLength, sequenceLength,
-                numChannels, channel);
+                x, batch, inputFrame + 3, validLength, sequenceLength, numChannels, channel);
             Packed const weightValue = *reinterpret_cast<Packed const*>(
                 weight + static_cast<int64_t>(kernel) * numChannels + channel);
 #pragma unroll
             for (int32_t pair = 0; pair < 2; ++pair)
             {
                 value0.values[pair] = Ops::fma(
-                    inputValue0.values[pair], weightValue.values[pair],
-                    value0.values[pair]);
+                    inputValue0.values[pair], weightValue.values[pair], value0.values[pair]);
                 value1.values[pair] = Ops::fma(
-                    inputValue1.values[pair], weightValue.values[pair],
-                    value1.values[pair]);
+                    inputValue1.values[pair], weightValue.values[pair], value1.values[pair]);
                 value2.values[pair] = Ops::fma(
-                    inputValue2.values[pair], weightValue.values[pair],
-                    value2.values[pair]);
+                    inputValue2.values[pair], weightValue.values[pair], value2.values[pair]);
                 value3.values[pair] = Ops::fma(
-                    inputValue3.values[pair], weightValue.values[pair],
-                    value3.values[pair]);
+                    inputValue3.values[pair], weightValue.values[pair], value3.values[pair]);
             }
             inputValue0 = inputValue1;
             inputValue1 = inputValue2;
@@ -543,8 +498,7 @@ __global__ void zipformerConvolutionFourFrames(
             value3.values[pair] = swooshRPair<T>(value3.values[pair]);
         }
         int64_t const outputIndex =
-            (static_cast<int64_t>(batch) * sequenceLength + frame) * numChannels
-            + channel;
+            (static_cast<int64_t>(batch) * sequenceLength + frame) * numChannels + channel;
         *reinterpret_cast<Packed*>(output + outputIndex) = value0;
         if (frame + 1 < sequenceLength)
         {
@@ -552,41 +506,35 @@ __global__ void zipformerConvolutionFourFrames(
         }
         if (frame + 2 < sequenceLength)
         {
-            *reinterpret_cast<Packed*>(output + outputIndex + 2LL * numChannels)
-                = value2;
+            *reinterpret_cast<Packed*>(output + outputIndex + 2LL * numChannels) = value2;
         }
         if (frame + 3 < sequenceLength)
         {
-            *reinterpret_cast<Packed*>(output + outputIndex + 3LL * numChannels)
-                = value3;
+            *reinterpret_cast<Packed*>(output + outputIndex + 3LL * numChannels) = value3;
         }
     }
 }
 
 template <typename T>
-void launchLowPrecisionConvolution(T const* x,
-    int32_t const* validLengths, T const* weight, T const* bias,
-    T* output, LowPrecisionKernel kernel, uint32_t blocks,
-    uint32_t threads, int64_t numElements, int32_t sequenceLength,
-    int32_t numChannels, int32_t kernelSize, cudaStream_t stream)
+void launchLowPrecisionConvolution(T const* x, int32_t const* validLengths, T const* weight,
+    T const* bias, T* output, LowPrecisionKernel kernel, uint32_t blocks, uint32_t threads,
+    int64_t numElements, int32_t sequenceLength, int32_t numChannels, int32_t kernelSize,
+    cudaStream_t stream)
 {
     if (kernel == LowPrecisionKernel::kFourFrames)
     {
-        zipformerConvolutionFourFrames<T>
-            <<<blocks, threads, 0, stream>>>(x, validLengths, weight, bias,
-                numElements, sequenceLength, numChannels, kernelSize, output);
+        zipformerConvolutionFourFrames<T><<<blocks, threads, 0, stream>>>(x, validLengths, weight,
+            bias, numElements, sequenceLength, numChannels, kernelSize, output);
     }
     else if (kernel == LowPrecisionKernel::kAdjacentFrames)
     {
-        zipformerConvolutionAdjacentFrames<T>
-            <<<blocks, threads, 0, stream>>>(x, validLengths, weight, bias,
-                numElements, sequenceLength, numChannels, kernelSize, output);
+        zipformerConvolutionAdjacentFrames<T><<<blocks, threads, 0, stream>>>(x, validLengths,
+            weight, bias, numElements, sequenceLength, numChannels, kernelSize, output);
     }
     else
     {
-        zipformerConvolutionPair<T>
-            <<<blocks, threads, 0, stream>>>(x, validLengths, weight, bias,
-                numElements, sequenceLength, numChannels, kernelSize, output);
+        zipformerConvolutionPair<T><<<blocks, threads, 0, stream>>>(x, validLengths, weight, bias,
+            numElements, sequenceLength, numChannels, kernelSize, output);
     }
 }
 
@@ -596,68 +544,51 @@ void launchLowPrecisionConvolution(T const* x,
 // only one implementation family, avoiding duplicate timings for identical
 // launches. FP32 always uses its float4 kernel because CUDA has no packed float
 // pair intrinsic analogous to half2 or bfloat162.
-class ZipformerConvolutionPlugin final : public IPluginV3, public IPluginV3OneCore,
-                                        public IPluginV3OneBuild, public IPluginV3OneRuntime
+class ZipformerConvolutionPlugin final : public IPluginV3,
+                                         public IPluginV3OneCore,
+                                         public IPluginV3OneBuild,
+                                         public IPluginV3OneRuntime
 {
-public:
+  public:
     ZipformerConvolutionPlugin() noexcept = default;
 
-    ZipformerConvolutionPlugin(
-        int32_t tactic, bool supportsFourFrameTactic) noexcept
-        : mTactic(tactic), mSupportsFourFrameTactic(supportsFourFrameTactic) {}
+    ZipformerConvolutionPlugin(int32_t tactic, bool supportsFourFrameTactic) noexcept
+        : mTactic(tactic), mSupportsFourFrameTactic(supportsFourFrameTactic)
+    {
+    }
 
     IPluginCapability* getCapabilityInterface(PluginCapabilityType type) noexcept override
     {
         switch (type)
         {
-        case PluginCapabilityType::kBUILD:
-            return static_cast<IPluginV3OneBuild*>(this);
-        case PluginCapabilityType::kRUNTIME:
-            return static_cast<IPluginV3OneRuntime*>(this);
-        case PluginCapabilityType::kCORE:
-            return static_cast<IPluginV3OneCore*>(this);
+        case PluginCapabilityType::kBUILD: return static_cast<IPluginV3OneBuild*>(this);
+        case PluginCapabilityType::kRUNTIME: return static_cast<IPluginV3OneRuntime*>(this);
+        case PluginCapabilityType::kCORE: return static_cast<IPluginV3OneCore*>(this);
         default: return nullptr;
         }
     }
 
     IPluginV3* clone() noexcept override
     {
-        return new (std::nothrow) ZipformerConvolutionPlugin(
-            mTactic, mSupportsFourFrameTactic);
+        return new (std::nothrow) ZipformerConvolutionPlugin(mTactic, mSupportsFourFrameTactic);
     }
 
-    char const* getPluginName() const noexcept override
-    {
-        return kPluginName;
-    }
+    char const* getPluginName() const noexcept override { return kPluginName; }
 
-    char const* getPluginVersion() const noexcept override
-    {
-        return kPluginVersion;
-    }
+    char const* getPluginVersion() const noexcept override { return kPluginVersion; }
 
-    char const* getPluginNamespace() const noexcept override
-    {
-        return kPluginNamespace;
-    }
+    char const* getPluginNamespace() const noexcept override { return kPluginNamespace; }
 
-    int32_t getNbOutputs() const noexcept override
-    {
-        return kOutputCount;
-    }
+    int32_t getNbOutputs() const noexcept override { return kOutputCount; }
 
-    int32_t configurePlugin(DynamicPluginTensorDesc const* inputs,
-        int32_t nbInputs, DynamicPluginTensorDesc const* outputs,
-        int32_t nbOutputs) noexcept override
+    int32_t configurePlugin(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+        DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) noexcept override
     {
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
             || nbOutputs != kOutputCount || inputs[0].desc.dims.nbDims != 3
-            || inputs[1].desc.dims.nbDims != 1
-            || inputs[2].desc.dims.nbDims != 2
-            || inputs[3].desc.dims.nbDims != 1
-            || outputs[0].desc.dims.nbDims != 3
-            || !isSupportedDataType(inputs[0].desc.type)
-            || inputs[1].desc.type != DataType::kINT32
+            || inputs[1].desc.dims.nbDims != 1 || inputs[2].desc.dims.nbDims != 2
+            || inputs[3].desc.dims.nbDims != 1 || outputs[0].desc.dims.nbDims != 3
+            || !isSupportedDataType(inputs[0].desc.type) || inputs[1].desc.type != DataType::kINT32
             || outputs[0].desc.type != inputs[0].desc.type
             || outputs[0].desc.format != TensorFormat::kLINEAR)
         {
@@ -685,12 +616,9 @@ public:
             optInputs[index] = inputs[index].opt;
             maxInputs[index] = inputs[index].max;
         }
-        bool const valid = haveValidShapes(
-                               minInputs, outputs[0].min, inputs[0].desc.type)
-                && haveValidShapes(
-                    optInputs, outputs[0].opt, inputs[0].desc.type)
-                && haveValidShapes(
-                    maxInputs, outputs[0].max, inputs[0].desc.type);
+        bool const valid = haveValidShapes(minInputs, outputs[0].min, inputs[0].desc.type)
+                           && haveValidShapes(optInputs, outputs[0].opt, inputs[0].desc.type)
+                           && haveValidShapes(maxInputs, outputs[0].max, inputs[0].desc.type);
         if (!valid)
         {
             return 1;
@@ -698,19 +626,17 @@ public:
         // Tactics are timed at the profile's optimization shape. Runtime shapes
         // that cannot use the four-frame layout safely fall back to the packed
         // pair kernel in enqueue().
-        mSupportsFourFrameTactic = inputs[0].desc.type != DataType::kFLOAT
-            && inputs[0].opt.d[2] % 4 == 0;
+        mSupportsFourFrameTactic =
+            inputs[0].desc.type != DataType::kFLOAT && inputs[0].opt.d[2] % 4 == 0;
         return 0;
     }
 
-    int32_t getOutputDataTypes(DataType* outputTypes, int32_t nbOutputs,
-        DataType const* inputTypes, int32_t nbInputs) const noexcept override
+    int32_t getOutputDataTypes(DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes,
+        int32_t nbInputs) const noexcept override
     {
-        if (outputTypes == nullptr || inputTypes == nullptr
-            || nbInputs != kInputCount || nbOutputs != kOutputCount
-            || !isSupportedDataType(inputTypes[0])
-            || inputTypes[1] != DataType::kINT32
-            || inputTypes[2] != inputTypes[0]
+        if (outputTypes == nullptr || inputTypes == nullptr || nbInputs != kInputCount
+            || nbOutputs != kOutputCount || !isSupportedDataType(inputTypes[0])
+            || inputTypes[1] != DataType::kINT32 || inputTypes[2] != inputTypes[0]
             || inputTypes[3] != inputTypes[0])
         {
             return 1;
@@ -719,18 +645,15 @@ public:
         return 0;
     }
 
-    int32_t getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
-        DimsExprs const* shapeInputs, int32_t nbShapeInputs,
-        DimsExprs* outputs, int32_t nbOutputs,
+    int32_t getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* shapeInputs,
+        int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs,
         IExprBuilder&) noexcept override
     {
         static_cast<void>(shapeInputs);
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount || nbShapeInputs != 0
-            || inputs[0].nbDims != 3 || inputs[0].d[0] == nullptr
-            || inputs[0].d[1] == nullptr || inputs[0].d[2] == nullptr
-            || inputs[1].nbDims != 1 || inputs[2].nbDims != 2
-            || inputs[3].nbDims != 1)
+            || nbOutputs != kOutputCount || nbShapeInputs != 0 || inputs[0].nbDims != 3
+            || inputs[0].d[0] == nullptr || inputs[0].d[1] == nullptr || inputs[0].d[2] == nullptr
+            || inputs[1].nbDims != 1 || inputs[2].nbDims != 2 || inputs[3].nbDims != 1)
         {
             return 1;
         }
@@ -741,8 +664,7 @@ public:
     bool supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut,
         int32_t nbInputs, int32_t nbOutputs) noexcept override
     {
-        if (inOut == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount || pos < 0
+        if (inOut == nullptr || nbInputs != kInputCount || nbOutputs != kOutputCount || pos < 0
             || pos >= kInputCount + kOutputCount)
         {
             return false;
@@ -756,21 +678,19 @@ public:
         {
             return desc.type == DataType::kINT32;
         }
-        return isSupportedDataType(desc.type)
-            && (pos == 0 || desc.type == inOut[0].desc.type);
+        return isSupportedDataType(desc.type) && (pos == 0 || desc.type == inOut[0].desc.type);
     }
 
-    size_t getWorkspaceSize(DynamicPluginTensorDesc const*, int32_t,
-        DynamicPluginTensorDesc const*, int32_t) const noexcept override
+    size_t getWorkspaceSize(DynamicPluginTensorDesc const*, int32_t, DynamicPluginTensorDesc const*,
+        int32_t) const noexcept override
     {
         return 0;
     }
 
     int32_t getNbTactics() noexcept override
     {
-        return mSupportsFourFrameTactic
-            ? static_cast<int32_t>(kTactics.size())
-            : static_cast<int32_t>(kSingleImplementationTactics.size());
+        return mSupportsFourFrameTactic ? static_cast<int32_t>(kTactics.size())
+                                        : static_cast<int32_t>(kSingleImplementationTactics.size());
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
@@ -779,8 +699,7 @@ public:
         {
             return writeConvolutionTactics(kTactics, tactics, nbTactics);
         }
-        return writeConvolutionTactics(
-            kSingleImplementationTactics, tactics, nbTactics);
+        return writeConvolutionTactics(kSingleImplementationTactics, tactics, nbTactics);
     }
 
     int32_t setTactic(int32_t tactic) noexcept override
@@ -805,12 +724,9 @@ public:
         PluginTensorDesc const* outputs, int32_t nbOutputs) noexcept override
     {
         if (inputs == nullptr || outputs == nullptr || nbInputs != kInputCount
-            || nbOutputs != kOutputCount
-            || !isSupportedDataType(inputs[0].type)
-            || inputs[1].type != DataType::kINT32
-            || outputs[0].type != inputs[0].type
-            || outputs[0].format != TensorFormat::kLINEAR
-            || !isValidTactic(mTactic))
+            || nbOutputs != kOutputCount || !isSupportedDataType(inputs[0].type)
+            || inputs[1].type != DataType::kINT32 || outputs[0].type != inputs[0].type
+            || outputs[0].format != TensorFormat::kLINEAR || !isValidTactic(mTactic))
         {
             return 1;
         }
@@ -828,20 +744,18 @@ public:
             inputShapes[index] = inputs[index].dims;
         }
         return inputs[1].format == TensorFormat::kLINEAR
-                && haveValidShapes(
-                    inputShapes, outputs[0].dims, inputs[0].type)
-            ? 0
-            : 1;
+                       && haveValidShapes(inputShapes, outputs[0].dims, inputs[0].type)
+                   ? 0
+                   : 1;
     }
 
-    int32_t enqueue(PluginTensorDesc const* inputDesc,
-        PluginTensorDesc const* outputDesc,
+    int32_t enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace,
         cudaStream_t stream) noexcept override
     {
         static_cast<void>(workspace);
-        if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr
-            || outputs == nullptr || outputs[0] == nullptr)
+        if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr || outputs == nullptr
+            || outputs[0] == nullptr)
         {
             return 1;
         }
@@ -856,9 +770,7 @@ public:
         // TensorRT calls onShapeChange before enqueue. Rechecking here keeps the
         // memory-safety contract local to the launch when a runtime invokes the
         // plugin outside the usual execution-context lifecycle.
-        if (onShapeChange(
-                inputDesc, kInputCount, outputDesc, kOutputCount)
-            != 0)
+        if (onShapeChange(inputDesc, kInputCount, outputDesc, kOutputCount) != 0)
         {
             return 1;
         }
@@ -871,91 +783,68 @@ public:
         }
 
         int32_t const batch = static_cast<int32_t>(inputDesc[0].dims.d[0]);
-        int32_t const sequenceLength =
-            static_cast<int32_t>(inputDesc[0].dims.d[1]);
-        int32_t const numChannels =
-            static_cast<int32_t>(inputDesc[0].dims.d[2]);
-        int32_t const kernelSize =
-            static_cast<int32_t>(inputDesc[2].dims.d[0]);
+        int32_t const sequenceLength = static_cast<int32_t>(inputDesc[0].dims.d[1]);
+        int32_t const numChannels = static_cast<int32_t>(inputDesc[0].dims.d[2]);
+        int32_t const kernelSize = static_cast<int32_t>(inputDesc[2].dims.d[0]);
         bool const fourFrameTactic = mTactic >= kFourFrameTacticOffset;
-        bool const adjacentFrameTactic = !fourFrameTactic
-            && mTactic >= kAdjacentFrameTacticOffset;
-        bool const useFourFrameKernel = fourFrameTactic
-            && inputDesc[0].type != DataType::kFLOAT
-            && numChannels % 4 == 0;
-        bool const useAdjacentFrameKernel = !useFourFrameKernel
-            && adjacentFrameTactic
-            && inputDesc[0].type != DataType::kFLOAT
-            && numChannels % 8 == 0;
-        LowPrecisionKernel const lowPrecisionKernel = useFourFrameKernel
-            ? LowPrecisionKernel::kFourFrames
-            : (useAdjacentFrameKernel ? LowPrecisionKernel::kAdjacentFrames
-                                      : LowPrecisionKernel::kPair);
-        int32_t const width = useFourFrameKernel
-            ? 4
-            : (useAdjacentFrameKernel ? 8 : vectorWidth(inputDesc[0].type));
-        int32_t const temporalElements = useFourFrameKernel
-            ? sequenceLength / 4 + (sequenceLength % 4 != 0)
-            : (useAdjacentFrameKernel
-                    ? sequenceLength / 2 + sequenceLength % 2
-                    : sequenceLength);
-        int64_t const numElements = static_cast<int64_t>(batch)
-            * temporalElements * (numChannels / width);
-        int32_t const tacticOffset = fourFrameTactic
-            ? kFourFrameTacticOffset
-            : kAdjacentFrameTacticOffset;
+        bool const adjacentFrameTactic = !fourFrameTactic && mTactic >= kAdjacentFrameTacticOffset;
+        bool const useFourFrameKernel =
+            fourFrameTactic && inputDesc[0].type != DataType::kFLOAT && numChannels % 4 == 0;
+        bool const useAdjacentFrameKernel = !useFourFrameKernel && adjacentFrameTactic
+                                            && inputDesc[0].type != DataType::kFLOAT
+                                            && numChannels % 8 == 0;
+        LowPrecisionKernel const lowPrecisionKernel =
+            useFourFrameKernel ? LowPrecisionKernel::kFourFrames
+                               : (useAdjacentFrameKernel ? LowPrecisionKernel::kAdjacentFrames
+                                                         : LowPrecisionKernel::kPair);
+        int32_t const width =
+            useFourFrameKernel ? 4 : (useAdjacentFrameKernel ? 8 : vectorWidth(inputDesc[0].type));
+        int32_t const temporalElements =
+            useFourFrameKernel ? sequenceLength / 4 + (sequenceLength % 4 != 0)
+                               : (useAdjacentFrameKernel ? sequenceLength / 2 + sequenceLength % 2
+                                                         : sequenceLength);
+        int64_t const numElements =
+            static_cast<int64_t>(batch) * temporalElements * (numChannels / width);
+        int32_t const tacticOffset =
+            fourFrameTactic ? kFourFrameTacticOffset : kAdjacentFrameTacticOffset;
         int32_t const threads = mTactic - tacticOffset;
-        int64_t const requiredBlocks =
-            numElements / threads + (numElements % threads != 0);
-        uint32_t const blocks = static_cast<uint32_t>(
-            std::min<int64_t>(kMaxBlocks, requiredBlocks));
+        int64_t const requiredBlocks = numElements / threads + (numElements % threads != 0);
+        uint32_t const blocks =
+            static_cast<uint32_t>(std::min<int64_t>(kMaxBlocks, requiredBlocks));
         uint32_t const launchThreads = static_cast<uint32_t>(threads);
         if (inputDesc[0].type == DataType::kHALF)
         {
-            launchLowPrecisionConvolution(
-                static_cast<half const*>(inputs[0]),
-                static_cast<int32_t const*>(inputs[1]),
-                static_cast<half const*>(inputs[2]),
-                static_cast<half const*>(inputs[3]),
-                static_cast<half*>(outputs[0]), lowPrecisionKernel,
-                blocks, launchThreads, numElements, sequenceLength, numChannels,
+            launchLowPrecisionConvolution(static_cast<half const*>(inputs[0]),
+                static_cast<int32_t const*>(inputs[1]), static_cast<half const*>(inputs[2]),
+                static_cast<half const*>(inputs[3]), static_cast<half*>(outputs[0]),
+                lowPrecisionKernel, blocks, launchThreads, numElements, sequenceLength, numChannels,
                 kernelSize, stream);
         }
         else if (inputDesc[0].type == DataType::kBF16)
         {
-            launchLowPrecisionConvolution(
-                static_cast<__nv_bfloat16 const*>(inputs[0]),
+            launchLowPrecisionConvolution(static_cast<__nv_bfloat16 const*>(inputs[0]),
                 static_cast<int32_t const*>(inputs[1]),
                 static_cast<__nv_bfloat16 const*>(inputs[2]),
                 static_cast<__nv_bfloat16 const*>(inputs[3]),
-                static_cast<__nv_bfloat16*>(outputs[0]),
-                lowPrecisionKernel, blocks, launchThreads, numElements,
-                sequenceLength, numChannels, kernelSize, stream);
+                static_cast<__nv_bfloat16*>(outputs[0]), lowPrecisionKernel, blocks, launchThreads,
+                numElements, sequenceLength, numChannels, kernelSize, stream);
         }
         else
         {
             zipformerConvolutionFloat4<<<blocks, launchThreads, 0, stream>>>(
-                static_cast<float const*>(inputs[0]),
-                static_cast<int32_t const*>(inputs[1]),
-                static_cast<float const*>(inputs[2]),
-                static_cast<float const*>(inputs[3]), numElements,
-                sequenceLength, numChannels, kernelSize,
+                static_cast<float const*>(inputs[0]), static_cast<int32_t const*>(inputs[1]),
+                static_cast<float const*>(inputs[2]), static_cast<float const*>(inputs[3]),
+                numElements, sequenceLength, numChannels, kernelSize,
                 static_cast<float*>(outputs[0]));
         }
         return cudaGetLastError() == cudaSuccess ? 0 : 1;
     }
 
-    IPluginV3* attachToContext(IPluginResourceContext*) noexcept override
-    {
-        return clone();
-    }
+    IPluginV3* attachToContext(IPluginResourceContext*) noexcept override { return clone(); }
 
-    PluginFieldCollection const* getFieldsToSerialize() noexcept override
-    {
-        return &mFields;
-    }
+    PluginFieldCollection const* getFieldsToSerialize() noexcept override { return &mFields; }
 
-private:
+  private:
     int32_t mTactic{kDefaultTactic};
     bool mSupportsFourFrameTactic{false};
     PluginFieldCollection mFields{};
@@ -963,29 +852,16 @@ private:
 
 class ZipformerConvolutionPluginCreator final : public IPluginCreatorV3One
 {
-public:
-    char const* getPluginName() const noexcept override
-    {
-        return kPluginName;
-    }
+  public:
+    char const* getPluginName() const noexcept override { return kPluginName; }
 
-    char const* getPluginVersion() const noexcept override
-    {
-        return kPluginVersion;
-    }
+    char const* getPluginVersion() const noexcept override { return kPluginVersion; }
 
-    char const* getPluginNamespace() const noexcept override
-    {
-        return kPluginNamespace;
-    }
+    char const* getPluginNamespace() const noexcept override { return kPluginNamespace; }
 
-    PluginFieldCollection const* getFieldNames() noexcept override
-    {
-        return &mFields;
-    }
+    PluginFieldCollection const* getFieldNames() noexcept override { return &mFields; }
 
-    IPluginV3* createPlugin(char const* name,
-        PluginFieldCollection const* fields,
+    IPluginV3* createPlugin(char const* name, PluginFieldCollection const* fields,
         TensorRTPhase phase) noexcept override
     {
         static_cast<void>(name);
@@ -999,7 +875,7 @@ public:
         return new (std::nothrow) ZipformerConvolutionPlugin();
     }
 
-private:
+  private:
     PluginFieldCollection mFields{};
 };
 } // namespace
@@ -1013,28 +889,24 @@ extern "C" bool initFastGpuAsrZipformerConvolutionPlugin() noexcept
     // creator as success so repeated package imports remain idempotent.
     static ZipformerConvolutionPluginCreator runtimeCreator;
     static ZipformerConvolutionPluginCreator builderCreator;
-    auto ensureRegistered = [](IPluginRegistry* registry,
-                                ZipformerConvolutionPluginCreator& creator) noexcept {
+    auto ensureRegistered =
+        [](IPluginRegistry* registry, ZipformerConvolutionPluginCreator& creator) noexcept
+    {
         if (registry == nullptr)
         {
             return false;
         }
-        if (registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace)
-            != nullptr)
+        if (registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace) != nullptr)
         {
             return true;
         }
         return registry->registerCreator(creator, kPluginNamespace)
-            || registry->getCreator(kPluginName, kPluginVersion,
-                   kPluginNamespace)
-                != nullptr;
+               || registry->getCreator(kPluginName, kPluginVersion, kPluginNamespace) != nullptr;
     };
 
-    bool const runtimeRegistered =
-        ensureRegistered(getPluginRegistry(), runtimeCreator);
-    auto* builderRegistry = nvinfer1::getBuilderPluginRegistry(
-        nvinfer1::EngineCapability::kSTANDARD);
-    bool const builderRegistered =
-        ensureRegistered(builderRegistry, builderCreator);
+    bool const runtimeRegistered = ensureRegistered(getPluginRegistry(), runtimeCreator);
+    auto* builderRegistry =
+        nvinfer1::getBuilderPluginRegistry(nvinfer1::EngineCapability::kSTANDARD);
+    bool const builderRegistered = ensureRegistered(builderRegistry, builderCreator);
     return runtimeRegistered && builderRegistered;
 }

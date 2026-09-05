@@ -66,9 +66,7 @@ def tensor_to_numpy(tensor: torch.Tensor) -> np.typing.NDArray:
 
 
 @pytest.mark.parametrize("activation_type", (SwooshL, SwooshR))
-def test_swoosh_is_checkpoint_stateless(
-    activation_type: type[torch.nn.Module],
-) -> None:
+def test_swoosh_is_checkpoint_stateless(activation_type: type[torch.nn.Module]) -> None:
     activation = activation_type()
 
     assert tuple(activation.named_parameters()) == ()
@@ -208,10 +206,7 @@ def test_swoosh_onnx_contract(
         )
 
 
-@pytest.mark.parametrize(
-    ("activation_type", "shift"),
-    ((SwooshL, 4.0), (SwooshR, 1.0)),
-)
+@pytest.mark.parametrize(("activation_type", "shift"), ((SwooshL, 4.0), (SwooshR, 1.0)))
 def test_swoosh_gradient_matches_closed_form(
     activation_type: type[torch.nn.Module], shift: float
 ) -> None:
@@ -263,9 +258,4 @@ def test_swoosh_large_finite_inputs_match_asymptotes(
     actual = activation_type()(values)
 
     assert torch.isfinite(actual).all()
-    torch.testing.assert_close(
-        actual,
-        expected,
-        rtol=torch.finfo(dtype).eps,
-        atol=0.0,
-    )
+    torch.testing.assert_close(actual, expected, rtol=torch.finfo(dtype).eps, atol=0.0)

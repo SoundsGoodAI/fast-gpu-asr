@@ -39,10 +39,7 @@ PARAKEET_SEARCH_BUFFER_PAIRS = (
 )
 
 
-def expected_token_selection_shared_memory_bytes(
-    vocab_size: int,
-    threads: int,
-) -> int:
+def expected_token_selection_shared_memory_bytes(vocab_size: int, threads: int) -> int:
     """Return storage for token scores and one reduction pair per warp.
 
     Parameters
@@ -64,10 +61,7 @@ def expected_token_selection_shared_memory_bytes(
 
 
 def expected_beam_search_shared_memory_bytes(
-    beam: int,
-    duration_count: int,
-    positive_duration_count: int,
-    threads: int,
+    beam: int, duration_count: int, positive_duration_count: int, threads: int
 ) -> int:
     """Return storage for expanded candidates, reductions, and selected pairs.
 
@@ -199,10 +193,7 @@ def test_parakeet_token_selection_keeps_nonfinite_indexes_in_bounds(
         pytest.param(np.dtype(np.float32), np.int32(0), id="encoder-fp32"),
         pytest.param(np.dtype(np.float16), np.int32(1), id="encoder-fp16"),
         pytest.param(
-            cp.dtype("bfloat16"),
-            np.int32(2),
-            marks=pytest.mark.sm80,
-            id="encoder-bf16",
+            cp.dtype("bfloat16"), np.int32(2), marks=pytest.mark.sm80, id="encoder-bf16"
         ),
     ),
 )
@@ -212,10 +203,7 @@ def test_parakeet_token_selection_keeps_nonfinite_indexes_in_bounds(
         pytest.param(np.dtype(np.float32), np.int32(0), id="decoder-fp32"),
         pytest.param(np.dtype(np.float16), np.int32(1), id="decoder-fp16"),
         pytest.param(
-            cp.dtype("bfloat16"),
-            np.int32(2),
-            marks=pytest.mark.sm80,
-            id="decoder-bf16",
+            cp.dtype("bfloat16"), np.int32(2), marks=pytest.mark.sm80, id="decoder-bf16"
         ),
     ),
 )
@@ -555,10 +543,7 @@ def test_parakeet_decoder_rejects_recurrent_state_binding_failure() -> None:
     decoder.decoder = context
 
     with pytest.raises(ASRInferenceError, match="recurrent-state input"):
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.array([1], dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32))
     decoder.stream.synchronize()
 
     assert context.binding_names == ["input_states_1", "input_states_2"]
@@ -573,10 +558,7 @@ def test_parakeet_decoder_restores_buffers_after_runtime_binding_failure() -> No
     context.rejected_binding_call = 3
 
     with pytest.raises(ASRInferenceError, match="recurrent-state input"):
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.array([1], dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32))
     decoder.stream.synchronize()
 
     assert len(context.binding_names) == 6
@@ -589,8 +571,7 @@ def test_parakeet_decoder_returns_empty_results_for_zero_frames() -> None:
     decoder = make_fake_parakeet_decoder(batch_size=2)
 
     token_ids, timestamps = decoder(
-        cp.empty((1, 0, 3), dtype=np.float32),
-        cp.zeros(1, dtype=np.int32),
+        cp.empty((1, 0, 3), dtype=np.float32), cp.zeros(1, dtype=np.int32)
     )
 
     assert token_ids == [[]]
@@ -603,10 +584,7 @@ def test_parakeet_decoder_reports_tensorrt_execution_failure() -> None:
     decoder.decoder = RuntimeDecoderContext(decoder, lambda _call: False)
 
     with pytest.raises(ASRInferenceError, match="TensorRT decoder execution failed"):
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
     decoder.stream.synchronize()
 
 
@@ -634,22 +612,13 @@ def test_parakeet_decoder_propagates_non_capture_driver_errors(
     failure = FakeDriverError(901)
     failing_kernel = Mock(side_effect=failure)
     monkeypatch.setattr(
-        parakeet_decoder.cp.cuda.driver,
-        "CUDADriverError",
-        FakeDriverError,
+        parakeet_decoder.cp.cuda.driver, "CUDADriverError", FakeDriverError
     )
-    monkeypatch.setattr(
-        parakeet_decoder,
-        "TDT_SELECT_TOKENS_KERNEL",
-        failing_kernel,
-    )
+    monkeypatch.setattr(parakeet_decoder, "TDT_SELECT_TOKENS_KERNEL", failing_kernel)
     install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [-2.0, 0.0])
 
     with pytest.raises(FakeDriverError) as error:
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
     decoder.stream.synchronize()
 
     assert error.value is failure
@@ -686,10 +655,7 @@ def test_parakeet_decoder_restores_buffers_after_execution_failure() -> None:
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     with pytest.raises(ASRInferenceError, match="TensorRT decoder execution failed"):
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
     decoder.stream.synchronize()
 
     for name, original_buffer in original_buffers.items():
@@ -760,10 +726,7 @@ def test_parakeet_decoder_restores_buffers_after_captured_binding_failure() -> N
     context = RejectingContext()
     decoder.decoder = context
     with pytest.raises(ASRInferenceError, match="recurrent-state input"):
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
     decoder.stream.synchronize()
 
     assert context.capture_bindings == ["input_states_1", "input_states_2"]
@@ -773,18 +736,13 @@ def test_parakeet_decoder_restores_buffers_after_captured_binding_failure() -> N
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("invalid_score", (-np.inf, np.nan))
-def test_parakeet_decoder_handles_nonfinite_search_scores(
-    invalid_score: float,
-) -> None:
+def test_parakeet_decoder_handles_nonfinite_search_scores(invalid_score: float) -> None:
     decoder = make_fake_parakeet_decoder(beam=2)
     install_static_decoder_context(
-        decoder,
-        [[invalid_score] * 3] * 2,
-        [[invalid_score] * 2] * 2,
+        decoder, [[invalid_score] * 3] * 2, [[invalid_score] * 2] * 2
     )
     token_ids, timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.array([1], dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
     )
 
     assert token_ids == [[]]
@@ -796,8 +754,7 @@ def test_parakeet_decoder_emits_token_with_positive_duration() -> None:
     decoder = make_fake_parakeet_decoder()
     install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [-2.0, 0.0])
     token_ids, timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.array([1], dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
     )
 
     assert token_ids == [[1]]
@@ -837,8 +794,7 @@ def test_parakeet_decoder_timestamps_token_after_blank_advance() -> None:
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     token_ids, timestamps = decoder(
-        cp.zeros((1, 3, 3), dtype=np.float32),
-        cp.array([3], dtype=np.int32),
+        cp.zeros((1, 3, 3), dtype=np.float32), cp.array([3], dtype=np.int32)
     )
 
     assert token_ids == [[1]]
@@ -914,10 +870,7 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     encoder_output = cp.arange(9, dtype=np.float32).reshape(1, 3, 3)
-    token_ids, timestamps = decoder(
-        encoder_output,
-        cp.array([3], dtype=np.int32),
-    )
+    token_ids, timestamps = decoder(encoder_output, cp.array([3], dtype=np.int32))
 
     assert token_ids == [[1, 1]]
     np.testing.assert_allclose(timestamps, [[0.0, 0.16]])
@@ -930,13 +883,10 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
 def test_parakeet_decoder_clamps_runtime_output_lengths() -> None:
     decoder = make_fake_parakeet_decoder(batch_size=2)
     install_static_decoder_context(
-        decoder,
-        [[-10.0, 0.0, -2.0]] * 2,
-        [[-10.0, 0.0]] * 2,
+        decoder, [[-10.0, 0.0, -2.0]] * 2, [[-10.0, 0.0]] * 2
     )
     token_ids, timestamps = decoder(
-        cp.zeros((2, 2, 3), dtype=np.float32),
-        cp.array([-1, 10], dtype=np.int32),
+        cp.zeros((2, 2, 3), dtype=np.float32), cp.array([-1, 10], dtype=np.int32)
     )
 
     assert token_ids == [[], [1, 1]]
@@ -979,8 +929,7 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
     decoder.encoder_input.fill(-1.0)
     decoder.targets.fill(-1)
     token_ids, timestamps = decoder(
-        cp.array([[[1.0, 2.0, 3.0]]], dtype=np.float32),
-        cp.array([1], dtype=np.int32),
+        cp.array([[[1.0, 2.0, 3.0]]], dtype=np.float32), cp.array([1], dtype=np.int32)
     )
 
     assert token_ids == [[]]
@@ -988,8 +937,7 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
     np.testing.assert_array_equal(encoder_inputs[0][0], [1.0, 2.0, 3.0])
     np.testing.assert_array_equal(encoder_inputs[0][1:], 0.0)
     np.testing.assert_array_equal(
-        target_inputs[0],
-        np.array([[2], [0], [0], [0], [0], [0]], dtype=np.int32),
+        target_inputs[0], np.array([[2], [0], [0], [0], [0], [0]], dtype=np.int32)
     )
     np.testing.assert_array_equal(decoder.search_output_lengths.get(), [1, 0, 0])
 
@@ -1003,11 +951,7 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
         pytest.param(np.dtype(np.float16), 3, 1, id="fp16-scalar"),
         pytest.param(np.dtype(np.float16), 8, 2, id="fp16-packed-multilayer"),
         pytest.param(
-            cp.dtype("bfloat16"),
-            3,
-            1,
-            marks=pytest.mark.sm80,
-            id="bf16-scalar",
+            cp.dtype("bfloat16"), 3, 1, marks=pytest.mark.sm80, id="bf16-scalar"
         ),
         pytest.param(
             cp.dtype("bfloat16"),
@@ -1019,9 +963,7 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
     ),
 )
 def test_parakeet_decoder_routes_recurrent_state_by_emission(
-    state_dtype: np.dtype,
-    state_hidden_dim: int,
-    state_layers: int,
+    state_dtype: np.dtype, state_hidden_dim: int, state_layers: int
 ) -> None:
     decoder = make_fake_parakeet_decoder(
         state_dtype=state_dtype,
@@ -1033,10 +975,7 @@ def test_parakeet_decoder_routes_recurrent_state_by_emission(
     )
 
     state_snapshots: list[
-        tuple[
-            np.typing.NDArray[np.float32],
-            np.typing.NDArray[np.float32],
-        ]
+        tuple[np.typing.NDArray[np.float32], np.typing.NDArray[np.float32]]
     ] = []
 
     def execute(call: int) -> bool:
@@ -1073,8 +1012,7 @@ def test_parakeet_decoder_routes_recurrent_state_by_emission(
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     token_ids, timestamps = decoder(
-        cp.zeros((1, 2, 3), dtype=np.float32),
-        cp.array([2], dtype=np.int32),
+        cp.zeros((1, 2, 3), dtype=np.float32), cp.array([2], dtype=np.int32)
     )
 
     assert token_ids == [[1]]
@@ -1093,8 +1031,7 @@ def test_parakeet_decoder_blank_advances_without_emitting_token() -> None:
     decoder = make_fake_parakeet_decoder()
     context = install_static_decoder_context(decoder, [-10.0, -11.0, 0.0], [0.0, 0.0])
     token_ids, timestamps = decoder(
-        cp.zeros((1, 2, 3), dtype=np.float32),
-        cp.array([2], dtype=np.int32),
+        cp.zeros((1, 2, 3), dtype=np.float32), cp.array([2], dtype=np.int32)
     )
 
     assert token_ids == [[]]
@@ -1109,8 +1046,7 @@ def test_parakeet_decoder_limits_zero_duration_token_emissions() -> None:
     install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [0.0, -2.0])
     decoder.max_symbols_per_timestep = 2
     token_ids, timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.array([1], dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
     )
 
     assert token_ids == [[1, 1]]
@@ -1126,15 +1062,13 @@ def test_parakeet_decoder_limits_zero_duration_token_emissions() -> None:
     ids=("no-penalty", "with-penalty"),
 )
 def test_parakeet_decoder_applies_blank_penalty(
-    blank_penalty: float,
-    expected_tokens: list[int],
+    blank_penalty: float, expected_tokens: list[int]
 ) -> None:
     decoder = make_fake_parakeet_decoder()
     decoder.blank_penalty = blank_penalty
     install_static_decoder_context(decoder, [-8.0, 0.0, 0.1], [-8.0, 0.0])
     token_ids, timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.ones(1, dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
     )
 
     assert token_ids == [expected_tokens]
@@ -1145,13 +1079,10 @@ def test_parakeet_decoder_applies_blank_penalty(
 def test_parakeet_decoder_keeps_batch_token_candidates_separate() -> None:
     decoder = make_fake_parakeet_decoder(batch_size=2)
     install_static_decoder_context(
-        decoder,
-        [[-10.0, 0.0, -2.0], [0.0, -10.0, -2.0]],
-        [[-2.0, 0.0], [-2.0, 0.0]],
+        decoder, [[-10.0, 0.0, -2.0], [0.0, -10.0, -2.0]], [[-2.0, 0.0], [-2.0, 0.0]]
     )
     token_ids, timestamps = decoder(
-        cp.zeros((2, 1, 3), dtype=np.float32),
-        cp.array([1, 1], dtype=np.int32),
+        cp.zeros((2, 1, 3), dtype=np.float32), cp.array([1, 1], dtype=np.int32)
     )
 
     assert token_ids == [[1], [0]]
@@ -1175,8 +1106,7 @@ def test_parakeet_decoder_reuses_cuda_graph_across_frame_shapes() -> None:
 
     second_encoder_output = encoder_output.reshape(-1)[:36].reshape(1, 12, 3)
     second_token_ids, second_timestamps = decoder(
-        second_encoder_output,
-        cp.array([12], dtype=np.int32),
+        second_encoder_output, cp.array([12], dtype=np.int32)
     )
 
     assert first_token_ids == [[1] * 20, [1] * 15]
@@ -1190,8 +1120,7 @@ def test_parakeet_decoder_reuses_cuda_graph_across_frame_shapes() -> None:
 
     replacement_output = cp.zeros_like(second_encoder_output)
     third_token_ids, third_timestamps = decoder(
-        replacement_output,
-        cp.array([12], dtype=np.int32),
+        replacement_output, cp.array([12], dtype=np.int32)
     )
 
     assert third_token_ids == second_token_ids
@@ -1238,8 +1167,7 @@ def test_parakeet_decoder_retries_after_capture_execution_failure() -> None:
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     with pytest.warns(RuntimeWarning, match="CUDA graph capture failed"):
         token_ids, timestamps = decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
+            cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
         )
 
     assert token_ids == [[1] * 20]
@@ -1252,8 +1180,7 @@ def test_parakeet_decoder_retries_after_capture_execution_failure() -> None:
         assert getattr(decoder, name) is original_buffer
 
     subsequent_token_ids, subsequent_timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.ones(1, dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
     )
     assert subsequent_token_ids == [[1] * 20]
     np.testing.assert_allclose(subsequent_timestamps, [[0.0] * 20])
@@ -1299,8 +1226,7 @@ def test_parakeet_decoder_recovers_from_invalidated_cuda_capture() -> None:
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     with pytest.warns(RuntimeWarning, match="CUDA graph capture failed"):
         token_ids, timestamps = decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
+            cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
         )
 
     assert token_ids == [[1] * 20]
@@ -1350,9 +1276,7 @@ def test_parakeet_decoder_propagates_non_invalidation_capture_error(
             raise FakeCaptureError(17)
 
     monkeypatch.setattr(
-        parakeet_decoder.cp.cuda.runtime,
-        "CUDARuntimeError",
-        FakeCaptureError,
+        parakeet_decoder.cp.cuda.runtime, "CUDARuntimeError", FakeCaptureError
     )
     decoder.stream = FailingCaptureStream(non_blocking=True)
     install_static_decoder_context(decoder, [-10.0, 0.0, -10.0], [0.0, -10.0])
@@ -1438,8 +1362,7 @@ def test_parakeet_decoder_length_normalizes_completed_hypotheses() -> None:
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     token_ids, timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.array([1], dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
     )
 
     assert token_ids == [[1, 0]]
@@ -1479,10 +1402,7 @@ def test_parakeet_finalize_length_normalizes_active_hypotheses() -> None:
 
 
 def make_beam_search_buffers(
-    beam: int,
-    durations: tuple[int, ...],
-    token_stride: int,
-    num_frames: int,
+    beam: int, durations: tuple[int, ...], token_stride: int, num_frames: int
 ) -> SimpleNamespace:
     """Allocate a one-utterance TDT beam-search kernel fixture.
 
@@ -1641,10 +1561,7 @@ def run_beam_search(buffers: SimpleNamespace, threads: int = 256) -> None:
             np.float32(0.08),
         ),
         shared_mem=expected_beam_search_shared_memory_bytes(
-            buffers.beam,
-            duration_count,
-            positive_duration_count,
-            threads,
+            buffers.beam, duration_count, positive_duration_count, threads
         ),
     )
 
@@ -1685,8 +1602,7 @@ def test_parakeet_beam_search_merges_duplicate_blank_histories() -> None:
     run_beam_search(buffers)
 
     np.testing.assert_allclose(
-        buffers.next_scores.get()[0, 0],
-        np.logaddexp(np.float32(0.0), np.float32(-0.2)),
+        buffers.next_scores.get()[0, 0], np.logaddexp(np.float32(0.0), np.float32(-0.2))
     )
     assert np.isneginf(buffers.next_scores.get()[0, 1])
     np.testing.assert_array_equal(buffers.next_lengths.get(), [[0, 0]])
@@ -1868,9 +1784,7 @@ class RecordingParakeetContext:
     """Record TensorRT profile selection and fixed-buffer bindings."""
 
     def __init__(
-        self,
-        rejected_binding: str | None = None,
-        profile_accepted: bool = True,
+        self, rejected_binding: str | None = None, profile_accepted: bool = True
     ) -> None:
         """Initialize configurable profile and binding outcomes.
 
@@ -1959,10 +1873,7 @@ class FakeParakeetEngine:
         """
 
         self.context = context
-        self.dtypes = {
-            "encoder_output": encoder_dtype,
-            "input_states_1": state_dtype,
-        }
+        self.dtypes = {"encoder_output": encoder_dtype, "input_states_1": state_dtype}
         self.shape_requests: list[str] = []
         self.dtype_requests: list[str] = []
 
@@ -2000,9 +1911,7 @@ class FakeParakeetEngine:
         self.dtype_requests.append(name)
         return self.dtypes[name]
 
-    def create_execution_context(
-        self,
-    ) -> RecordingParakeetContext | None:
+    def create_execution_context(self) -> RecordingParakeetContext | None:
         """Return the configured fake TensorRT execution context.
 
         Returns
@@ -2094,12 +2003,7 @@ def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
 
     assert error.value is failure
     assert requested_device_ids == [4]
-    assert events == [
-        "enter_device",
-        "enter_stream",
-        "exit_stream",
-        "exit_device",
-    ]
+    assert events == ["enter_device", "enter_stream", "exit_stream", "exit_device"]
 
 
 def test_parakeet_decoder_zero_frame_call_uses_cuda_contexts() -> None:
@@ -2115,12 +2019,7 @@ def test_parakeet_decoder_zero_frame_call_uses_cuda_contexts() -> None:
 
     assert token_ids == [[]]
     assert timestamps == [[]]
-    assert events == [
-        "enter_device",
-        "enter_stream",
-        "exit_stream",
-        "exit_device",
-    ]
+    assert events == ["enter_device", "enter_stream", "exit_stream", "exit_device"]
 
 
 def construct_parakeet_decoder(stream: cp.cuda.Stream | NullCudaContext) -> None:
@@ -2171,9 +2070,7 @@ def test_parakeet_decoder_swaps_all_search_buffers_and_rebinds_states() -> None:
 
 
 @pytest.mark.parametrize("rejected_name", ("input_states_1", "input_states_2"))
-def test_parakeet_decoder_attempts_both_recurrent_bindings(
-    rejected_name: str,
-) -> None:
+def test_parakeet_decoder_attempts_both_recurrent_bindings(rejected_name: str) -> None:
     decoder = ParakeetModifiedBeamSearchDecoder.__new__(
         ParakeetModifiedBeamSearchDecoder
     )
@@ -2259,8 +2156,7 @@ def test_parakeet_decoder_rejects_malformed_inputs(
 
     with pytest.raises(ASRInferenceError, match=message):
         decoder(
-            cast(cp.ndarray, encoder_output),
-            cast(cp.ndarray, encoder_output_lengths),
+            cast(cp.ndarray, encoder_output), cast(cp.ndarray, encoder_output_lengths)
         )
 
 
@@ -2271,26 +2167,19 @@ def test_parakeet_decoder_rejects_int32_history_capacity_overflow() -> None:
     output_lengths = np.full(2, 2, dtype=np.int32)
 
     with pytest.raises(ASRInferenceError, match="signed 32-bit kernel indexing"):
-        decoder(
-            cast(cp.ndarray, encoder_output),
-            cast(cp.ndarray, output_lengths),
-        )
+        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
 
 
 def test_parakeet_decoder_rejects_int32_encoder_capacity_overflow() -> None:
     decoder = make_parakeet_validation_decoder()
     max_frames = INT32_MAX // (decoder.batch_size * decoder.encoder_dim) + 1
     encoder_output = FakeCudaArray(
-        (decoder.batch_size, max_frames, decoder.encoder_dim),
-        np.dtype(np.float32),
+        (decoder.batch_size, max_frames, decoder.encoder_dim), np.dtype(np.float32)
     )
     output_lengths = FakeCudaArray((decoder.batch_size,), np.dtype(np.int32))
 
     with pytest.raises(ASRInferenceError, match="signed 32-bit kernel indexing"):
-        decoder(
-            cast(cp.ndarray, encoder_output),
-            cast(cp.ndarray, output_lengths),
-        )
+        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
 
 
 @pytest.mark.cuda
@@ -2299,12 +2188,7 @@ def test_parakeet_decoder_rejects_int32_encoder_capacity_overflow() -> None:
     (
         pytest.param(trt.float32, trt.float16, id="fp32-encoder-fp16-state"),
         pytest.param(trt.float16, trt.float32, id="fp16-encoder-fp32-state"),
-        pytest.param(
-            trt.bfloat16,
-            trt.bfloat16,
-            marks=pytest.mark.sm80,
-            id="bf16",
-        ),
+        pytest.param(trt.bfloat16, trt.bfloat16, marks=pytest.mark.sm80, id="bf16"),
     ),
 )
 def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
@@ -2515,8 +2399,7 @@ def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
     ),
 )
 def test_parakeet_decoder_reports_fixed_tensor_binding_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    rejected_binding: str,
+    monkeypatch: pytest.MonkeyPatch, rejected_binding: str
 ) -> None:
     stream = cp.cuda.get_current_stream()
     context = RecordingParakeetContext(rejected_binding)

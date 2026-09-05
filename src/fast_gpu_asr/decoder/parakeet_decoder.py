@@ -480,12 +480,11 @@ class ParakeetModifiedBeamSearchDecoder:
             for chunk_start in range(0, max_steps, TDT_SEARCH_CHUNK_STEPS):
                 chunk_steps = min(TDT_SEARCH_CHUNK_STEPS, max_steps - chunk_start)
 
-                replay_graph = (
+                if (
                     chunk_steps == TDT_SEARCH_CHUNK_STEPS
                     and self.cuda_graph_supported
                     and self.cuda_graph is not None
-                )
-                if replay_graph:
+                ):
                     self.cuda_graph.launch(self.stream)
                 else:
                     should_capture = (
@@ -691,10 +690,9 @@ class ParakeetModifiedBeamSearchDecoder:
                             raise ASRInferenceError(
                                 "TensorRT decoder execution failed."
                             )
-                        else:
-                            if self.cuda_graph_supported:
-                                self.cuda_graph_signature = graph_signature
-                                graph_warmed = True
+                        elif self.cuda_graph_supported:
+                            self.cuda_graph_signature = graph_signature
+                            graph_warmed = True
 
                 steps_executed += chunk_steps
 

@@ -182,8 +182,7 @@ def create_wheel_test_project(tmp_path: Path) -> Path:
 
 
 def run_wheel_build(
-    project_dir: Path,
-    wheel_dir: Path,
+    project_dir: Path, wheel_dir: Path
 ) -> subprocess.CompletedProcess[str]:
     """Build one test wheel through the configured PEP 517 backend.
 
@@ -207,13 +206,7 @@ def run_wheel_build(
 
     wheel_dir.mkdir()
     return subprocess.run(
-        (
-            sys.executable,
-            "-I",
-            "-c",
-            BUILD_WHEEL_SCRIPT,
-            str(wheel_dir),
-        ),
+        (sys.executable, "-I", "-c", BUILD_WHEEL_SCRIPT, str(wheel_dir)),
         cwd=project_dir,
         capture_output=True,
         text=True,
@@ -236,8 +229,7 @@ def test_setup_registers_binary_distribution_commands(
 
 
 def test_source_distribution_is_rejected(
-    setup_options: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
+    setup_options: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     command = setup_options["cmdclass"]["sdist"](setup_options["distclass"]())
     monkeypatch.setattr(
@@ -255,10 +247,7 @@ def test_source_distribution_is_rejected(
 
 @pytest.mark.parametrize(
     "base_tag",
-    (
-        ("cp312", "cp312", "manylinux_2_27_x86_64"),
-        ("cp314", "cp314", "linux_aarch64"),
-    ),
+    (("cp312", "cp312", "manylinux_2_27_x86_64"), ("cp314", "cp314", "linux_aarch64")),
     ids=("manylinux-x86_64", "linux-aarch64"),
 )
 def test_binary_wheel_uses_python_abi_independent_tag(
@@ -409,8 +398,7 @@ def test_real_wheel_build_runs_plugin_artifact_validation(tmp_path: Path) -> Non
 
 
 def test_binary_wheel_accepts_complete_plugin_set(
-    wheel_command: bdist_wheel,
-    base_wheel_runs: list[bdist_wheel],
+    wheel_command: bdist_wheel, base_wheel_runs: list[bdist_wheel]
 ) -> None:
     wheel_command.run()
 
@@ -418,8 +406,7 @@ def test_binary_wheel_accepts_complete_plugin_set(
 
 
 def test_binary_wheel_propagates_base_build_failure(
-    wheel_command: bdist_wheel,
-    monkeypatch: pytest.MonkeyPatch,
+    wheel_command: bdist_wheel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     failure = RuntimeError("wheel build failed")
 
@@ -467,13 +454,10 @@ def test_binary_wheel_rejects_manifest_mismatch(
 
 
 @pytest.mark.parametrize(
-    "artifact_kind",
-    ("directory", "broken_symlink", "valid_symlink", "fifo"),
+    "artifact_kind", ("directory", "broken_symlink", "valid_symlink", "fifo")
 )
 def test_binary_wheel_reports_nonregular_artifacts(
-    wheel_command: bdist_wheel,
-    base_wheel_runs: list[bdist_wheel],
-    artifact_kind: str,
+    wheel_command: bdist_wheel, base_wheel_runs: list[bdist_wheel], artifact_kind: str
 ) -> None:
     artifact_names = [f"{PLUGIN_NAMES[-1]}.so", f"{PLUGIN_NAMES[0]}.cu"]
     for name in artifact_names:
@@ -500,8 +484,7 @@ def test_binary_wheel_reports_nonregular_artifacts(
 
 
 def test_binary_wheel_reports_every_empty_artifact(
-    wheel_command: bdist_wheel,
-    base_wheel_runs: list[bdist_wheel],
+    wheel_command: bdist_wheel, base_wheel_runs: list[bdist_wheel]
 ) -> None:
     artifact_names = [f"{PLUGIN_NAMES[-1]}.cu", f"{PLUGIN_NAMES[0]}.so"]
     for artifact_name in artifact_names:
@@ -517,8 +500,7 @@ def test_binary_wheel_reports_every_empty_artifact(
 
 
 def test_binary_wheel_rejects_empty_plugin_set(
-    wheel_command: bdist_wheel,
-    base_wheel_runs: list[bdist_wheel],
+    wheel_command: bdist_wheel, base_wheel_runs: list[bdist_wheel]
 ) -> None:
     wheel_command.plugin_dir = wheel_command.plugin_dir / "empty"
     wheel_command.plugin_dir.mkdir()

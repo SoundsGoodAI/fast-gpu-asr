@@ -236,9 +236,7 @@ def reference_relative_attention(
 
 
 def reference_self_attention(
-    module: SelfAttention,
-    x: torch.Tensor,
-    attention_weights: torch.Tensor,
+    module: SelfAttention, x: torch.Tensor, attention_weights: torch.Tensor
 ) -> torch.Tensor:
     """Apply attention weights after independently arranging projected values.
 
@@ -430,9 +428,7 @@ def test_relative_attention_excludes_masked_scores_below_old_sentinel(
 
 
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPES)
-def test_relative_attention_defines_all_masked_rows_as_zero(
-    dtype: torch.dtype,
-) -> None:
+def test_relative_attention_defines_all_masked_rows_as_zero(dtype: torch.dtype) -> None:
     generator = torch.Generator().manual_seed(23)
     module = make_relative_attention().to(dtype)
     projection = torch.randn(
@@ -540,9 +536,7 @@ def test_self_attention_matches_reference(
     )
     module = make_self_attention(dtype)
     x = torch.randn(
-        (2, sequence_length, SELF_ATTENTION_INPUT_DIM),
-        dtype=dtype,
-        generator=generator,
+        (2, sequence_length, SELF_ATTENTION_INPUT_DIM), dtype=dtype, generator=generator
     )
     expected = reference_self_attention(module, x, weights)
 
@@ -555,13 +549,11 @@ def test_self_attention_matches_reference(
 def test_self_attention_supports_alternate_head_layout() -> None:
     generator = torch.Generator().manual_seed(67)
     module = make_self_attention(
-        num_heads=ALTERNATE_SELF_NUM_HEADS,
-        value_head_dim=ALTERNATE_SELF_VALUE_HEAD_DIM,
+        num_heads=ALTERNATE_SELF_NUM_HEADS, value_head_dim=ALTERNATE_SELF_VALUE_HEAD_DIM
     )
     x = torch.randn(2, 5, SELF_ATTENTION_INPUT_DIM, generator=generator)
     weights = torch.softmax(
-        torch.randn(2, ALTERNATE_SELF_NUM_HEADS, 5, 5, generator=generator),
-        dim=3,
+        torch.randn(2, ALTERNATE_SELF_NUM_HEADS, 5, 5, generator=generator), dim=3
     )
 
     actual = module(x, weights)

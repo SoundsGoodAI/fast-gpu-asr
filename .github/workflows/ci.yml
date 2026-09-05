@@ -12,6 +12,11 @@ on:
           (billed separately on the GitHub-hosted T4 runner)
         type: boolean
         default: false
+      publish_to:
+        description: Publish the tested wheel from a matching version tag (requires GPU tests)
+        type: choice
+        options: [none, testpypi, pypi]
+        default: none
 
 permissions:
   contents: read
@@ -48,12 +53,30 @@ jobs:
           version: "0.11.21"
       - name: Check lockfile
         run: uv lock --check
+      - name: Validate release request
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_to != 'none'
+        env:
+          RUN_GPU_TESTS: ${{ inputs.run_gpu_tests }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          if os.environ["RUN_GPU_TESTS"] != "true":
+              raise ValueError("Publishing requires run_gpu_tests=true.")
+          if os.environ["GITHUB_REF"] != f"refs/tags/v{version}":
+              raise ValueError(f"Publishing requires the version tag v{version}.")
+          PY
       - name: Install development environment
         run: uv sync --frozen --extra dev
       - name: Lint
         run: uv run --frozen ruff check .
       - name: Check formatting
         run: uv run --frozen ruff format --check .
+      - name: Check CUDA formatting
+        run: uv run --frozen python src/fast_gpu_asr/decoder/lint_gpu_kernels.py --check
       - name: Compile Python sources
         run: uv run --frozen python -m compileall -q src tests scripts
 
@@ -263,6 +286,8 @@ jobs:
         run: |
           rm -rf dist
           scripts/build_wheel.sh dist
+      - name: Validate PyPI metadata
+        run: uvx --from twine twine check --strict dist/*.whl
       - name: Verify and smoke-test installed wheel
         shell: bash
         run: |
@@ -398,3 +423,30 @@ jobs:
             "${RUNNER_TEMP}/tensorrt-headers.tar.gz" \
             dist
           rm -f src/fast_gpu_asr/tensorrt_plugins/*.so
+
+  publish:
+    name: Publish to ${{ inputs.publish_to }}
+    needs: [gpu-tests]
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests &&
+      (inputs.publish_to == 'testpypi' || inputs.publish_to == 'pypi') &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      github.repository == 'SoundsGoodAI/fast-gpu-asr'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    environment:
+      name: ${{ inputs.publish_to }}
+      url: ${{ inputs.publish_to == 'pypi' && 'https://pypi.org/p/fast-gpu-asr' || 'https://test.pypi.org/p/fast-gpu-asr' }}
+    steps:
+      - name: Download tested wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fast-gpu-asr-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist
+      - name: Publish wheel with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: ${{ inputs.publish_to == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          attestations: true

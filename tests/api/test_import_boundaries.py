@@ -106,10 +106,7 @@ def unexpected_import_references(
     isolated-interpreter test separately checks actual import-time dependencies.
     """
 
-    tree = ast.parse(
-        module_path.read_text(encoding="utf8"),
-        filename=str(module_path),
-    )
+    tree = ast.parse(module_path.read_text(encoding="utf8"), filename=str(module_path))
     package_name = (
         module_name
         if module_path.name == "__init__.py"
@@ -141,10 +138,7 @@ def unexpected_import_references(
         elif isinstance(node, ast.ImportFrom):
             import_name = node.module or ""
             if node.level:
-                import_name = resolve_name(
-                    "." * node.level + import_name,
-                    package_name,
-                )
+                import_name = resolve_name("." * node.level + import_name, package_name)
             imports = (import_name,)
         elif isinstance(node, ast.Call):
             named_dynamic_import = (

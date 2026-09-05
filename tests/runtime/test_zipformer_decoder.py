@@ -75,8 +75,7 @@ class ScriptedDecoderContext:
         self.calls += 1
         if self.outputs:
             cp.copyto(
-                self.decoder.tokens_log_prob,
-                self.outputs[call % len(self.outputs)],
+                self.decoder.tokens_log_prob, self.outputs[call % len(self.outputs)]
             )
         return call != self.rejected_call
 
@@ -107,8 +106,7 @@ def make_ctc_decoder(blank_id: int = 0, blank_penalty: float = 0.0) -> CTCGreedy
 
 
 def initialize_zipformer_search_buffers(
-    decoder: ZipformerModifiedBeamSearchDecoder,
-    vocab_size: int,
+    decoder: ZipformerModifiedBeamSearchDecoder, vocab_size: int
 ) -> None:
     """Initialize buffers normally created by the TensorRT-backed constructor.
 
@@ -130,9 +128,7 @@ def initialize_zipformer_search_buffers(
         decoder.shared_beam_search,
         decoder.beam_search_threads,
     ) = get_zipformer_beam_search_kernels(
-        decoder.beam,
-        vocab_size,
-        decoder.context_size,
+        decoder.beam, vocab_size, decoder.context_size
     )
     decoder.beam_search_register_batch_limit = 64
     decoder.cuda_graph = None
@@ -276,10 +272,7 @@ def test_zipformer_beam_search_factory_builds_matching_launches(
     created_kernels: list[SimpleNamespace] = []
 
     def create_kernel(
-        source: str,
-        name: str,
-        options: tuple[str, ...],
-        backend: str,
+        source: str, name: str, options: tuple[str, ...], backend: str
     ) -> SimpleNamespace:
         """Record one CuPy kernel compilation request.
 
@@ -358,8 +351,7 @@ def test_zipformer_beam_search_factory_builds_matching_launches(
     ),
 )
 def test_zipformer_beam_search_factory_rejects_invalid_thread_count(
-    monkeypatch: pytest.MonkeyPatch,
-    threads: int | float,
+    monkeypatch: pytest.MonkeyPatch, threads: int | float
 ) -> None:
     monkeypatch.setattr(gpu_kernels, "ZIPFORMER_BEAM_SEARCH_THREADS", threads)
     get_zipformer_beam_search_kernels.cache_clear()
@@ -390,18 +382,10 @@ def test_zipformer_beam_search_factory_rejects_shared_memory_overflow() -> None:
 )
 def test_ctc_greedy_collapses_repeats_and_blanks(dtype: np.dtype) -> None:
     decoder = make_ctc_decoder()
-    paths = cp.array(
-        [
-            [0, 1, 1, 0, 1, 2],
-            [2, 2, 0, 3, 3, 3],
-        ],
-    )
+    paths = cp.array([[0, 1, 1, 0, 1, 2], [2, 2, 0, 3, 3, 3]])
     log_probs = cp.eye(4, dtype=cp.float32)[paths].astype(dtype)
 
-    token_ids, timestamps = decoder(
-        log_probs,
-        cp.array([6, 4], dtype=np.int32),
-    )
+    token_ids, timestamps = decoder(log_probs, cp.array([6, 4], dtype=np.int32))
 
     assert token_ids == [[1, 1, 2], [2, 3]]
     np.testing.assert_allclose(timestamps[0], [0.04, 0.16, 0.20])
@@ -434,11 +418,7 @@ def test_ctc_greedy_supports_nonzero_blank_id() -> None:
 def test_ctc_greedy_clamps_invalid_output_lengths() -> None:
     decoder = make_ctc_decoder()
     log_probs = cp.array(
-        [
-            [[0.0, 1.0], [1.0, 0.0]],
-            [[0.0, 1.0], [1.0, 0.0]],
-        ],
-        dtype=np.float32,
+        [[[0.0, 1.0], [1.0, 0.0]], [[0.0, 1.0], [1.0, 0.0]]], dtype=np.float32
     )
 
     token_ids, timestamps = decoder(log_probs, cp.array([10, -1], dtype=np.int32))
@@ -453,8 +433,7 @@ def test_ctc_greedy_reuses_buffers_without_leaking_results() -> None:
     decoder = make_ctc_decoder()
     first_paths = cp.array([[1, 0, 2, 0], [2, 2, 0, 0]])
     first_tokens, first_timestamps = decoder(
-        cp.eye(4, dtype=cp.float32)[first_paths],
-        cp.full(2, 4, dtype=np.int32),
+        cp.eye(4, dtype=cp.float32)[first_paths], cp.full(2, 4, dtype=np.int32)
     )
     allocated_buffers = (
         decoder.emitted_tokens,
@@ -467,8 +446,7 @@ def test_ctc_greedy_reuses_buffers_without_leaking_results() -> None:
 
     second_paths = cp.array([[3, 0, 1, 0], [0, 0, 0, 0]])
     second_tokens, second_timestamps = decoder(
-        cp.eye(4, dtype=cp.float32)[second_paths],
-        cp.full(2, 4, dtype=np.int32),
+        cp.eye(4, dtype=cp.float32)[second_paths], cp.full(2, 4, dtype=np.int32)
     )
 
     assert first_tokens == [[1, 2], [2]]
@@ -496,8 +474,7 @@ def test_ctc_greedy_returns_empty_results_for_zero_frames() -> None:
     decoder = make_ctc_decoder()
 
     token_ids, timestamps = decoder(
-        cp.empty((2, 0, 4), dtype=np.float32),
-        cp.zeros(2, dtype=np.int32),
+        cp.empty((2, 0, 4), dtype=np.float32), cp.zeros(2, dtype=np.int32)
     )
 
     assert token_ids == [[], []]
@@ -528,10 +505,7 @@ def test_zipformer_register_and_shared_search_match() -> None:
     )
     initial_contexts = cp.array(
         rng.integers(
-            0,
-            vocab_size,
-            size=(batch_size * beam, context_size),
-            dtype=np.int32,
+            0, vocab_size, size=(batch_size * beam, context_size), dtype=np.int32
         )
     )
     output_lengths = cp.array([10, -1], dtype=np.int32)
@@ -664,8 +638,7 @@ def test_zipformer_search_updates_distinct_parent_histories(
     node_timestamps = cp.full(beam * 3, -2.0, dtype=np.float32)
     node_counts = cp.zeros(1, dtype=np.int32)
     context_lookup = cp.arange(
-        (vocab_size + 1) ** context_size * encoder_dim,
-        dtype=np.float32,
+        (vocab_size + 1) ** context_size * encoder_dim, dtype=np.float32
     ).reshape(-1, encoder_dim)
 
     kernel(
@@ -673,11 +646,7 @@ def test_zipformer_search_updates_distinct_parent_histories(
         (threads,),
         (
             cp.array(
-                [
-                    [-0.4, -5.0, -5.0, -0.1],
-                    [-0.6, -5.0, 0.0, -5.0],
-                ],
-                dtype=np.float32,
+                [[-0.4, -5.0, -5.0, -0.1], [-0.6, -5.0, 0.0, -5.0]], dtype=np.float32
             ),
             cp.arange(12, dtype=np.float32).reshape(1, 3, encoder_dim),
             encoder_input,
@@ -719,16 +688,12 @@ def test_zipformer_search_updates_distinct_parent_histories(
     np.testing.assert_allclose(node_timestamps.get()[:2], [0.04, 0.04])
     np.testing.assert_array_equal(node_counts.get(), [2])
     np.testing.assert_array_equal(
-        encoder_input.get(),
-        np.tile(np.arange(8, 12, dtype=np.float32), (beam, 1)),
+        encoder_input.get(), np.tile(np.arange(8, 12, dtype=np.float32), (beam, 1))
     )
     np.testing.assert_array_equal(
         decoder_input.get(),
         np.vstack(
-            (
-                np.arange(76, 80, dtype=np.float32),
-                np.arange(52, 56, dtype=np.float32),
-            )
+            (np.arange(76, 80, dtype=np.float32), np.arange(52, 56, dtype=np.float32))
         ),
     )
 
@@ -781,8 +746,7 @@ def test_zipformer_search_keeps_nonfinite_candidates_in_bounds(
                 cp.zeros((1, 1, encoder_dim), dtype=np.float32),
                 cp.empty((beam, encoder_dim), dtype=np.float32),
                 cp.zeros(
-                    ((vocab_size + 1) ** context_size, encoder_dim),
-                    dtype=np.float32,
+                    ((vocab_size + 1) ** context_size, encoder_dim), dtype=np.float32
                 ),
                 cp.empty((beam, encoder_dim), dtype=np.float32),
                 contexts,
@@ -813,13 +777,7 @@ def test_zipformer_search_keeps_nonfinite_candidates_in_bounds(
         )
         return tuple(
             array.get()
-            for array in (
-                next_scores,
-                next_nodes,
-                next_lengths,
-                contexts,
-                node_counts,
-            )
+            for array in (next_scores, next_nodes, next_lengths, contexts, node_counts)
         )
 
     register_results = run_search(register_launch)
@@ -867,11 +825,7 @@ def test_zipformer_search_merges_and_resorts_duplicate_histories(
         (threads,),
         (
             cp.array(
-                [
-                    [-0.2, -8.0, -0.1],
-                    [-8.0, -0.3, -8.0],
-                    [-8.0, -8.0, -8.0],
-                ],
+                [[-0.2, -8.0, -0.1], [-8.0, -0.3, -8.0], [-8.0, -8.0, -8.0]],
                 dtype=np.float32,
             ),
             cp.zeros((1, 2, 1), dtype=np.float32),
@@ -970,8 +924,7 @@ def test_zipformer_decoder_returns_empty_results_for_zero_frames() -> None:
     decoder = make_fake_zipformer_decoder(batch_size=2)
 
     token_ids, timestamps = decoder(
-        cp.empty((2, 0, 3), dtype=np.float32),
-        cp.zeros(2, dtype=np.int32),
+        cp.empty((2, 0, 3), dtype=np.float32), cp.zeros(2, dtype=np.int32)
     )
 
     assert token_ids == [[], []]
@@ -983,8 +936,7 @@ def test_zipformer_decoder_clamps_invalid_output_lengths() -> None:
     decoder = make_fake_zipformer_decoder(batch_size=2)
     decoder.decoder = ScriptedDecoderContext(decoder, ([-8.0, 0.0, -8.0, -8.0],))
     token_ids, timestamps = decoder(
-        cp.zeros((2, 2, 3), dtype=np.float32),
-        cp.array([10, -1], dtype=np.int32),
+        cp.zeros((2, 2, 3), dtype=np.float32), cp.array([10, -1], dtype=np.int32)
     )
 
     assert token_ids == [[1, 1], []]
@@ -997,16 +949,13 @@ def test_zipformer_decoder_does_not_leak_results_across_calls() -> None:
     decoder = make_fake_zipformer_decoder(batch_size=2)
     decoder.decoder = ScriptedDecoderContext(decoder, ([-8.0, 0.0, -8.0, -8.0],))
     first_tokens, first_timestamps = decoder(
-        cp.zeros((2, 3, 3), dtype=np.float32),
-        cp.array([3, 2], dtype=np.int32),
+        cp.zeros((2, 3, 3), dtype=np.float32), cp.array([3, 2], dtype=np.int32)
     )
     empty_tokens, empty_timestamps = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.zeros(1, dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.zeros(1, dtype=np.int32)
     )
     final_tokens, final_timestamps = decoder(
-        cp.zeros((2, 4, 3), dtype=np.float32),
-        cp.array([4, 1], dtype=np.int32),
+        cp.zeros((2, 4, 3), dtype=np.float32), cp.array([4, 1], dtype=np.int32)
     )
 
     assert first_tokens == [[1, 1, 1], [1, 1]]
@@ -1026,15 +975,13 @@ def test_zipformer_decoder_does_not_leak_results_across_calls() -> None:
     ids=("no-penalty", "with-penalty"),
 )
 def test_zipformer_decoder_applies_blank_penalty(
-    blank_penalty: float,
-    expected_tokens: list[int],
+    blank_penalty: float, expected_tokens: list[int]
 ) -> None:
     decoder = make_fake_zipformer_decoder()
     decoder.blank_penalty = blank_penalty
     decoder.decoder = ScriptedDecoderContext(decoder, ([0.1, 0.0, -8.0, -8.0],))
     token_ids, _ = decoder(
-        cp.zeros((1, 1, 3), dtype=np.float32),
-        cp.ones(1, dtype=np.int32),
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
     )
 
     assert token_ids == [expected_tokens]
@@ -1044,15 +991,10 @@ def test_zipformer_decoder_applies_blank_penalty(
 def test_zipformer_decoder_supports_nonzero_blank_id() -> None:
     decoder = make_fake_zipformer_decoder(blank_id=3)
     decoder.decoder = ScriptedDecoderContext(
-        decoder,
-        (
-            [-8.0, -8.0, -8.0, 0.0],
-            [-8.0, 0.0, -8.0, -8.0],
-        ),
+        decoder, ([-8.0, -8.0, -8.0, 0.0], [-8.0, 0.0, -8.0, -8.0])
     )
     token_ids, timestamps = decoder(
-        cp.zeros((1, 2, 3), dtype=np.float32),
-        cp.array([2], dtype=np.int32),
+        cp.zeros((1, 2, 3), dtype=np.float32), cp.array([2], dtype=np.int32)
     )
 
     assert token_ids == [[1]]
@@ -1063,12 +1005,10 @@ def test_zipformer_decoder_supports_nonzero_blank_id() -> None:
 def test_zipformer_decoder_keeps_batch_candidates_separate() -> None:
     decoder = make_fake_zipformer_decoder(batch_size=2)
     decoder.decoder = ScriptedDecoderContext(
-        decoder,
-        ([[-1.0, 0.0, -8.0, -8.0], [-1.0, -8.0, 0.0, -8.0]],),
+        decoder, ([[-1.0, 0.0, -8.0, -8.0], [-1.0, -8.0, 0.0, -8.0]],)
     )
     token_ids, _ = decoder(
-        cp.zeros((2, 1, 3), dtype=np.float32),
-        cp.ones(2, dtype=np.int32),
+        cp.zeros((2, 1, 3), dtype=np.float32), cp.ones(2, dtype=np.int32)
     )
 
     assert token_ids == [[1], [2]]
@@ -1078,17 +1018,10 @@ def test_zipformer_decoder_keeps_batch_candidates_separate() -> None:
 def test_zipformer_decoder_clears_inactive_encoder_slots() -> None:
     decoder = make_fake_zipformer_decoder(batch_size=3, beam=2)
     decoder.decoder = ScriptedDecoderContext(
-        decoder,
-        (
-            [-8.0, 0.0, -8.0, -8.0],
-            [0.0, -8.0, -8.0, -8.0],
-        ),
+        decoder, ([-8.0, 0.0, -8.0, -8.0], [0.0, -8.0, -8.0, -8.0])
     )
     encoder_output = cp.arange(6, dtype=np.float32).reshape(1, 2, 3)
-    token_ids, _ = decoder(
-        encoder_output,
-        cp.array([2], dtype=np.int32),
-    )
+    token_ids, _ = decoder(encoder_output, cp.array([2], dtype=np.int32))
 
     assert token_ids == [[1]]
     staged_encoder = decoder.encoder_input.reshape(3, 2, 3).get()
@@ -1103,10 +1036,7 @@ def test_zipformer_decoder_reports_tensorrt_execution_failure() -> None:
     decoder = make_fake_zipformer_decoder()
     decoder.decoder = ScriptedDecoderContext(decoder, rejected_call=0)
     with pytest.raises(ASRInferenceError, match="TensorRT decoder execution failed"):
-        decoder(
-            cp.zeros((1, 1, 3), dtype=np.float32),
-            cp.ones(1, dtype=np.int32),
-        )
+        decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
 
 
 @pytest.mark.cuda
@@ -1114,9 +1044,7 @@ def test_zipformer_decoder_falls_back_after_captured_execution_failure() -> None
     decoder = make_fake_zipformer_decoder()
     decoder.cuda_graph_supported = True
     decoder.decoder = ScriptedDecoderContext(
-        decoder,
-        ([-8.0, 0.0, -8.0, -8.0],),
-        rejected_call=3,
+        decoder, ([-8.0, 0.0, -8.0, -8.0],), rejected_call=3
     )
     encoder_output = cp.zeros((1, 2, 3), dtype=np.float32)
     encoder_output_lengths = cp.full(1, 2, dtype=np.int32)
@@ -1136,8 +1064,7 @@ def test_zipformer_decoder_falls_back_after_captured_execution_failure() -> None
 @pytest.mark.cuda
 @pytest.mark.parametrize("status", (901, 999), ids=("invalidated", "unexpected"))
 def test_zipformer_decoder_handles_cuda_capture_errors(
-    monkeypatch: pytest.MonkeyPatch,
-    status: int,
+    monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
     class CaptureError(RuntimeError):
         """Carry the CUDA status exposed by CuPy capture failures."""
@@ -1170,9 +1097,7 @@ def test_zipformer_decoder_handles_cuda_capture_errors(
             raise CaptureError(status)
 
     monkeypatch.setattr(
-        zipformer_decoder.cp.cuda.runtime,
-        "CUDARuntimeError",
-        CaptureError,
+        zipformer_decoder.cp.cuda.runtime, "CUDARuntimeError", CaptureError
     )
     decoder = make_fake_zipformer_decoder()
     decoder.stream = InvalidatingStream(non_blocking=True)
@@ -1198,19 +1123,13 @@ def test_zipformer_decoder_handles_cuda_capture_errors(
 
 @pytest.mark.cuda
 @pytest.mark.parametrize(
-    "use_register_search",
-    (False, True),
-    ids=("shared", "register"),
+    "use_register_search", (False, True), ids=("shared", "register")
 )
 def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffers(
     use_register_search: bool,
 ) -> None:
     decoder = make_fake_zipformer_decoder(
-        batch_size=2,
-        beam=2,
-        context_size=1,
-        encoder_dim=3,
-        vocab_size=4,
+        batch_size=2, beam=2, context_size=1, encoder_dim=3, vocab_size=4
     )
     decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
     decoder.cuda_graph_supported = True
@@ -1265,11 +1184,7 @@ def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffer
     decoder.shared_beam_search = record_launch("shared", decoder.shared_beam_search)
 
     decoder.decoder = ScriptedDecoderContext(
-        decoder,
-        (
-            [-1.0, 0.0, -8.0, -8.0],
-            [-1.0, -8.0, 0.0, -8.0],
-        ),
+        decoder, ([-1.0, 0.0, -8.0, -8.0], [-1.0, -8.0, 0.0, -8.0])
     )
     encoder_output = cp.zeros((2, 2, 3), dtype=np.float32)
     encoder_output_lengths = cp.array([2, 1], dtype=np.int32)
@@ -1289,10 +1204,7 @@ def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffer
     assert token_ids == [[1], [1, 2]]
     np.testing.assert_array_equal(
         decoder.encoder_input.reshape(2, 2, 3).get(),
-        [
-            [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
-            [[9.0, 10.0, 11.0], [9.0, 10.0, 11.0]],
-        ],
+        [[[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]], [[9.0, 10.0, 11.0], [9.0, 10.0, 11.0]]],
     )
     assert decoder.cuda_graph is captured_graph
     assert decoder.decoder.calls == 4
@@ -1358,9 +1270,7 @@ def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffer
     ),
 )
 def test_zipformer_decoder_converts_inputs_to_engine_precision(
-    encoder_dtype: np.dtype,
-    context_dtype: np.dtype,
-    decoder_dtype: np.dtype,
+    encoder_dtype: np.dtype, context_dtype: np.dtype, decoder_dtype: np.dtype
 ) -> None:
     decoder = make_fake_zipformer_decoder(
         context_size=2,
@@ -1370,19 +1280,12 @@ def test_zipformer_decoder_converts_inputs_to_engine_precision(
         sequential_context_lookup=True,
     )
     decoder.decoder = ScriptedDecoderContext(
-        decoder,
-        (
-            [-8.0, 0.0, -8.0, -8.0],
-            [0.0, -8.0, -8.0, -8.0],
-        ),
+        decoder, ([-8.0, 0.0, -8.0, -8.0], [0.0, -8.0, -8.0, -8.0])
     )
     encoder_output = (
         cp.arange(16, dtype=np.float32).astype(encoder_dtype).reshape(1, 2, 8)
     )
-    token_ids, _ = decoder(
-        encoder_output,
-        cp.array([2], dtype=np.int32),
-    )
+    token_ids, _ = decoder(encoder_output, cp.array([2], dtype=np.int32))
 
     assert token_ids == [[1]]
     np.testing.assert_array_equal(
@@ -1587,9 +1490,7 @@ class FakeZipformerEngine:
         assert name in ("decoder_input", "encoder_output")
         return self.tensor_dtype
 
-    def create_execution_context(
-        self,
-    ) -> RecordingZipformerContext | None:
+    def create_execution_context(self) -> RecordingZipformerContext | None:
         """Return the configured fake TensorRT execution context.
 
         Returns
@@ -1711,10 +1612,7 @@ def test_ctc_decoder_rejects_malformed_inputs(
     decoder = make_ctc_validation_decoder()
 
     with pytest.raises(ASRInferenceError, match=message):
-        decoder(
-            cast(cp.ndarray, log_probs),
-            cast(cp.ndarray, output_lengths),
-        )
+        decoder(cast(cp.ndarray, log_probs), cast(cp.ndarray, output_lengths))
 
 
 def test_ctc_decoder_rejects_int32_frame_overflow() -> None:
@@ -1723,8 +1621,7 @@ def test_ctc_decoder_rejects_int32_frame_overflow() -> None:
 
     with pytest.raises(ASRInferenceError, match="CTC frame count exceeds"):
         make_ctc_validation_decoder()(
-            cast(cp.ndarray, log_probs),
-            cast(cp.ndarray, output_lengths),
+            cast(cp.ndarray, log_probs), cast(cp.ndarray, output_lengths)
         )
 
 
@@ -1796,8 +1693,7 @@ def test_zipformer_decoder_rejects_malformed_inputs(
 
     with pytest.raises(ASRInferenceError, match=message):
         decoder(
-            cast(cp.ndarray, encoder_output),
-            cast(cp.ndarray, encoder_output_lengths),
+            cast(cp.ndarray, encoder_output), cast(cp.ndarray, encoder_output_lengths)
         )
 
 
@@ -1811,26 +1707,19 @@ def test_zipformer_decoder_rejects_int32_history_capacity_overflow() -> None:
     output_lengths = FakeCudaArray((1,), np.dtype(np.int32))
 
     with pytest.raises(ASRInferenceError, match="token histories exceed"):
-        decoder(
-            cast(cp.ndarray, encoder_output),
-            cast(cp.ndarray, output_lengths),
-        )
+        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
 
 
 def test_zipformer_decoder_rejects_int32_encoder_index_overflow() -> None:
     decoder = make_zipformer_validation_decoder()
     max_frames = INT32_MAX // (decoder.batch_size * decoder.encoder_dim) + 1
     encoder_output = FakeCudaArray(
-        (decoder.batch_size, max_frames, decoder.encoder_dim),
-        np.dtype(np.float32),
+        (decoder.batch_size, max_frames, decoder.encoder_dim), np.dtype(np.float32)
     )
     output_lengths = FakeCudaArray((decoder.batch_size,), np.dtype(np.int32))
 
     with pytest.raises(ASRInferenceError, match="encoder output exceeds"):
-        decoder(
-            cast(cp.ndarray, encoder_output),
-            cast(cp.ndarray, output_lengths),
-        )
+        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
 
 
 @pytest.mark.cuda
@@ -1867,8 +1756,7 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
     engine_path = tmp_path / "decoder.trt"
     context_lookup = torch.arange(81 * 4, dtype=torch.float32).reshape(81, 4) / 7.0
     torch.save(
-        context_lookup.to(context_dtype),
-        tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE,
+        context_lookup.to(context_dtype), tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE
     )
     context = RecordingZipformerContext()
     engine = FakeZipformerEngine(context, engine_dtype)
@@ -1920,13 +1808,9 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
     assert decoder.initial_decoder_input.dtype == expected_engine_dtype
     assert decoder.tokens_log_prob.dtype == np.float32
     np.testing.assert_array_equal(
-        decoder.context_lookup.astype(cp.float32).get(),
-        expected_context_lookup,
+        decoder.context_lookup.astype(cp.float32).get(), expected_context_lookup
     )
-    np.testing.assert_array_equal(
-        decoder.initial_contexts.get(),
-        [[-1, 0], [-1, 0]],
-    )
+    np.testing.assert_array_equal(decoder.initial_contexts.get(), [[-1, 0], [-1, 0]])
     np.testing.assert_array_equal(
         decoder.initial_decoder_input.astype(cp.float32).get(),
         np.tile(expected_initial_decoder_input[1], (2, 1)),
@@ -1935,8 +1819,7 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
 
 @pytest.mark.cuda
 def test_zipformer_decoder_initializes_every_wide_beam_context(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
     context_lookup = torch.arange(81 * 4, dtype=torch.float32).reshape(81, 4)
@@ -1965,14 +1848,7 @@ def test_zipformer_decoder_initializes_every_wide_beam_context(
     assert decoder.beam == 3
     np.testing.assert_array_equal(
         decoder.initial_contexts.get(),
-        [
-            [-1, 3],
-            [0, 0],
-            [0, 0],
-            [-1, 3],
-            [0, 0],
-            [0, 0],
-        ],
+        [[-1, 3], [0, 0], [0, 0], [-1, 3], [0, 0], [0, 0]],
     )
     np.testing.assert_array_equal(
         decoder.initial_decoder_input.get(),
@@ -2012,12 +1888,10 @@ def test_zipformer_decoder_rejects_profile_selection_failure(
 
 
 @pytest.mark.parametrize(
-    "rejected_binding",
-    ("decoder_input", "encoder_output", "tokens_log_prob"),
+    "rejected_binding", ("decoder_input", "encoder_output", "tokens_log_prob")
 )
 def test_zipformer_decoder_rejects_tensor_binding_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    rejected_binding: str,
+    monkeypatch: pytest.MonkeyPatch, rejected_binding: str
 ) -> None:
     stream = NullCudaContext()
     context = RecordingZipformerContext(rejected_binding)

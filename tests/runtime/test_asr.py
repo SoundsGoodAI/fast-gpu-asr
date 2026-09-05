@@ -117,10 +117,7 @@ def make_config(model_type: str, decoder_type: str) -> DictConfig:
         decoder_params["context_size"] = 2
     elif model_type == "parakeet_asr":
         decoder_params.update(
-            {
-                "max_symbols_per_timestep": 10,
-                "tdt_durations": [0, 1, 2, 3, 4],
-            }
+            {"max_symbols_per_timestep": 10, "tdt_durations": [0, 1, 2, 3, 4]}
         )
 
     return OmegaConf.create(
@@ -136,11 +133,7 @@ def make_config(model_type: str, decoder_type: str) -> DictConfig:
     )
 
 
-def write_config(
-    model_dir: Path,
-    model_type: str,
-    decoder_type: str,
-) -> None:
+def write_config(model_dir: Path, model_type: str, decoder_type: str) -> None:
     """Write one minimal model configuration used by constructor tests.
 
     Parameters
@@ -154,14 +147,11 @@ def write_config(
     """
 
     OmegaConf.save(
-        make_config(model_type, decoder_type),
-        model_dir / "model_config.yaml",
+        make_config(model_type, decoder_type), model_dir / "model_config.yaml"
     )
 
 
-def patch_runtime_components(
-    monkeypatch: pytest.MonkeyPatch,
-) -> PatchedRuntime:
+def patch_runtime_components(monkeypatch: pytest.MonkeyPatch) -> PatchedRuntime:
     """Install runtime fakes that record construction and CUDA scope.
 
     Parameters
@@ -267,22 +257,17 @@ def patch_runtime_components(
     monkeypatch.setattr(asr_module, "Encoder", FakeEncoder)
     monkeypatch.setattr(asr_module, "CTCGreedyDecoder", FakeCTCDecoder)
     monkeypatch.setattr(
-        asr_module,
-        "ZipformerModifiedBeamSearchDecoder",
-        FakeZipformerDecoder,
+        asr_module, "ZipformerModifiedBeamSearchDecoder", FakeZipformerDecoder
     )
     monkeypatch.setattr(
-        asr_module,
-        "ParakeetModifiedBeamSearchDecoder",
-        FakeParakeetDecoder,
+        asr_module, "ParakeetModifiedBeamSearchDecoder", FakeParakeetDecoder
     )
     monkeypatch.setattr(asr_module, "PostProcessor", FakePostProcessor)
     return PatchedRuntime(calls, stream, events)
 
 
 def test_asr_propagates_missing_model_config_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
         asr_module.cp.cuda,
@@ -295,8 +280,7 @@ def test_asr_propagates_missing_model_config_error(
 
 
 def test_asr_propagates_malformed_model_config_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "model_config.yaml").write_text("model_type: [\n", encoding="utf8")
     monkeypatch.setattr(
@@ -310,8 +294,7 @@ def test_asr_propagates_malformed_model_config_error(
 
 
 def test_asr_propagates_interpolation_failure_in_routing_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = make_config("zipformer_asr", "ctc_greedy_search")
     config["model_type"] = "${missing_model_type}"
@@ -326,8 +309,7 @@ def test_asr_propagates_interpolation_failure_in_routing_metadata(
 
 
 def test_asr_propagates_cuda_device_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(tmp_path, "zipformer_asr", "ctc_greedy_search")
     failure = RuntimeError("invalid device ordinal")
@@ -379,14 +361,7 @@ def test_asr_propagates_cuda_device_failure(
         "frame_shift_sec",
     ),
     (
-        (
-            "zipformer_asr",
-            "ctc_greedy_search",
-            "zipformer.trt",
-            "ctc",
-            None,
-            0.04,
-        ),
+        ("zipformer_asr", "ctc_greedy_search", "zipformer.trt", "ctc", None, 0.04),
         (
             "zipformer_asr",
             "transducer_greedy_search",
@@ -447,13 +422,7 @@ def test_asr_routes_model_components(
 
     right_padding_samples = 200 if model_type == "zipformer_asr" else 0
     assert runtime.calls["encoder"] == [
-        (
-            tmp_path / encoder_filename,
-            16000,
-            3,
-            runtime.stream,
-            right_padding_samples,
-        )
+        (tmp_path / encoder_filename, 16000, 3, runtime.stream, right_padding_samples)
     ]
     assert type(model.encoder) is asr_module.Encoder
     assert model.encoder.batch_size == 7
@@ -512,8 +481,7 @@ def test_asr_routes_model_components(
 
 
 def test_asr_validates_by_default_on_requested_device(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(tmp_path, "zipformer_asr", "ctc_greedy_search")
     runtime = patch_runtime_components(monkeypatch)
@@ -542,8 +510,7 @@ def test_asr_validates_by_default_on_requested_device(
 
 
 def test_asr_validation_failure_stops_component_initialization(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     OmegaConf.save({"invalid": True}, tmp_path / "model_config.yaml")
     runtime = patch_runtime_components(monkeypatch)
@@ -567,8 +534,7 @@ def test_asr_validation_failure_stops_component_initialization(
 
 
 def test_asr_stream_initialization_failure_stops_components(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(tmp_path, "zipformer_asr", "ctc_greedy_search")
     runtime = patch_runtime_components(monkeypatch)
@@ -594,12 +560,7 @@ def test_asr_stream_initialization_failure_stops_components(
     ("model_type", "decoder_type", "component_name", "completed_components"),
     (
         ("zipformer_asr", "ctc_greedy_search", "Encoder", ()),
-        (
-            "zipformer_asr",
-            "ctc_greedy_search",
-            "CTCGreedyDecoder",
-            ("encoder",),
-        ),
+        ("zipformer_asr", "ctc_greedy_search", "CTCGreedyDecoder", ("encoder",)),
         (
             "zipformer_asr",
             "transducer_modified_beam_search",
@@ -612,12 +573,7 @@ def test_asr_stream_initialization_failure_stops_components(
             "ParakeetModifiedBeamSearchDecoder",
             ("encoder",),
         ),
-        (
-            "zipformer_asr",
-            "ctc_greedy_search",
-            "PostProcessor",
-            ("encoder", "ctc"),
-        ),
+        ("zipformer_asr", "ctc_greedy_search", "PostProcessor", ("encoder", "ctc")),
     ),
     ids=("encoder", "ctc", "zipformer", "parakeet", "postprocessor"),
 )
@@ -694,10 +650,7 @@ def test_asr_call_forwards_outputs_and_recovers_from_failure(
 
     def encoder(
         received_audios: list[np.typing.NDArray[np.float32]],
-    ) -> tuple[
-        np.typing.NDArray[np.float32],
-        np.typing.NDArray[np.int32],
-    ]:
+    ) -> tuple[np.typing.NDArray[np.float32], np.typing.NDArray[np.int32]]:
         """Check waveform identity and return the fixed encoder outputs."""
 
         assert received_audios is audios
@@ -751,11 +704,5 @@ def test_asr_call_forwards_outputs_and_recovers_from_failure(
 
     assert actual_texts is result[0]
     assert actual_word_timestamps is result[1]
-    assert events == [
-        "enter_lock",
-        "encoder",
-        "decoder",
-        "postprocessor",
-        "exit_lock",
-    ]
+    assert events == ["enter_lock", "encoder", "decoder", "postprocessor", "exit_lock"]
     assert not call_lock.active

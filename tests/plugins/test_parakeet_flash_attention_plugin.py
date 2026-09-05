@@ -23,13 +23,7 @@ pytestmark = pytest.mark.cuda
 
 PLUGIN_NAME = "parakeet_flash_attention"
 PLUGIN_VERSION = "1"
-INPUT_NAMES = (
-    "qkv",
-    "position",
-    "content_bias",
-    "position_bias",
-    "valid_lengths",
-)
+INPUT_NAMES = ("qkv", "position", "content_bias", "position_bias", "valid_lengths")
 DEFAULT_NUM_HEADS = 8
 DEFAULT_HEAD_DIM = 64
 DEFAULT_SCALE = DEFAULT_HEAD_DIM**-0.5
@@ -42,10 +36,7 @@ MAX_SEQUENCE_LENGTH = 512
 INT32_MIN = np.iinfo(np.int32).min
 INT32_MAX = np.iinfo(np.int32).max
 SOFTMAX_DISPATCH_CASES = tuple(
-    pytest.param(
-        32 * (slots - 1) + 1,
-        id=f"softmax-slots-{slots}",
-    )
+    pytest.param(32 * (slots - 1) + 1, id=f"softmax-slots-{slots}")
     for slots in range(1, 17)
 ) + (pytest.param(MAX_SEQUENCE_LENGTH, id="softmax-maximum"),)
 SHAPE_CASES = (
@@ -54,15 +45,9 @@ SHAPE_CASES = (
     pytest.param((2, 17), (17, 5), id="mixed-lengths"),
     pytest.param((1, 32), (31,), id="one-warp-boundary"),
     pytest.param((1, 33), (33,), id="second-warp-slot"),
+    pytest.param((3, 65), (INT32_MIN, 34, INT32_MAX), id="length-extremes"),
     pytest.param(
-        (3, 65),
-        (INT32_MIN, 34, INT32_MAX),
-        id="length-extremes",
-    ),
-    pytest.param(
-        (1, MAX_SEQUENCE_LENGTH),
-        (MAX_SEQUENCE_LENGTH - 1,),
-        id="maximum-partial-mask",
+        (1, MAX_SEQUENCE_LENGTH), (MAX_SEQUENCE_LENGTH - 1,), id="maximum-partial-mask"
     ),
 )
 
@@ -192,9 +177,7 @@ type PluginCreatorFixture = tuple[ctypes.CDLL, trt.IPluginCreatorV3One]
 
 
 @pytest.fixture(scope="module")
-def plugin_creator(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> PluginCreatorFixture:
+def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFixture:
     """Compile, register, and return the Parakeet attention creator.
 
     Parameters
@@ -224,10 +207,7 @@ def plugin_creator(
     return library, creator
 
 
-def make_plugin(
-    creator: trt.IPluginCreatorV3One,
-    scale: float,
-) -> trt.IPluginV3:
+def make_plugin(creator: trt.IPluginCreatorV3One, scale: float) -> trt.IPluginV3:
     """Create a Parakeet attention plugin with one scalar scale field.
 
     Parameters
@@ -246,9 +226,7 @@ def make_plugin(
     scale_value = np.array([scale], dtype=np.float32)
     field = trt.PluginField("scale", scale_value, trt.PluginFieldType.FLOAT32)
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection([field]),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection([field]), trt.TensorRTPhase.BUILD
     )
     assert plugin is not None
     return plugin
@@ -441,11 +419,9 @@ def make_inputs(
     rng = np.random.default_rng(seed)
     relative_length = 2 * sequence_length - 1
     return AttentionInputs(
-        rng.normal(
-            0.0,
-            0.2,
-            (batch_size, sequence_length, 3 * case.channels),
-        ).astype(np.float32),
+        rng.normal(0.0, 0.2, (batch_size, sequence_length, 3 * case.channels)).astype(
+            np.float32
+        ),
         rng.normal(0.0, 0.2, (1, relative_length, case.channels)).astype(np.float32),
         rng.normal(0.0, 0.2, (case.num_heads, case.head_dim)).astype(np.float32),
         rng.normal(0.0, 0.2, (case.num_heads, case.head_dim)).astype(np.float32),
@@ -567,9 +543,7 @@ def quantize_host_inputs(inputs: AttentionInputs, case: EngineCase) -> Attention
 
 
 def reference_attention(
-    inputs: AttentionInputs,
-    case: EngineCase,
-    scale: float | None = None,
+    inputs: AttentionInputs, case: EngineCase, scale: float | None = None
 ) -> np.typing.NDArray:
     """Evaluate Parakeet's mixed-precision attention path with PyTorch.
 
@@ -608,14 +582,8 @@ def reference_attention(
     )
     content_query = query + content_bias.unsqueeze(0).unsqueeze(2)
     position_query = query + position_bias.unsqueeze(0).unsqueeze(2)
-    content_scores = torch.matmul(
-        content_query,
-        key.permute(0, 1, 3, 2),
-    ).float()
-    position_scores = torch.matmul(
-        position_query,
-        position.permute(0, 1, 3, 2),
-    ).float()
+    content_scores = torch.matmul(content_query, key.permute(0, 1, 3, 2)).float()
+    position_scores = torch.matmul(position_query, position.permute(0, 1, 3, 2)).float()
     relative_indexes = (
         sequence_length
         - 1
@@ -890,11 +858,7 @@ def test_parakeet_flash_attention_reuses_context_across_shapes_and_streams(
     context = attention_engine.engine.create_execution_context()
     assert context is not None
     streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream.null)
-    shape_cases = (
-        (1, 1, (1,)),
-        (3, 65, (INT32_MIN, 34, INT32_MAX)),
-        (1, 33, (32,)),
-    )
+    shape_cases = ((1, 1, (1,)), (3, 65, (INT32_MIN, 34, INT32_MAX)), (1, 33, (32,)))
     for index, (batch, length, valid_lengths) in enumerate(shape_cases):
         stream = streams[index % len(streams)]
         inputs = make_inputs(

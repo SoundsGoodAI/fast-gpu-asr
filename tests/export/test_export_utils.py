@@ -234,8 +234,7 @@ def test_remove_onnx_artifacts_reports_missing_graph(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("location", ("", "../outside.data"), ids=("empty", "parent"))
 def test_remove_onnx_artifacts_rejects_unsafe_location(
-    tmp_path: Path,
-    location: str,
+    tmp_path: Path, location: str
 ) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -253,8 +252,7 @@ def test_remove_onnx_artifacts_rejects_unsafe_location(
 
 @pytest.mark.parametrize("inside", (False, True), ids=("outside", "inside"))
 def test_remove_onnx_artifacts_rejects_absolute_location(
-    tmp_path: Path,
-    inside: bool,
+    tmp_path: Path, inside: bool
 ) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -272,8 +270,7 @@ def test_remove_onnx_artifacts_rejects_absolute_location(
 
 @pytest.mark.parametrize("symlink_kind", ("parent", "file"))
 def test_remove_onnx_artifacts_rejects_symlink_escape(
-    tmp_path: Path,
-    symlink_kind: str,
+    tmp_path: Path, symlink_kind: str
 ) -> None:
     model_dir, outside_dir = tmp_path / "model", tmp_path / "outside"
     model_dir.mkdir()
@@ -312,8 +309,7 @@ def test_remove_onnx_artifacts_removes_graph_when_external_cleanup_fails(
 
 
 def test_build_tensorrt_engine_configures_dynamic_network(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake = fake_tensorrt
     inputs = [
@@ -381,9 +377,7 @@ def test_build_tensorrt_engine_configures_dynamic_network(
 
 @pytest.mark.parametrize("optimization_level", (0, 3))
 def test_build_tensorrt_engine_accepts_fully_static_network(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
-    optimization_level: int,
+    build_paths, fake_tensorrt: SimpleNamespace, optimization_level: int
 ) -> None:
     fake = fake_tensorrt
     fake.network.get_input.return_value.shape = (8, 3)
@@ -399,9 +393,7 @@ def test_build_tensorrt_engine_accepts_fully_static_network(
 
 @pytest.mark.parametrize("missing_flag", ("FP16", "BF16"))
 def test_build_tensorrt_engine_uses_available_precision_flags(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
-    missing_flag: str,
+    build_paths, fake_tensorrt: SimpleNamespace, missing_flag: str
 ) -> None:
     fake = fake_tensorrt
     flags = vars(fake.trt.BuilderFlag).copy()
@@ -418,9 +410,7 @@ def test_build_tensorrt_engine_uses_available_precision_flags(
 
 @pytest.mark.parametrize("optimization_level", (-1, 6, 1.5))
 def test_build_tensorrt_engine_rejects_invalid_optimization_level_before_setup(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
-    optimization_level: float | int,
+    build_paths, fake_tensorrt: SimpleNamespace, optimization_level: float | int
 ) -> None:
     with pytest.raises(ValueError, match="integer from 0 through 5"):
         build_tensorrt_engine(*build_paths, {}, optimization_level)
@@ -431,8 +421,7 @@ def test_build_tensorrt_engine_rejects_invalid_optimization_level_before_setup(
 
 
 def test_build_tensorrt_engine_requires_plugin_initialization(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake_tensorrt.trt.init_libnvinfer_plugins.return_value = False
 
@@ -446,8 +435,7 @@ def test_build_tensorrt_engine_requires_plugin_initialization(
 
 
 def test_build_tensorrt_engine_propagates_custom_plugin_failure_before_parse(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake_tensorrt.load_plugins.side_effect = RuntimeError("custom plugin failed")
 
@@ -460,8 +448,7 @@ def test_build_tensorrt_engine_propagates_custom_plugin_failure_before_parse(
 
 
 def test_build_tensorrt_engine_reports_every_parser_error(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake_tensorrt.parser.parse_from_file.return_value = False
 
@@ -485,10 +472,7 @@ def test_build_tensorrt_engine_reports_every_parser_error(
     ids=("missing", "extra", "wrong-name", "static"),
 )
 def test_build_tensorrt_engine_requires_exact_dynamic_profile_names(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
-    input_shape,
-    profiles,
+    build_paths, fake_tensorrt: SimpleNamespace, input_shape, profiles
 ) -> None:
     fake = fake_tensorrt
     fake.network.get_input.return_value.shape = input_shape
@@ -503,8 +487,7 @@ def test_build_tensorrt_engine_requires_exact_dynamic_profile_names(
 
 
 def test_build_tensorrt_engine_rejects_optimization_profile(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake = fake_tensorrt
     fake.config.add_optimization_profile.return_value = -1
@@ -519,8 +502,7 @@ def test_build_tensorrt_engine_rejects_optimization_profile(
 
 
 def test_build_tensorrt_engine_rejects_tactic_source_mask(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake = fake_tensorrt
     fake.config.set_tactic_sources.return_value = False
@@ -534,8 +516,7 @@ def test_build_tensorrt_engine_rejects_tactic_source_mask(
 
 
 def test_build_tensorrt_engine_reports_invalid_profile_shape(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake = fake_tensorrt
     profile_error = ValueError("inconsistent dimensions")
@@ -556,8 +537,7 @@ def test_build_tensorrt_engine_reports_invalid_profile_shape(
 
 
 def test_build_tensorrt_engine_preserves_existing_engine_when_build_fails(
-    build_paths,
-    fake_tensorrt: SimpleNamespace,
+    build_paths, fake_tensorrt: SimpleNamespace
 ) -> None:
     fake = fake_tensorrt
     fake.builder.build_serialized_network.return_value = None
@@ -597,8 +577,7 @@ def test_build_tensorrt_engine_executes_real_network(
     )
     onnx_path, engine_path = tmp_path / "model.onnx", tmp_path / "model.trt"
     onnx.save_model(
-        helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]),
-        onnx_path,
+        helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]), onnx_path
     )
     profiles = {"audio": ((2, 1), (2, 3), (2, 5))} if dynamic else {}
 

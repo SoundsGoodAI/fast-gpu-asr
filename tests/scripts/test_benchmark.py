@@ -79,14 +79,10 @@ def test_read_pcm16_normalizes_mono_waveform(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("channels", "sample_width"),
-    ((2, 2), (1, 1)),
-    ids=("stereo", "pcm8"),
+    ("channels", "sample_width"), ((2, 2), (1, 1)), ids=("stereo", "pcm8")
 )
 def test_read_pcm16_rejects_incompatible_wav(
-    tmp_path: Path,
-    channels: int,
-    sample_width: int,
+    tmp_path: Path, channels: int, sample_width: int
 ) -> None:
     wav_path = tmp_path / "audio.wav"
     write_wav(
@@ -402,8 +398,7 @@ def test_main_reports_synchronized_median_timings(
 
 
 def test_main_reads_wav_before_initializing_model(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wav_path = tmp_path / "audio.wav"
     write_wav(wav_path, np.zeros(8, dtype=np.int16), channels=2)

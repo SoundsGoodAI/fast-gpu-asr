@@ -99,9 +99,7 @@ class FakeEngine:
         return trt.TensorIOMode.OUTPUT
 
     def get_tensor_profile_shape(
-        self,
-        name: str,
-        profile_index: int,
+        self, name: str, profile_index: int
     ) -> tuple[tuple[int, ...], ...]:
         """Return dynamic profile shapes for a named input.
 
@@ -265,11 +263,7 @@ def install_fake_tokenizer(
                 return standalone_piece
             return "<unk>"
 
-    monkeypatch.setattr(
-        utils_module.spm,
-        "SentencePieceProcessor",
-        FakeTokenizer,
-    )
+    monkeypatch.setattr(utils_module.spm, "SentencePieceProcessor", FakeTokenizer)
 
 
 def make_zipformer_config(
@@ -444,10 +438,7 @@ def make_encoder_engine(
             "encoder_output": output_dtype,
             "encoder_output_lengths": trt.int32,
         },
-        {
-            "audio": audio_profile,
-            "audio_lengths": ((batch_size,),) * 3,
-        },
+        {"audio": audio_profile, "audio_lengths": ((batch_size,),) * 3},
     )
 
 
@@ -492,19 +483,10 @@ def make_decoder_engine(
         )
 
     decoder_dim = model_config.decoder_params.decoder_dim
-    state_shape = (
-        model_config.decoder_params.pred_rnn_layers,
-        capacity,
-        decoder_dim,
-    )
+    state_shape = (model_config.decoder_params.pred_rnn_layers, capacity, decoder_dim)
     return FakeEngine(
         ("encoder_output", "targets", "input_states_1", "input_states_2"),
-        (
-            "token_log_probs",
-            "duration_log_probs",
-            "output_states_1",
-            "output_states_2",
-        ),
+        ("token_log_probs", "duration_log_probs", "output_states_1", "output_states_2"),
         {
             "encoder_output": (capacity, model_config.decoder_params.encoder_dim),
             "targets": (capacity, 1),
@@ -577,11 +559,7 @@ TRANSDUCER_MODEL_FILES = {
     "parakeet": ("parakeet.trt", "tdt_decoder.trt"),
 }
 DECODER_TENSOR_RANKS = {
-    "zipformer": {
-        "decoder_input": 2,
-        "encoder_output": 2,
-        "tokens_log_prob": 2,
-    },
+    "zipformer": {"decoder_input": 2, "encoder_output": 2, "tokens_log_prob": 2},
     "parakeet": {
         "encoder_output": 2,
         "targets": 2,
@@ -680,8 +658,7 @@ def test_validate_model_config_reports_missing_required_field(
     ),
 )
 def test_validate_model_config_reports_mandatory_missing_value(
-    field: str,
-    value: str | None,
+    field: str, value: str | None
 ) -> None:
     model_config = make_parakeet_config()
     OmegaConf.update(model_config, field, value)
@@ -703,8 +680,7 @@ def test_validate_model_config_reports_mandatory_missing_value(
     ),
 )
 def test_validate_model_config_accepts_supported_decoder_modes(
-    architecture: str,
-    decoder_type: str,
+    architecture: str, decoder_type: str
 ) -> None:
     if architecture == "zipformer":
         model_config = make_zipformer_config(decoder_type)
@@ -750,9 +726,7 @@ def test_validate_model_config_accepts_supported_decoder_modes(
             id="zipformer-beam-equals-vocabulary",
         ),
         pytest.param(
-            "parakeet",
-            {"decoder_params.beam": 4},
-            id="parakeet-beam-equals-vocabulary",
+            "parakeet", {"decoder_params.beam": 4}, id="parakeet-beam-equals-vocabulary"
         ),
         pytest.param(
             "zipformer",
@@ -762,8 +736,7 @@ def test_validate_model_config_accepts_supported_decoder_modes(
     ),
 )
 def test_validate_model_config_accepts_inclusive_boundaries(
-    architecture: str,
-    updates: dict[str, int | float | list[int]],
+    architecture: str, updates: dict[str, int | float | list[int]]
 ) -> None:
     model_config = make_model_config(architecture)
     for field, value in updates.items():
@@ -785,12 +758,7 @@ def test_validate_model_config_accepts_ctc_without_transducer_decoder_fields() -
     ("architecture", "field", "value", "message"),
     (
         ("zipformer", "model_type", "unknown", "Unsupported model_type"),
-        (
-            "zipformer",
-            "decoder_type",
-            "unknown",
-            "Expected decoder_type to be one of",
-        ),
+        ("zipformer", "decoder_type", "unknown", "Expected decoder_type to be one of"),
         (
             "parakeet",
             "decoder_type",
@@ -800,10 +768,7 @@ def test_validate_model_config_accepts_ctc_without_transducer_decoder_fields() -
     ),
 )
 def test_validate_model_config_rejects_unsupported_modes(
-    architecture: str,
-    field: str,
-    value: str,
-    message: str,
+    architecture: str, field: str, value: str, message: str
 ) -> None:
     model_config = make_model_config(architecture)
     model_config[field] = value
@@ -817,8 +782,7 @@ def test_validate_model_config_wraps_unresolved_interpolation() -> None:
     model_config.model_type = "${missing_model_type}"
 
     with pytest.raises(
-        ASRInitializationError,
-        match="Failed to resolve model configuration",
+        ASRInitializationError, match="Failed to resolve model configuration"
     ) as error:
         validate_model_config(model_config)
 
@@ -831,8 +795,7 @@ def test_validate_model_config_wraps_interpolation_cycle() -> None:
     model_config.cycle_b = "${cycle_a}"
 
     with pytest.raises(
-        ASRInitializationError,
-        match="Failed to resolve model configuration",
+        ASRInitializationError, match="Failed to resolve model configuration"
     ) as error:
         validate_model_config(model_config)
 
@@ -873,10 +836,7 @@ def test_validate_model_config_rejects_blank_penalty_outside_float32(
         validate_model_config(model_config)
 
 
-@pytest.mark.parametrize(
-    "blank_penalty",
-    (float("inf"), float("nan"), 0),
-)
+@pytest.mark.parametrize("blank_penalty", (float("inf"), float("nan"), 0))
 def test_validate_model_config_rejects_non_float32_blank_penalty(
     blank_penalty: float | int,
 ) -> None:
@@ -902,8 +862,7 @@ def test_validate_model_config_rejects_non_dictconfig() -> None:
     ids=lambda value: str(value).replace(".", "-"),
 )
 def test_validate_model_config_rejects_zero_for_every_positive_integer(
-    architecture: str,
-    field: str,
+    architecture: str, field: str
 ) -> None:
     model_config = make_model_config(architecture)
     OmegaConf.update(model_config, field, 0)
@@ -922,9 +881,7 @@ def test_validate_model_config_rejects_zero_for_every_positive_integer(
     ),
 )
 def test_validate_model_config_rejects_invalid_integer_values(
-    architecture: str,
-    field: str,
-    value: int | float,
+    architecture: str, field: str, value: int | float
 ) -> None:
     model_config = make_model_config(architecture)
     OmegaConf.update(model_config, field, value)
@@ -935,16 +892,9 @@ def test_validate_model_config_rejects_invalid_integer_values(
 
 @pytest.mark.parametrize(
     "field",
-    (
-        "encoder_dims",
-        "num_encoder_layers",
-        "downsampling_factors",
-        "feedforward_dims",
-    ),
+    ("encoder_dims", "num_encoder_layers", "downsampling_factors", "feedforward_dims"),
 )
-def test_validate_model_config_requires_six_zipformer_stack_values(
-    field: str,
-) -> None:
+def test_validate_model_config_requires_six_zipformer_stack_values(field: str) -> None:
     model_config = make_zipformer_config()
     model_config.audio_encoder_params[field] = [1] * 5
 
@@ -966,8 +916,7 @@ def test_validate_model_config_requires_six_zipformer_stack_values(
     ),
 )
 def test_validate_model_config_propagates_non_iterable_metadata(
-    architecture: str,
-    field: str,
+    architecture: str, field: str
 ) -> None:
     model_config = make_model_config(architecture)
     OmegaConf.update(model_config, field, 1)
@@ -993,10 +942,7 @@ def test_validate_model_config_propagates_non_iterable_metadata(
         ),
         pytest.param(
             "zipformer",
-            {
-                "decoder_type": "transducer_greedy_search",
-                "decoder_params.beam": 2,
-            },
+            {"decoder_type": "transducer_greedy_search", "decoder_params.beam": 2},
             "Expected beam=1",
             id="greedy-beam",
         ),
@@ -1128,11 +1074,7 @@ def test_validate_model_config_propagates_non_iterable_metadata(
         ),
         pytest.param(
             "parakeet",
-            {
-                "vocab_size": 50_000,
-                "blank_id": 50_000,
-                "decoder_params.beam": 50_000,
-            },
+            {"vocab_size": 50_000, "blank_id": 50_000, "decoder_params.beam": 50_000},
             "Parakeet per-utterance search table",
             id="parakeet-search-overflow",
         ),
@@ -1228,9 +1170,7 @@ def test_validate_model_config_rejects_inconsistent_metadata(
     ),
 )
 def test_validate_model_config_rejects_invalid_audio_profile(
-    architecture: str,
-    updates: dict[str, int | float],
-    message: str,
+    architecture: str, updates: dict[str, int | float], message: str
 ) -> None:
     model_config = make_model_config(architecture)
     for field, value in updates.items():
@@ -1242,9 +1182,7 @@ def test_validate_model_config_rejects_invalid_audio_profile(
 
 @pytest.mark.parametrize("engine_name", ("zipformer.trt", "parakeet.trt"))
 def test_get_engine_loads_native_encoder_plugins(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    engine_name: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_name: str
 ) -> None:
     engine_path = tmp_path / engine_name
     engine_path.write_bytes(b"engine")
@@ -1312,11 +1250,7 @@ def test_get_engine_loads_native_encoder_plugins(
         return True
 
     monkeypatch.setattr(utils_module, "load_tensorrt_plugins", load_plugins)
-    monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        initialize_plugins,
-    )
+    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", initialize_plugins)
     monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
 
     assert get_engine(engine_path) is engine
@@ -1370,15 +1304,10 @@ def test_get_engine_wraps_native_plugin_load_failure(
         pytest.fail("TensorRT initialized after custom-plugin loading failed.")
 
     monkeypatch.setattr(utils_module, "load_tensorrt_plugins", fail_to_load_plugins)
-    monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        fail_to_initialize,
-    )
+    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", fail_to_initialize)
 
     with pytest.raises(
-        ASRInitializationError,
-        match="Failed to load TensorRT plugins",
+        ASRInitializationError, match="Failed to load TensorRT plugins"
     ) as error:
         get_engine(engine_path)
 
@@ -1387,9 +1316,7 @@ def test_get_engine_wraps_native_plugin_load_failure(
 
 @pytest.mark.parametrize("engine_name", ("decoder.trt", "tdt_decoder.trt"))
 def test_get_engine_does_not_load_native_plugins_for_decoder(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    engine_name: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_name: str
 ) -> None:
     engine_path = tmp_path / engine_name
     engine_path.write_bytes(b"engine")
@@ -1452,11 +1379,7 @@ def test_get_engine_does_not_load_native_plugins_for_decoder(
         "load_tensorrt_plugins",
         lambda: pytest.fail("Decoder engine unexpectedly loaded encoder plugins."),
     )
-    monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        initialize_plugins,
-    )
+    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", initialize_plugins)
     monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
 
     assert get_engine(engine_path) is engine
@@ -1514,9 +1437,7 @@ def test_get_engine_reports_deserialization_failure(
             return None
 
     monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        lambda _logger, _namespace: True,
+        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
     )
     monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
 
@@ -1530,8 +1451,7 @@ def test_get_engine_reports_deserialization_failure(
 
 
 def test_get_engine_wraps_runtime_construction_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
     engine_path.write_bytes(b"engine")
@@ -1554,9 +1474,7 @@ def test_get_engine_wraps_runtime_construction_failure(
         raise failure
 
     monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        lambda _logger, _namespace: True,
+        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
     )
     monkeypatch.setattr(utils_module.trt, "Runtime", make_runtime)
 
@@ -1567,8 +1485,7 @@ def test_get_engine_wraps_runtime_construction_failure(
 
 
 def test_get_engine_wraps_file_read_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
 
@@ -1603,15 +1520,9 @@ def test_get_engine_wraps_file_read_failure(
             pytest.fail(f"Unexpected engine bytes: {serialized_engine!r}")
 
     monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        lambda _logger, _namespace: True,
+        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
     )
-    monkeypatch.setattr(
-        utils_module.trt,
-        "Runtime",
-        FakeRuntime,
-    )
+    monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
 
     with pytest.raises(ASRInitializationError, match="Failed to deserialize") as error:
         get_engine(engine_path)
@@ -1620,8 +1531,7 @@ def test_get_engine_wraps_file_read_failure(
 
 
 def test_get_engine_reports_plugin_initialization_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
     engine_path.touch()
@@ -1638,9 +1548,7 @@ def test_get_engine_reports_plugin_initialization_failure(
         pytest.fail("Runtime constructed after TensorRT plugin initialization failed.")
 
     monkeypatch.setattr(
-        utils_module.trt,
-        "init_libnvinfer_plugins",
-        lambda _logger, _namespace: False,
+        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: False
     )
     monkeypatch.setattr(utils_module.trt, "Runtime", fail_to_make_runtime)
 
@@ -1650,17 +1558,9 @@ def test_get_engine_reports_plugin_initialization_failure(
 
 def test_get_names_preserves_engine_order() -> None:
     engine = FakeEngine(
-        ("second_input", "first_input"),
-        ("second_output", "first_output"),
-        {},
-        {},
+        ("second_input", "first_input"), ("second_output", "first_output"), {}, {}
     )
-    engine.names = (
-        "first_output",
-        "second_input",
-        "first_input",
-        "second_output",
-    )
+    engine.names = ("first_output", "second_input", "first_input", "second_output")
 
     assert get_names(engine) == (
         ("second_input", "first_input"),
@@ -1684,8 +1584,7 @@ def test_validate_tokenizer_reports_missing_model(tmp_path: Path) -> None:
 
 
 def test_validate_parakeet_tokenizer_uses_full_vocabulary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_fake_tokenizer(monkeypatch, tmp_path, vocab_size=4, unk_id=3)
 
@@ -1694,9 +1593,7 @@ def test_validate_parakeet_tokenizer_uses_full_vocabulary(
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 def test_validate_tokenizer_requires_standalone_word_boundary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    architecture: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     zipformer = architecture == "zipformer"
     unk_id = 4 if zipformer else 3
@@ -1715,8 +1612,7 @@ def test_validate_tokenizer_requires_standalone_word_boundary(
 
 
 def test_validate_tokenizer_reports_vocabulary_mismatch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_fake_tokenizer(monkeypatch, tmp_path, vocab_size=3, unk_id=2)
 
@@ -1736,23 +1632,14 @@ def test_validate_zipformer_tokenizer_reports_effective_vocabulary_mismatch(
     unk_id: int,
 ) -> None:
     install_fake_tokenizer(
-        monkeypatch,
-        tmp_path,
-        vocab_size=tokenizer_vocab_size,
-        unk_id=unk_id,
+        monkeypatch, tmp_path, vocab_size=tokenizer_vocab_size, unk_id=unk_id
     )
 
     with pytest.raises(ASRInitializationError, match="tokenizer vocabulary size 4"):
         validate_tokenizer(tmp_path, make_zipformer_config())
 
 
-@pytest.mark.parametrize(
-    ("tokenizer_vocab_size", "unk_id"),
-    (
-        (5, 4),
-        (4, 1),
-    ),
-)
+@pytest.mark.parametrize(("tokenizer_vocab_size", "unk_id"), ((5, 4), (4, 1)))
 def test_validate_zipformer_tokenizer_accepts_supported_vocab_layouts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1760,34 +1647,23 @@ def test_validate_zipformer_tokenizer_accepts_supported_vocab_layouts(
     unk_id: int,
 ) -> None:
     install_fake_tokenizer(
-        monkeypatch,
-        tmp_path,
-        vocab_size=tokenizer_vocab_size,
-        unk_id=unk_id,
+        monkeypatch, tmp_path, vocab_size=tokenizer_vocab_size, unk_id=unk_id
     )
 
     validate_tokenizer(tmp_path, make_zipformer_config())
 
 
 def test_validate_zipformer_tokenizer_requires_blank_token(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    install_fake_tokenizer(
-        monkeypatch,
-        tmp_path,
-        vocab_size=5,
-        unk_id=4,
-        blank_id=4,
-    )
+    install_fake_tokenizer(monkeypatch, tmp_path, vocab_size=5, unk_id=4, blank_id=4)
 
     with pytest.raises(ASRInitializationError, match="in-vocabulary <blk> token"):
         validate_tokenizer(tmp_path, make_zipformer_config())
 
 
 def test_validate_zipformer_tokenizer_rejects_invalid_blank_piece_round_trip(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_fake_tokenizer(
         monkeypatch,
@@ -1803,16 +1679,9 @@ def test_validate_zipformer_tokenizer_rejects_invalid_blank_piece_round_trip(
 
 
 def test_validate_zipformer_tokenizer_rejects_configured_blank_id_mismatch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    install_fake_tokenizer(
-        monkeypatch,
-        tmp_path,
-        vocab_size=5,
-        unk_id=4,
-        blank_id=1,
-    )
+    install_fake_tokenizer(monkeypatch, tmp_path, vocab_size=5, unk_id=4, blank_id=1)
     model_config = make_zipformer_config()
     model_config.blank_id = 0
 
@@ -1847,11 +1716,7 @@ def test_validate_tokenizer_reports_loader_failure(
         assert model_file == str(tokenizer_path)
         raise failure
 
-    monkeypatch.setattr(
-        utils_module.spm,
-        "SentencePieceProcessor",
-        fail_to_load,
-    )
+    monkeypatch.setattr(utils_module.spm, "SentencePieceProcessor", fail_to_load)
 
     with pytest.raises(
         ASRInitializationError, match="Failed to load SentencePiece"
@@ -1864,14 +1729,12 @@ def test_validate_tokenizer_reports_loader_failure(
 @pytest.mark.parametrize("output_dtype", (trt.float32, trt.float16, trt.bfloat16))
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 def test_validate_encoder_engine_accepts_supported_output_precision(
-    architecture: str,
-    output_dtype: trt.DataType,
+    architecture: str, output_dtype: trt.DataType
 ) -> None:
     model_config = make_model_config(architecture)
     assert (
         validate_encoder_engine(
-            make_encoder_engine(model_config, output_dtype),
-            model_config,
+            make_encoder_engine(model_config, output_dtype), model_config
         )
         == 2
     )
@@ -1883,17 +1746,11 @@ def test_validate_encoder_engine_accepts_supported_output_precision(
         ("audio", trt.float16, "encoder audio dtype"),
         ("audio_lengths", trt.int32, "encoder audio_lengths dtype"),
         ("encoder_output", trt.int32, "encoder_output dtype"),
-        (
-            "encoder_output_lengths",
-            trt.int64,
-            "encoder_output_lengths dtype",
-        ),
+        ("encoder_output_lengths", trt.int64, "encoder_output_lengths dtype"),
     ),
 )
 def test_validate_encoder_engine_rejects_invalid_dtype(
-    tensor_name: str,
-    dtype: trt.DataType,
-    message: str,
+    tensor_name: str, dtype: trt.DataType, message: str
 ) -> None:
     model_config = make_zipformer_config()
     engine = make_encoder_engine(model_config)
@@ -1906,8 +1763,7 @@ def test_validate_encoder_engine_rejects_invalid_dtype(
 @pytest.mark.parametrize("io_kind", ("input", "output"))
 @pytest.mark.parametrize("mutation", ("missing", "extra"))
 def test_validate_encoder_engine_rejects_invalid_io_signature(
-    io_kind: str,
-    mutation: str,
+    io_kind: str, mutation: str
 ) -> None:
     model_config = make_zipformer_config()
     engine = make_encoder_engine(model_config)
@@ -1943,13 +1799,7 @@ def test_validate_encoder_engine_rejects_audio_profile_mismatch(
 
 @pytest.mark.parametrize(
     "malformation",
-    (
-        "missing_shape",
-        "rank_one",
-        "zero_batch",
-        "oversized_batch",
-        "variable_batch",
-    ),
+    ("missing_shape", "rank_one", "zero_batch", "oversized_batch", "variable_batch"),
 )
 def test_validate_encoder_engine_rejects_malformed_audio_profile(
     malformation: str,
@@ -2017,9 +1867,7 @@ def test_validate_encoder_engine_rejects_lengths_profile_mismatch() -> None:
     ids=lambda value: str(value),
 )
 def test_validate_encoder_engine_rejects_tensor_shape_mismatch(
-    architecture: str,
-    tensor_name: str,
-    dimension: int,
+    architecture: str, tensor_name: str, dimension: int
 ) -> None:
     model_config = make_model_config(architecture)
     engine = make_encoder_engine(model_config)
@@ -2036,14 +1884,11 @@ def test_validate_encoder_engine_rejects_tensor_shape_mismatch(
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 @pytest.mark.parametrize("floating_dtype", (trt.float32, trt.float16, trt.bfloat16))
 def test_validate_decoder_engine_accepts_supported_precision(
-    architecture: str,
-    floating_dtype: trt.DataType,
+    architecture: str, floating_dtype: trt.DataType
 ) -> None:
     model_config = make_model_config(architecture)
     validate_decoder_engine(
-        make_decoder_engine(model_config, floating_dtype),
-        model_config,
-        2,
+        make_decoder_engine(model_config, floating_dtype), model_config, 2
     )
 
 
@@ -2057,8 +1902,7 @@ def test_validate_decoder_engine_accepts_supported_precision(
     ids=lambda value: str(value),
 )
 def test_validate_decoder_engine_rejects_mixed_floating_precision(
-    architecture: str,
-    tensor_name: str,
+    architecture: str, tensor_name: str
 ) -> None:
     model_config = make_model_config(architecture)
     engine = make_decoder_engine(model_config)
@@ -2090,9 +1934,7 @@ def test_validate_decoder_engine_rejects_uniform_unsupported_precision(
     ),
 )
 def test_validate_parakeet_decoder_rejects_boundary_dtype(
-    tensor_name: str,
-    dtype: trt.DataType,
-    message: str,
+    tensor_name: str, dtype: trt.DataType, message: str
 ) -> None:
     model_config = make_parakeet_config()
     engine = make_decoder_engine(model_config)
@@ -2110,9 +1952,7 @@ def test_validate_parakeet_decoder_rejects_boundary_dtype(
     ),
 )
 def test_validate_zipformer_decoder_rejects_boundary_dtype(
-    tensor_name: str,
-    dtype: trt.DataType,
-    message: str,
+    tensor_name: str, dtype: trt.DataType, message: str
 ) -> None:
     model_config = make_zipformer_config()
     engine = make_decoder_engine(model_config)
@@ -2130,22 +1970,15 @@ def test_validate_decoder_engine_rejects_invalid_batch_size(
 
     with pytest.raises(ASRInitializationError, match="decoder batch size"):
         validate_decoder_engine(
-            make_decoder_engine(model_config),
-            model_config,
-            cast(int, batch_size),
+            make_decoder_engine(model_config), model_config, cast(int, batch_size)
         )
 
 
-@pytest.mark.parametrize(
-    "architecture",
-    ("zipformer", "parakeet"),
-)
+@pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 @pytest.mark.parametrize("io_kind", ("input", "output"))
 @pytest.mark.parametrize("mutation", ("missing", "extra"))
 def test_validate_decoder_engine_rejects_invalid_io_signature(
-    architecture: str,
-    io_kind: str,
-    mutation: str,
+    architecture: str, io_kind: str, mutation: str
 ) -> None:
     model_config = make_model_config(architecture)
     engine = make_decoder_engine(model_config)
@@ -2176,9 +2009,7 @@ def test_validate_decoder_engine_rejects_invalid_io_signature(
     ids=lambda value: str(value),
 )
 def test_validate_decoder_engine_rejects_shape_mismatch(
-    architecture: str,
-    tensor_name: str,
-    dimension: int,
+    architecture: str, tensor_name: str, dimension: int
 ) -> None:
     model_config = make_model_config(architecture)
     engine = make_decoder_engine(model_config)
@@ -2196,9 +2027,7 @@ def test_validate_decoder_engine_rejects_capacity_overflow() -> None:
 
     with pytest.raises(ASRInitializationError, match="decoder capacity exceeds"):
         validate_decoder_engine(
-            make_decoder_engine(model_config),
-            model_config,
-            batch_size,
+            make_decoder_engine(model_config), model_config, batch_size
         )
 
 
@@ -2231,23 +2060,16 @@ def test_validate_zipformer_context_lookup_reports_missing_cache(
 
 
 @pytest.mark.parametrize(
-    "error_type",
-    (EOFError, OSError, RuntimeError, UnpicklingError),
+    "error_type", (EOFError, OSError, RuntimeError, UnpicklingError)
 )
 def test_validate_zipformer_context_lookup_wraps_load_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    error_type: type[Exception],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
 ) -> None:
     context_lookup_path = tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE
     context_lookup_path.touch()
     failure = error_type("invalid cache")
 
-    def fail_to_load(
-        path: Path,
-        map_location: str,
-        weights_only: bool,
-    ) -> None:
+    def fail_to_load(path: Path, map_location: str, weights_only: bool) -> None:
         """Validate cache-loading options and raise the configured failure.
 
         Parameters
@@ -2273,8 +2095,7 @@ def test_validate_zipformer_context_lookup_wraps_load_failure(
     monkeypatch.setattr(utils_module.torch, "load", fail_to_load)
 
     with pytest.raises(
-        ASRInitializationError,
-        match="Failed to load predictor context cache",
+        ASRInitializationError, match="Failed to load predictor context cache"
     ) as error:
         validate_zipformer_context_lookup(tmp_path, make_zipformer_config())
 
@@ -2284,9 +2105,7 @@ def test_validate_zipformer_context_lookup_wraps_load_failure(
 @pytest.mark.parametrize("dtype", (torch.float16, torch.float32, torch.bfloat16))
 @pytest.mark.parametrize("context_size", (1, 2))
 def test_validate_zipformer_context_lookup_accepts_supported_dtype(
-    tmp_path: Path,
-    dtype: torch.dtype,
-    context_size: int,
+    tmp_path: Path, dtype: torch.dtype, context_size: int
 ) -> None:
     model_config = make_zipformer_config()
     model_config.decoder_params.context_size = context_size
@@ -2315,9 +2134,7 @@ def test_validate_zipformer_context_lookup_accepts_supported_dtype(
     ),
 )
 def test_validate_zipformer_context_lookup_rejects_invalid_content(
-    tmp_path: Path,
-    malformation: str,
-    message: str,
+    tmp_path: Path, malformation: str, message: str
 ) -> None:
     model_config = make_zipformer_config()
     expected_shape = (
@@ -2358,8 +2175,7 @@ def test_validate_zipformer_context_lookup_rejects_invalid_content(
 
 
 def test_validate_model_rejects_config_before_reading_bundle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_config = make_zipformer_config()
     model_config.decoder_params.beam = 0
@@ -2376,8 +2192,7 @@ def test_validate_model_rejects_config_before_reading_bundle(
 
 
 def test_validate_model_stops_after_tokenizer_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     failure = ASRInitializationError("invalid tokenizer")
 
@@ -2414,9 +2229,7 @@ def test_validate_model_stops_after_tokenizer_failure(
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 def test_validate_model_reports_missing_transducer_decoder_before_loading_encoder(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    architecture: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     model_config = make_model_config(architecture)
     encoder_filename, decoder_filename = TRANSDUCER_MODEL_FILES[architecture]
@@ -2451,9 +2264,7 @@ def test_validate_model_reports_missing_transducer_decoder_before_loading_encode
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 def test_validate_model_rejects_encoder_before_loading_decoder(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    architecture: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     model_config = make_model_config(architecture)
     encoder_filename, decoder_filename = TRANSDUCER_MODEL_FILES[architecture]
@@ -2486,15 +2297,13 @@ def test_validate_model_rejects_encoder_before_loading_decoder(
     monkeypatch.setattr(utils_module, "get_engine", load_engine)
 
     with pytest.raises(
-        ASRInitializationError,
-        match="encoder tensor encoder_output_lengths shape",
+        ASRInitializationError, match="encoder tensor encoder_output_lengths shape"
     ):
         validate_model(tmp_path, model_config)
 
 
 def test_validate_model_rejects_decoder_before_loading_context_cache(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_config = make_zipformer_config()
     encoder_path = tmp_path / "zipformer.trt"
@@ -2506,15 +2315,10 @@ def test_validate_model_rejects_decoder_before_loading_context_cache(
         decoder.shapes["tokens_log_prob"][0],
         model_config.vocab_size + 1,
     )
-    engines = {
-        encoder_path: make_encoder_engine(model_config),
-        decoder_path: decoder,
-    }
+    engines = {encoder_path: make_encoder_engine(model_config), decoder_path: decoder}
 
     monkeypatch.setattr(
-        utils_module,
-        "validate_tokenizer",
-        lambda _model_dir, _model_config: None,
+        utils_module, "validate_tokenizer", lambda _model_dir, _model_config: None
     )
     monkeypatch.setattr(utils_module, "get_engine", engines.__getitem__)
     monkeypatch.setattr(
@@ -2531,9 +2335,7 @@ def test_validate_model_rejects_decoder_before_loading_context_cache(
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 def test_validate_model_reports_missing_encoder_before_loading_engines(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    architecture: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     model_config = make_model_config(architecture)
     encoder_filename = TRANSDUCER_MODEL_FILES[architecture][0]
@@ -2566,8 +2368,7 @@ def test_validate_model_reports_missing_encoder_before_loading_engines(
 
 
 def test_validate_model_accepts_complete_zipformer_ctc_bundle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_config = make_zipformer_config("ctc_greedy_search")
     (tmp_path / "zipformer.trt").touch()
@@ -2588,11 +2389,7 @@ def test_validate_model_accepts_complete_zipformer_ctc_bundle(
 
         tokenizer_calls.append((model_dir, config))
 
-    monkeypatch.setattr(
-        utils_module,
-        "validate_tokenizer",
-        validate_tokenizer,
-    )
+    monkeypatch.setattr(utils_module, "validate_tokenizer", validate_tokenizer)
     monkeypatch.setattr(
         utils_module,
         "validate_zipformer_context_lookup",
@@ -2630,10 +2427,7 @@ def test_validate_model_accepts_complete_zipformer_ctc_bundle(
     ("architecture", "batch_size"), (("zipformer", 3), ("parakeet", 5))
 )
 def test_validate_model_accepts_complete_transducer_bundle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    architecture: str,
-    batch_size: int,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str, batch_size: int
 ) -> None:
     model_config = make_model_config(architecture)
     encoder_filename, decoder_filename = TRANSDUCER_MODEL_FILES[architecture]
@@ -2687,9 +2481,7 @@ def test_validate_model_accepts_complete_transducer_bundle(
         context_calls.append((model_dir, config))
 
     monkeypatch.setattr(
-        utils_module,
-        "validate_zipformer_context_lookup",
-        validate_context,
+        utils_module, "validate_zipformer_context_lookup", validate_context
     )
 
     validate_model(tmp_path, model_config)

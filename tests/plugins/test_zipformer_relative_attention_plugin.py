@@ -64,9 +64,7 @@ type InputSpec = tuple[trt.DataType, tuple[int, ...]]
 
 
 @pytest.fixture(scope="module")
-def plugin_creator(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> PluginCreatorFixture:
+def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFixture:
     """Compile and register the current relative-attention plugin source.
 
     Parameters
@@ -111,9 +109,7 @@ def make_plugin(creator: trt.IPluginCreatorV3One) -> trt.IPluginV3:
     """
 
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection([]),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection([]), trt.TensorRTPhase.BUILD
     )
     assert plugin is not None
     return plugin
@@ -121,8 +117,7 @@ def make_plugin(creator: trt.IPluginCreatorV3One) -> trt.IPluginV3:
 
 @pytest.fixture(scope="module", params=DTYPE_CASES, ids=lambda case: case.name)
 def relative_attention_engine(
-    request: pytest.FixtureRequest,
-    plugin_creator: PluginCreatorFixture,
+    request: pytest.FixtureRequest, plugin_creator: PluginCreatorFixture
 ) -> RelativeAttentionEngine:
     """Build one dynamic relative-attention engine for a supported dtype.
 
@@ -235,9 +230,7 @@ def make_inputs(
         0.0, 0.25, (batch_size, sequence_length, projection_dim)
     ).astype(np.float32)
     position = rng.normal(
-        0.0,
-        0.25,
-        (1, 2 * sequence_length - 1, num_heads, POSITION_DIM),
+        0.0, 0.25, (1, 2 * sequence_length - 1, num_heads, POSITION_DIM)
     ).astype(np.float32)
     mask = np.zeros((batch_size, sequence_length), dtype=np.bool_)
     for batch in range(batch_size):
@@ -519,14 +512,12 @@ def test_relative_attention_plugin_applies_relative_offset(
     relative_offset = 2
     content_dim = DEFAULT_NUM_HEADS * DEFAULT_QUERY_DIM
     projection = np.zeros(
-        (1, sequence_length, DEFAULT_PROJECTION_DIM),
-        dtype=np.float32,
+        (1, sequence_length, DEFAULT_PROJECTION_DIM), dtype=np.float32
     )
     for head in range(DEFAULT_NUM_HEADS):
         projection[:, :, 2 * content_dim + head * POSITION_DIM] = 20.0
     position = np.zeros(
-        (1, 2 * sequence_length - 1, DEFAULT_NUM_HEADS, POSITION_DIM),
-        dtype=np.float32,
+        (1, 2 * sequence_length - 1, DEFAULT_NUM_HEADS, POSITION_DIM), dtype=np.float32
     )
     position[:, sequence_length - 1 + relative_offset, :, 0] = 20.0
     mask = np.zeros((1, sequence_length), dtype=np.bool_)
@@ -534,40 +525,31 @@ def test_relative_attention_plugin_applies_relative_offset(
     run = run_engine(engine, dtype_case, (projection, position, mask))
     actual = assert_run_matches_reference(run, dtype_case, (projection, position, mask))
     expected = np.zeros(
-        (
-            1,
-            DEFAULT_NUM_HEADS,
-            sequence_length - relative_offset,
-            sequence_length,
-        ),
+        (1, DEFAULT_NUM_HEADS, sequence_length - relative_offset, sequence_length),
         dtype=np.float32,
     )
     query_indices = np.arange(sequence_length - relative_offset)
     expected[:, :, query_indices, query_indices + relative_offset] = 1.0
     np.testing.assert_array_equal(
-        actual[:, :, : sequence_length - relative_offset],
-        expected,
+        actual[:, :, : sequence_length - relative_offset], expected
     )
 
 
 @pytest.mark.parametrize("sequence_length", KERNEL_BOUNDARIES)
 def test_relative_attention_plugin_exercises_every_kernel_boundary_key(
-    relative_attention_engine: RelativeAttentionEngine,
-    sequence_length: int,
+    relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
     content_dim = DEFAULT_NUM_HEADS * DEFAULT_QUERY_DIM
     projection = np.zeros(
-        (1, sequence_length, DEFAULT_PROJECTION_DIM),
-        dtype=np.float32,
+        (1, sequence_length, DEFAULT_PROJECTION_DIM), dtype=np.float32
     )
     for head in range(DEFAULT_NUM_HEADS):
         channel = head * DEFAULT_QUERY_DIM
         projection[0, :, channel] = 20.0
         projection[0, sequence_length - 1, content_dim + channel] = 20.0
     position = np.zeros(
-        (1, 2 * sequence_length - 1, DEFAULT_NUM_HEADS, POSITION_DIM),
-        dtype=np.float32,
+        (1, 2 * sequence_length - 1, DEFAULT_NUM_HEADS, POSITION_DIM), dtype=np.float32
     )
     mask = np.zeros((1, sequence_length), dtype=np.bool_)
 
@@ -581,8 +563,7 @@ def test_relative_attention_plugin_exercises_every_kernel_boundary_key(
 
 @pytest.mark.parametrize("sequence_length", MASKING_KERNEL_CASES)
 def test_relative_attention_plugin_contains_nonfinite_padding(
-    relative_attention_engine: RelativeAttentionEngine,
-    sequence_length: int,
+    relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
     projection, position, mask = make_inputs(1, sequence_length)
@@ -609,9 +590,7 @@ def test_relative_attention_plugin_contains_nonfinite_padding(
     ),
 )
 def test_relative_attention_plugin_supports_head_layouts(
-    relative_attention_engine: RelativeAttentionEngine,
-    num_heads: int,
-    query_dim: int,
+    relative_attention_engine: RelativeAttentionEngine, num_heads: int, query_dim: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
     inputs = make_inputs(2, 17, num_heads, query_dim)
@@ -632,8 +611,7 @@ def test_relative_attention_plugin_matches_pytorch_without_padding(
 
 @pytest.mark.parametrize("sequence_length", MASKING_KERNEL_CASES)
 def test_relative_attention_plugin_handles_fully_padded_sequence(
-    relative_attention_engine: RelativeAttentionEngine,
-    sequence_length: int,
+    relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
     projection, position, _ = make_inputs(1, sequence_length)
@@ -792,9 +770,7 @@ def test_relative_attention_creator_rejects_fields(
         "unexpected", np.array([1], dtype=np.int32), trt.PluginFieldType.INT32
     )
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection([field]),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection([field]), trt.TensorRTPhase.BUILD
     )
     assert plugin is None
 

@@ -76,14 +76,11 @@ class SelfAttention(torch.nn.Module):
             x = x.reshape(
                 batch_size, x.size(1), self.num_heads, x.size(2) // self.num_heads
             ).permute(0, 2, 1, 3)
-            x = torch.matmul(attn_weights, x)
-            x = x.permute(0, 2, 1, 3)
+            x = torch.matmul(attn_weights, x).permute(0, 2, 1, 3)
             x = x.reshape(batch_size, x.size(1), self.num_heads * x.size(3))
 
         # The returned value has the same (N, T, C) shape as the input.
-        x = self.out_proj(x)
-
-        return x
+        return self.out_proj(x)
 
 
 class NonlinAttention(torch.nn.Module):
@@ -126,9 +123,7 @@ class NonlinAttention(torch.nn.Module):
             NTC layout, avoiding external head-layout transposes.
         """
 
-        x = self.in_proj(x)
-
-        s, x, y = x.chunk(3, dim=2)
+        s, x, y = self.in_proj(x).chunk(3, dim=2)
         x = x * torch.tanh(s)
         attn_weights = attn_weights.to(x.dtype)
 
@@ -144,10 +139,7 @@ class NonlinAttention(torch.nn.Module):
         else:
             x = torch.matmul(attn_weights[:, 0], x)
 
-        x = x * y
-        x = self.out_proj(x)
-
-        return x
+        return self.out_proj(x * y)
 
 
 class RelPositionMultiheadAttentionWeights(torch.nn.Module):
@@ -280,8 +272,7 @@ class RelPositionMultiheadAttentionWeights(torch.nn.Module):
             batch_size, self.num_heads, sequence_length, position.size(3)
         )
 
-        scores = torch.matmul(query, key)
-        scores = scores + position_scores[:, :, :, :sequence_length]
+        scores = torch.matmul(query, key) + position_scores[:, :, :, :sequence_length]
         expanded_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
         scores = torch.softmax(scores.masked_fill(expanded_mask, float("-inf")), dim=3)
         # Define an all-masked row as zero and make source exclusion exact.
@@ -377,9 +368,7 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         """
 
         # (2 * seq_len - 1, embed_dim), i.e. (pos_len, embed_dim).
-        pos_emb = self.pos_emb[
+        return self.pos_emb[
             self.pos_emb.size(0) // 2 - x.size(1) + 1 : self.pos_emb.size(0) // 2
             + x.size(1)
         ].unsqueeze(0)
-
-        return pos_emb

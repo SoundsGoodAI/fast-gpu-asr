@@ -12,16 +12,9 @@ import torch
 from onnx.reference import ReferenceEvaluator
 
 from fast_gpu_asr.constants import ONNX_OPSET_VERSION, ZERO_LOG
-from fast_gpu_asr.export.model.zipformer.subsampling import (
-    BiasNorm,
-    Conv2dSubsampling,
-)
+from fast_gpu_asr.export.model.zipformer.subsampling import BiasNorm, Conv2dSubsampling
 
-DTYPE_TOLERANCES = {
-    torch.float32: 1e-6,
-    torch.float16: 1e-3,
-    torch.bfloat16: 1e-2,
-}
+DTYPE_TOLERANCES = {torch.float32: 1e-6, torch.float16: 1e-3, torch.bfloat16: 1e-2}
 
 
 def make_random_tensor(
@@ -44,8 +37,7 @@ def make_random_tensor(
         Standard-normal CPU samples in the requested shape and dtype.
     """
 
-    generator = torch.Generator().manual_seed(seed)
-    return torch.randn(shape, generator=generator).to(dtype)
+    return torch.randn(shape, generator=torch.Generator().manual_seed(seed)).to(dtype)
 
 
 def fill_right_padding(features: torch.Tensor, lengths: torch.Tensor) -> None:
@@ -176,15 +168,9 @@ def reference_subsampling(
         )
 
     output_frame_capacity = (features.size(1) - 7) // 2
-    output_lengths = torch.clamp(
-        (lengths - 7) // 2,
-        min=0,
-        max=output_frame_capacity,
-    )
+    output_lengths = torch.clamp((lengths - 7) // 2, min=0, max=output_frame_capacity)
     valid_frames = torch.arange(
-        output_frame_capacity,
-        dtype=output_lengths.dtype,
-        device=output_lengths.device,
+        output_frame_capacity, dtype=output_lengths.dtype, device=output_lengths.device
     ).unsqueeze(0) < output_lengths.unsqueeze(1)
 
     output = output * valid_frames.unsqueeze(1).unsqueeze(3)
@@ -203,9 +189,7 @@ def reference_subsampling(
     )
     output = torch.nn.functional.softplus(output - 4.0) - 0.08 * output - 0.035
     output = torch.nn.functional.linear(
-        output,
-        module.pointwise_conv2.weight,
-        module.pointwise_conv2.bias,
+        output, module.pointwise_conv2.weight, module.pointwise_conv2.bias
     ).permute(0, 3, 1, 2)
     output = bypass + output
 
@@ -216,10 +200,11 @@ def reference_subsampling(
     output = torch.nn.functional.linear(output, module.out.weight, module.out.bias)
     output_dtype = output.dtype
     output = output.float()
-    rms = torch.mean(
-        (output - module.out_norm.bias.float()) ** 2, dim=2, keepdim=True
-    ).sqrt()
-    rms = rms.clamp_min(torch.finfo(torch.float32).tiny)
+    rms = (
+        torch.mean((output - module.out_norm.bias.float()) ** 2, dim=2, keepdim=True)
+        .sqrt()
+        .clamp_min(torch.finfo(torch.float32).tiny)
+    )
     output = (output * module.out_norm.scale.float() / rms).to(output_dtype)
 
     return output, output_lengths
@@ -383,10 +368,7 @@ def test_partitioned_zipformer_subsampling_onnx_matches_dynamic_time(
         "features",
         "feature_lengths",
     ]
-    assert [value.name for value in model.graph.output] == [
-        "output",
-        "output_lengths",
-    ]
+    assert [value.name for value in model.graph.output] == ["output", "output_lengths"]
     features_shape = get_onnx_shape(model.graph.input[0])
     output_shape = get_onnx_shape(model.graph.output[0])
     assert features_shape == (4, "num_frames", 16)
@@ -437,8 +419,7 @@ def test_partitioned_zipformer_subsampling_onnx_matches_dynamic_time(
                 features.clone(), lengths.clone()
             )
         actual_output, actual_lengths = evaluator.run(
-            None,
-            {"features": features.numpy(), "feature_lengths": lengths.numpy()},
+            None, {"features": features.numpy(), "feature_lengths": lengths.numpy()}
         )
         np.testing.assert_allclose(
             actual_output,
@@ -474,10 +455,7 @@ def test_zipformer_subsampling_valid_prefix_is_invariant_to_right_padding(
     assert extended_output_lengths.tolist() == [8, 16, 17]
     valid_length = compact_output_lengths[0].item()
     torch.testing.assert_close(
-        compact[0, :valid_length],
-        extended[0, :valid_length],
-        atol=1e-6,
-        rtol=1e-6,
+        compact[0, :valid_length], extended[0, :valid_length], atol=1e-6, rtol=1e-6
     )
 
 

@@ -135,9 +135,7 @@ class Decoder(torch.nn.Module):
         )
 
         if self.context_size > 1:
-            embeddings = embeddings.permute(0, 2, 1)
-            embeddings = self.conv(embeddings)
-            embeddings = embeddings.permute(0, 2, 1)
+            embeddings = self.conv(embeddings.permute(0, 2, 1)).permute(0, 2, 1)
 
         features = embeddings[:, 0, :]
         if self.context_size > 1:
@@ -186,6 +184,4 @@ class Joiner(torch.nn.Module):
         """
 
         logits = self.output_proj(torch.tanh(encoder_out + decoder_out))
-        probs = torch.log_softmax(logits.to(torch.float32), dim=1)
-
-        return probs
+        return torch.log_softmax(logits.to(torch.float32), dim=1)

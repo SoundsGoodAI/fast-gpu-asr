@@ -135,9 +135,7 @@ def parse_args() -> argparse.Namespace:
         help="TensorRT builder optimization level.",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Keep intermediate ONNX models.",
+        "--debug", action="store_true", help="Keep intermediate ONNX models."
     )
     return parser.parse_args()
 
@@ -188,7 +186,7 @@ def extract_member(archive: tarfile.TarFile, filename: str, output_dir: Path) ->
     if source is None:
         raise FileNotFoundError(f"Unable to read {member.name} from Parakeet archive.")
 
-    output_path = output_dir / Path(filename).name
+    output_path = output_dir / basename
     with source, open(output_path, "wb") as output_file:
         shutil.copyfileobj(source, output_file)
 
@@ -228,9 +226,7 @@ def extract_parakeet_archive(
         config_path = extract_member(archive, "model_config.yaml", output_dir)
         checkpoint_path = extract_member(archive, "model_weights.ckpt", output_dir)
         model_config = OmegaConf.load(config_path)
-        tokenizer_path = str(model_config.tokenizer.model_path)
-        if tokenizer_path.startswith("nemo:"):
-            tokenizer_path = tokenizer_path.removeprefix("nemo:")
+        tokenizer_path = str(model_config.tokenizer.model_path).removeprefix("nemo:")
         tokenizer_path = extract_member(archive, Path(tokenizer_path).name, output_dir)
 
     return config_path, checkpoint_path, tokenizer_path
@@ -281,9 +277,7 @@ def adjust_state_dict(
             .replace("encoder.pre_encode.conv.5", "encoder.pre_encode.conv3")
             .replace("encoder.pre_encode.conv.6", "encoder.pre_encode.pointwise_conv2")
         )
-        if key.endswith(
-            ("conv.pointwise_conv1.weight", "conv.pointwise_conv2.weight"),
-        ):
+        if key.endswith(("conv.pointwise_conv1.weight", "conv.pointwise_conv2.weight")):
             if value.ndim != 3 or value.size(2) != 1:
                 raise ValueError(
                     f"Expected pointwise Conv1d weight {key} to have shape "
@@ -291,7 +285,7 @@ def adjust_state_dict(
                 )
             value = value.squeeze(2)
         if key.endswith(
-            ("feed_forward1.linear2.weight", "feed_forward2.linear2.weight"),
+            ("feed_forward1.linear2.weight", "feed_forward2.linear2.weight")
         ):
             value = value * 0.5
 
@@ -548,7 +542,7 @@ def make_runtime_config(
                 "max_symbols_per_timestep": model_config.decoding.greedy.max_symbols,
                 "tdt_durations": list(model_config.model_defaults.tdt_durations),
             },
-        },
+        }
     )
     validate_model_config(runtime_config)
     return runtime_config
@@ -623,16 +617,10 @@ def export_model_to_onnx(
                 torch.zeros(decoder_batch, encoder_dim, dtype=decoder_dtype),
                 torch.zeros(decoder_batch, 1, dtype=torch.int32),
                 torch.zeros(
-                    pred_rnn_layers,
-                    decoder_batch,
-                    decoder_dim,
-                    dtype=decoder_dtype,
+                    pred_rnn_layers, decoder_batch, decoder_dim, dtype=decoder_dtype
                 ),
                 torch.zeros(
-                    pred_rnn_layers,
-                    decoder_batch,
-                    decoder_dim,
-                    dtype=decoder_dtype,
+                    pred_rnn_layers, decoder_batch, decoder_dim, dtype=decoder_dtype
                 ),
             ),
             decoder_path,
@@ -749,7 +737,7 @@ def export_parakeet(args: argparse.Namespace) -> None:
         round(args.max_audio_seconds * model_config.sample_rate),
     )
     encoder_profiles = {
-        "audio": tuple((args.batch_size, samples) for samples in audio_samples),
+        "audio": tuple((args.batch_size, samples) for samples in audio_samples)
     }
     build_tensorrt_engine(
         encoder_onnx_path,
@@ -768,8 +756,7 @@ def export_parakeet(args: argparse.Namespace) -> None:
         remove_onnx_artifacts(encoder_onnx_path)
         remove_onnx_artifacts(decoder_onnx_path)
 
-    published_config = OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE)
-    validate_model(args.output_dir, published_config)
+    validate_model(args.output_dir, OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE))
 
     logger.info("Parakeet TensorRT export completed in %s.", args.output_dir)
 

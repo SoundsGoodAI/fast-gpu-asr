@@ -16,12 +16,7 @@ import tensorrt as trt
 from cuda.bindings import runtime
 
 from ..constants import AUDIO_SAMPLES_PER_WORKER
-from ..utils import (
-    ASRInferenceError,
-    ASRInitializationError,
-    get_engine,
-    get_names,
-)
+from ..utils import ASRInferenceError, ASRInitializationError, get_engine, get_names
 
 
 class Encoder:
@@ -91,16 +86,13 @@ class Encoder:
             self.context_memory_size = 0
 
             lengths_shape = tuple(engine.get_tensor_shape("audio_lengths"))
-            output_lengths_shape = tuple(
-                engine.get_tensor_shape("encoder_output_lengths")
-            )
-
             self.lengths = cp.empty(lengths_shape, dtype=self.dtypes["audio_lengths"])
             self.lengths_host = cpx.empty_pinned(
                 lengths_shape, dtype=self.dtypes["audio_lengths"]
             )
             self.output_lengths = cp.empty(
-                output_lengths_shape, dtype=self.dtypes["encoder_output_lengths"]
+                tuple(engine.get_tensor_shape("encoder_output_lengths")),
+                dtype=self.dtypes["encoder_output_lengths"],
             )
             self.audio: cp.ndarray | None = None
             self.audio_host: np.typing.NDArray[np.float32] | None = None
@@ -121,8 +113,7 @@ class Encoder:
                 // AUDIO_SAMPLES_PER_WORKER,
             )
             self.audio_copy_pool = ThreadPoolExecutor(
-                max_workers=audio_copy_workers,
-                thread_name_prefix="fast-gpu-asr-audio",
+                max_workers=audio_copy_workers, thread_name_prefix="fast-gpu-asr-audio"
             )
 
     def copy_audio_range(
@@ -157,8 +148,7 @@ class Encoder:
             reflected_samples = min(waveform_samples, self.right_padding_samples)
             np.copyto(
                 audio_host[
-                    index,
-                    waveform_samples : waveform_samples + reflected_samples,
+                    index, waveform_samples : waveform_samples + reflected_samples
                 ],
                 waveform[waveform_samples - reflected_samples :][::-1],
             )

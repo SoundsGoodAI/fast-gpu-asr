@@ -488,13 +488,11 @@ class ZipformerModifiedBeamSearchDecoder:
                 )
 
             if max_frames > self.frame_capacity:
-                num_hypotheses = self.batch_size * self.beam
-                node_elements = num_hypotheses * max_frames
                 output_elements = self.batch_size * max_frames
 
-                self.node_parents = cp.empty(node_elements, dtype=np.int32)
-                self.node_tokens = cp.empty(node_elements, dtype=np.int32)
-                self.node_timestamps = cp.empty(node_elements, dtype=np.float32)
+                self.node_parents = cp.empty(history_elements, dtype=np.int32)
+                self.node_tokens = cp.empty(history_elements, dtype=np.int32)
+                self.node_timestamps = cp.empty(history_elements, dtype=np.float32)
                 self.output_tokens = cp.empty(output_elements, dtype=np.int32)
                 self.output_timestamps = cp.empty(output_elements, dtype=np.float32)
                 self.frame_capacity = max_frames

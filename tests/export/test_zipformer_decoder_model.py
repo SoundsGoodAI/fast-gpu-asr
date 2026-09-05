@@ -95,9 +95,7 @@ def test_predictor_matches_reference(
     ) * (contexts.unsqueeze(2) >= 0)
     if context_size > 1:
         features = torch.nn.functional.conv1d(
-            embeddings.permute(0, 2, 1),
-            decoder.conv.weight,
-            groups=decoder_dim // 4,
+            embeddings.permute(0, 2, 1), decoder.conv.weight, groups=decoder_dim // 4
         )[:, :, 0].relu()
     else:
         features = embeddings[:, 0]

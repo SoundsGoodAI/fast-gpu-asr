@@ -152,16 +152,13 @@ def make_fields(
 
     values = {
         "frame_shift": np.array(
-            [FRAME_SHIFT if extractor is None else extractor.hop_length],
-            dtype=np.int32,
+            [FRAME_SHIFT if extractor is None else extractor.hop_length], dtype=np.int32
         ),
         "preemph": np.array(
-            [PREEMPH if extractor is None else extractor.preemph],
-            dtype=np.float32,
+            [PREEMPH if extractor is None else extractor.preemph], dtype=np.float32
         ),
         "log_eps": np.array(
-            [LOG_EPS if extractor is None else extractor.log_eps],
-            dtype=np.float32,
+            [LOG_EPS if extractor is None else extractor.log_eps], dtype=np.float32
         ),
         "eps": np.array(
             [NORMALIZATION_EPS if extractor is None else extractor.eps],
@@ -565,10 +562,7 @@ def assert_valid_features_are_normalized(
 
         valid_features = utterance[:feature_length].astype(np.float64)
         np.testing.assert_allclose(
-            valid_features.mean(axis=0),
-            0.0,
-            rtol=0.0,
-            atol=1e-4,
+            valid_features.mean(axis=0), 0.0, rtol=0.0, atol=1e-4
         )
         standard_deviations = valid_features.std(axis=0, ddof=1)
         assert np.all((standard_deviations > 0.99) & (standard_deviations < 1.001))
@@ -605,11 +599,7 @@ def feature_input_specs(
     if dtypes is None:
         dtypes = (trt.float32, trt.int64, trt.float32, trt.float32)
     return tuple(
-        zip(
-            dtypes,
-            (audio_shape, length_shape, window_shape, mel_shape),
-            strict=True,
-        )
+        zip(dtypes, (audio_shape, length_shape, window_shape, mel_shape), strict=True)
     )
 
 
@@ -617,10 +607,7 @@ INVALID_CONTRACT_CASES = (
     pytest.param(feature_input_specs(audio_shape=(640,)), id="audio-rank"),
     pytest.param(feature_input_specs(length_shape=(1, 1)), id="length-rank"),
     pytest.param(feature_input_specs(window_shape=(1, FFT_LENGTH)), id="window-rank"),
-    pytest.param(
-        feature_input_specs(mel_shape=(MEL_FREQUENCIES,)),
-        id="mel-rank",
-    ),
+    pytest.param(feature_input_specs(mel_shape=(MEL_FREQUENCIES,)), id="mel-rank"),
     pytest.param(
         feature_input_specs(dtypes=(trt.float16, trt.int64, trt.float32, trt.float32)),
         id="audio-dtype",
@@ -639,16 +626,12 @@ INVALID_CONTRACT_CASES = (
     ),
     pytest.param(feature_input_specs(length_shape=(2,)), id="batch-mismatch"),
     pytest.param(
-        feature_input_specs(
-            window_shape=(1,),
-            mel_shape=(1, NUM_FEATURES),
-        ),
+        feature_input_specs(window_shape=(1,), mel_shape=(1, NUM_FEATURES)),
         id="window-too-short",
     ),
     pytest.param(
         feature_input_specs(
-            window_shape=(FFT_LENGTH - 1,),
-            mel_shape=(FFT_LENGTH // 2, NUM_FEATURES),
+            window_shape=(FFT_LENGTH - 1,), mel_shape=(FFT_LENGTH // 2, NUM_FEATURES)
         ),
         id="window-odd",
     ),
@@ -664,20 +647,15 @@ INVALID_CONTRACT_CASES = (
         id="too-many-frequencies",
     ),
     pytest.param(feature_input_specs()[:3], id="missing-input"),
-    pytest.param(
-        feature_input_specs() + ((trt.float32, (1,)),),
-        id="extra-input",
-    ),
+    pytest.param(feature_input_specs() + ((trt.float32, (1,)),), id="extra-input"),
 )
 WORKSPACE_OVERFLOW_SPECS = feature_input_specs(
-    audio_shape=(260, 640_200),
-    length_shape=(260,),
+    audio_shape=(260, 640_200), length_shape=(260,)
 )
 
 
 def build_static_contract(
-    creator: trt.IPluginCreatorV3One,
-    input_specs: tuple[InputSpec, ...],
+    creator: trt.IPluginCreatorV3One, input_specs: tuple[InputSpec, ...]
 ) -> tuple[bool, trt.IHostMemory | None]:
     """Build one static plugin contract and report whether its layer was added.
 
@@ -739,11 +717,7 @@ def test_parakeet_feature_plugin_matches_pytorch(
     lengths = np.array(length_values, dtype=np.int64)
     audio = make_audio(lengths, samples)
     actual, actual_lengths = assert_run_matches_pytorch(
-        run_engine(engine, audio, lengths),
-        extractor,
-        audio,
-        lengths,
-        atol,
+        run_engine(engine, audio, lengths), extractor, audio, lengths, atol
     )
     np.testing.assert_array_equal(actual_lengths, lengths // FRAME_SHIFT)
     assert_valid_features_are_normalized(actual, actual_lengths)
@@ -806,10 +780,7 @@ def test_parakeet_feature_plugin_ignores_trailing_padding_extent(
     np.testing.assert_array_equal(short_lengths, (10,))
     np.testing.assert_array_equal(long_lengths, short_lengths)
     np.testing.assert_allclose(
-        long_features[0, :10],
-        short_features[0, :10],
-        rtol=FEATURE_RTOL,
-        atol=2e-3,
+        long_features[0, :10], short_features[0, :10], rtol=FEATURE_RTOL, atol=2e-3
     )
 
 
@@ -842,10 +813,7 @@ def test_parakeet_feature_plugin_supports_concurrent_contexts(
 ) -> None:
     _, engine, extractor = feature_engine
     host_cases = []
-    for audio_samples, length_values in (
-        (640, (480,)),
-        (4000, (3840, 1920, 320)),
-    ):
+    for audio_samples, length_values in ((640, (480,)), (4000, (3840, 1920, 320))):
         lengths = np.array(length_values, dtype=np.int64)
         host_cases.append((make_audio(lengths, audio_samples), lengths))
 
@@ -861,9 +829,7 @@ def test_parakeet_feature_plugin_rejects_runtime_batch_mismatch(
 ) -> None:
     _, engine, _ = feature_engine
     run = prepare_run(
-        engine,
-        np.zeros((2, 1920), dtype=np.float32),
-        np.zeros(1, dtype=np.int64),
+        engine, np.zeros((2, 1920), dtype=np.float32), np.zeros(1, dtype=np.int64)
     )
     with run.stream:
         executed = run.context.execute_async_v3(run.stream.ptr)
@@ -881,18 +847,13 @@ def test_parakeet_feature_plugin_full_scale_pcm_is_finite(
     audio = np.tile(np.array((-1.0, 1.0), dtype=np.float32), 2000).reshape(1, -1)
 
     assert_run_matches_pytorch(
-        run_engine(engine, audio, lengths),
-        extractor,
-        audio,
-        lengths,
-        atol=7e-3,
+        run_engine(engine, audio, lengths), extractor, audio, lengths, atol=7e-3
     )
 
 
 @pytest.mark.parametrize("batch_size", (3, 256), ids=("small", "profile-maximum"))
 def test_parakeet_feature_plugin_returns_zero_for_silence(
-    feature_engine: FeatureEngine,
-    batch_size: int,
+    feature_engine: FeatureEngine, batch_size: int
 ) -> None:
     _, engine, extractor = feature_engine
     lengths = np.full(batch_size, 4000, dtype=np.int64)
@@ -901,15 +862,11 @@ def test_parakeet_feature_plugin_returns_zero_for_silence(
     audio = np.zeros((batch_size, 4000), dtype=np.float32)
 
     actual, actual_lengths = assert_run_matches_pytorch(
-        run_engine(engine, audio, lengths),
-        extractor,
-        audio,
-        lengths,
+        run_engine(engine, audio, lengths), extractor, audio, lengths
     )
 
     np.testing.assert_array_equal(
-        actual_lengths,
-        (lengths // FRAME_SHIFT).astype(np.int32),
+        actual_lengths, (lengths // FRAME_SHIFT).astype(np.int32)
     )
     np.testing.assert_array_equal(actual, 0.0)
 
@@ -925,10 +882,7 @@ def test_parakeet_feature_plugin_ignores_nonfinite_padding(
     audio[1, 1281::2] = -np.inf
 
     assert_run_matches_pytorch(
-        run_engine(engine, audio, lengths),
-        extractor,
-        audio,
-        lengths,
+        run_engine(engine, audio, lengths), extractor, audio, lengths
     )
 
 
@@ -996,18 +950,11 @@ def test_parakeet_feature_plugin_clamps_lengths_and_zeroes_short_utterances(
     lengths = np.array(length_values, dtype=np.int64)
     audio = (
         np.random.default_rng(seed)
-        .normal(
-            0.0,
-            0.05,
-            (len(lengths), samples),
-        )
+        .normal(0.0, 0.05, (len(lengths), samples))
         .astype(np.float32)
     )
     actual, actual_lengths = assert_run_matches_pytorch(
-        run_engine(engine, audio, lengths),
-        extractor,
-        audio,
-        lengths,
+        run_engine(engine, audio, lengths), extractor, audio, lengths
     )
     np.testing.assert_array_equal(actual_lengths, expected_lengths)
     for utterance, length in zip(actual, actual_lengths, strict=True):
@@ -1017,8 +964,7 @@ def test_parakeet_feature_plugin_clamps_lengths_and_zeroes_short_utterances(
 
 @pytest.mark.parametrize("input_specs", INVALID_CONTRACT_CASES)
 def test_parakeet_feature_plugin_rejects_invalid_contracts(
-    plugin_creator: PluginCreatorFixture,
-    input_specs: tuple[InputSpec, ...],
+    plugin_creator: PluginCreatorFixture, input_specs: tuple[InputSpec, ...]
 ) -> None:
     _, creator = plugin_creator
     _, serialized_engine = build_static_contract(creator, input_specs)
@@ -1030,10 +976,7 @@ def test_parakeet_feature_plugin_rejects_invalid_contracts(
     (
         pytest.param(feature_input_specs(), id="default"),
         pytest.param(
-            feature_input_specs(
-                window_shape=(2,),
-                mel_shape=(2, NUM_FEATURES),
-            ),
+            feature_input_specs(window_shape=(2,), mel_shape=(2, NUM_FEATURES)),
             id="minimum-even-fft",
         ),
         pytest.param(
@@ -1046,8 +989,7 @@ def test_parakeet_feature_plugin_rejects_invalid_contracts(
     ),
 )
 def test_parakeet_feature_plugin_accepts_valid_static_contract(
-    plugin_creator: PluginCreatorFixture,
-    input_specs: tuple[InputSpec, ...],
+    plugin_creator: PluginCreatorFixture, input_specs: tuple[InputSpec, ...]
 ) -> None:
     _, creator = plugin_creator
     _, serialized_engine = build_static_contract(creator, input_specs)
@@ -1059,8 +1001,7 @@ def test_parakeet_feature_plugin_rejects_workspace_overflow(
 ) -> None:
     _, creator = plugin_creator
     layer_added, serialized_engine = build_static_contract(
-        creator,
-        WORKSPACE_OVERFLOW_SPECS,
+        creator, WORKSPACE_OVERFLOW_SPECS
     )
 
     assert layer_added
@@ -1076,8 +1017,7 @@ def test_parakeet_feature_plugin_rejects_workspace_overflow(
     ),
 )
 def test_parakeet_feature_plugin_rejects_invalid_profile_endpoints(
-    plugin_creator: PluginCreatorFixture,
-    length_batches: tuple[int, ...],
+    plugin_creator: PluginCreatorFixture, length_batches: tuple[int, ...]
 ) -> None:
     _, creator = plugin_creator
     result = build_feature_engine(
@@ -1153,9 +1093,7 @@ def test_parakeet_feature_timing_cache_depends_on_frontend(
 @pytest.mark.parametrize("name", FIELD_NAMES)
 @pytest.mark.parametrize("problem", ("missing", "wrong-type"))
 def test_parakeet_feature_creator_requires_correctly_typed_fields(
-    plugin_creator: PluginCreatorFixture,
-    name: str,
-    problem: str,
+    plugin_creator: PluginCreatorFixture, name: str, problem: str
 ) -> None:
     _, creator = plugin_creator
     if problem == "missing":
@@ -1168,9 +1106,7 @@ def test_parakeet_feature_creator_requires_correctly_typed_fields(
         )
         fields = make_fields({name: value})
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection(fields),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection(fields), trt.TensorRTPhase.BUILD
     )
     assert plugin is None
 
@@ -1178,18 +1114,14 @@ def test_parakeet_feature_creator_requires_correctly_typed_fields(
 @pytest.mark.parametrize("name", ("frame_shift", "eps"), ids=("integer", "float"))
 @pytest.mark.parametrize("count", (0, 2), ids=("empty", "multiple"))
 def test_parakeet_feature_creator_rejects_non_scalar_field(
-    plugin_creator: PluginCreatorFixture,
-    name: str,
-    count: int,
+    plugin_creator: PluginCreatorFixture, name: str, count: int
 ) -> None:
     _, creator = plugin_creator
     dtype = np.int32 if name == "frame_shift" else np.float32
     value = FRAME_SHIFT if name == "frame_shift" else NORMALIZATION_EPS
     fields = make_fields({name: np.full(count, value, dtype=dtype)})
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection(fields),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection(fields), trt.TensorRTPhase.BUILD
     )
     assert plugin is None
 
@@ -1201,9 +1133,7 @@ def test_parakeet_feature_creator_rejects_duplicate_field(
     fields = make_fields()
     fields.append(fields[0])
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection(fields),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection(fields), trt.TensorRTPhase.BUILD
     )
     assert plugin is None
 
@@ -1215,9 +1145,7 @@ def test_parakeet_feature_creator_accepts_reordered_and_unknown_fields(
     fields = make_fields({"implementation_metadata": np.array([1], dtype=np.int32)})
     fields.reverse()
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection(fields),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection(fields), trt.TensorRTPhase.BUILD
     )
     assert plugin is not None
 
@@ -1276,16 +1204,12 @@ def test_parakeet_feature_creator_accepts_valid_parameter_boundaries(
     ),
 )
 def test_parakeet_feature_creator_rejects_invalid_parameter(
-    plugin_creator: PluginCreatorFixture,
-    name: str,
-    value: int | float,
+    plugin_creator: PluginCreatorFixture, name: str, value: int | float
 ) -> None:
     _, creator = plugin_creator
     dtype = np.int32 if name == "frame_shift" else np.float32
     fields = make_fields({name: np.array([value], dtype=dtype)})
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection(fields),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection(fields), trt.TensorRTPhase.BUILD
     )
     assert plugin is None

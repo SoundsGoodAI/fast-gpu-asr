@@ -24,11 +24,7 @@ pytestmark = pytest.mark.cuda
 
 PLUGIN_NAME = ZIPFORMER_ATTENTION_VALUE_PLUGIN_NAME
 PLUGIN_VERSION = "1"
-DTYPE_CASES = (
-    "float32",
-    "float16",
-    pytest.param("bfloat16", marks=pytest.mark.sm80),
-)
+DTYPE_CASES = ("float32", "float16", pytest.param("bfloat16", marks=pytest.mark.sm80))
 
 
 @dataclass(frozen=True)
@@ -110,9 +106,7 @@ type InputSpec = tuple[trt.DataType, tuple[int, ...]]
 
 
 @pytest.fixture(scope="module")
-def plugin_creator(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> PluginCreatorFixture:
+def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFixture:
     """Compile and register the current attention-value plugin source.
 
     Parameters
@@ -160,9 +154,7 @@ def make_plugin(creator: trt.IPluginCreatorV3One, value_heads: int) -> trt.IPlug
     value = np.array([value_heads], dtype=np.int32)
     field = trt.PluginField("num_heads", value, trt.PluginFieldType.INT32)
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection([field]),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection([field]), trt.TensorRTPhase.BUILD
     )
     assert plugin is not None
     return plugin
@@ -201,8 +193,7 @@ def set_profile_shape(
 
 @pytest.fixture(scope="module", params=DTYPE_CASES)
 def attention_engine(
-    request: pytest.FixtureRequest,
-    plugin_creator: PluginCreatorFixture,
+    request: pytest.FixtureRequest, plugin_creator: PluginCreatorFixture
 ) -> AttentionEngine:
     """Build all production layouts and a guaranteed cuBLAS fallback per dtype.
 
@@ -230,16 +221,12 @@ def attention_engine(
     profile = builder.create_optimization_profile()
     for case in LAYER_CASES:
         attention = network.add_input(
-            case.attention_name,
-            dtype,
-            (-1, case.attention_heads, -1, -1),
+            case.attention_name, dtype, (-1, case.attention_heads, -1, -1)
         )
         value = network.add_input(case.value_name, dtype, (-1, -1, case.channels))
         assert attention is not None and value is not None
         layer = network.add_plugin_v3(
-            [attention, value],
-            [],
-            make_plugin(creator, case.value_heads),
+            [attention, value], [], make_plugin(creator, case.value_heads)
         )
         assert layer is not None
         output = layer.get_output(0)
@@ -285,9 +272,7 @@ def attention_engine(
 
 
 def make_host_inputs(
-    batch_size: int,
-    sequence_length: int,
-    seed: int,
+    batch_size: int, sequence_length: int, seed: int
 ) -> dict[str, np.typing.NDArray]:
     """Create deterministic, distinct attention and value inputs for every layer.
 
@@ -311,23 +296,19 @@ def make_host_inputs(
     for index, case in enumerate(LAYER_CASES):
         attention_rng = np.random.default_rng(seed + 101 * (index + 1))
         logits = attention_rng.normal(
-            size=(batch_size, case.attention_heads, sequence_length, sequence_length),
+            size=(batch_size, case.attention_heads, sequence_length, sequence_length)
         ).astype(np.float32)
         logits -= logits.max(axis=3, keepdims=True)
         attention = np.exp(logits)
         inputs[case.attention_name] = attention / attention.sum(axis=3, keepdims=True)
         inputs[case.value_name] = rng.normal(
-            0.0,
-            0.5,
-            (batch_size, sequence_length, case.channels),
+            0.0, 0.5, (batch_size, sequence_length, case.channels)
         ).astype(np.float32)
     return inputs
 
 
 def reference_attention_value(
-    attention: np.typing.NDArray,
-    value: np.typing.NDArray,
-    value_heads: int,
+    attention: np.typing.NDArray, value: np.typing.NDArray, value_heads: int
 ) -> np.typing.NDArray:
     """Evaluate NHTT-by-NTC in NumPy; a single value head uses attention head zero.
 
@@ -349,10 +330,7 @@ def reference_attention_value(
     batch, frames, channels = value.shape
     values_by_head = value.reshape(batch, frames, value_heads, channels // value_heads)
     return np.einsum(
-        "nhqk,nkhd->nqhd",
-        attention[:, :value_heads],
-        values_by_head,
-        optimize=True,
+        "nhqk,nkhd->nqhd", attention[:, :value_heads], values_by_head, optimize=True
     ).reshape(value.shape)
 
 
@@ -399,9 +377,7 @@ def prepare_engine_run(
             shape = tuple(context.get_tensor_shape(case.output_name))
             assert shape == host_inputs[case.value_name].shape
             buffers[case.output_name] = cp.full(
-                shape,
-                cp.nan,
-                dtype=attention_engine.dtype,
+                shape, cp.nan, dtype=attention_engine.dtype
             )
         for name, buffer in buffers.items():
             assert context.set_tensor_address(name, buffer.data.ptr)
@@ -467,8 +443,7 @@ def assert_run_matches_reference(
     }
     for name, expected in expected_inputs.items():
         np.testing.assert_array_equal(
-            cp.asnumpy(run.buffers[name]).astype(np.float32),
-            expected,
+            cp.asnumpy(run.buffers[name]).astype(np.float32), expected
         )
     for case in LAYER_CASES:
         actual = cp.asnumpy(run.buffers[case.output_name]).astype(np.float32)
@@ -490,9 +465,7 @@ def assert_run_matches_reference(
     ("batch_size", "sequence_length"), ((1, 1), (1, 3), (2, 17), (3, 65))
 )
 def test_attention_value_plugin_matches_reference(
-    attention_engine: AttentionEngine,
-    batch_size: int,
-    sequence_length: int,
+    attention_engine: AttentionEngine, batch_size: int, sequence_length: int
 ) -> None:
     inputs = make_host_inputs(
         batch_size, sequence_length, 1000 + batch_size * 100 + sequence_length
@@ -532,8 +505,7 @@ def test_attention_value_plugin_accumulates_products_in_fp32(
             (1, case.attention_heads, 4, 4), dtype=np.float32
         )
         inputs[case.value_name] = np.broadcast_to(
-            values_by_key.reshape(1, 4, 1),
-            (1, 4, case.channels),
+            values_by_key.reshape(1, 4, 1), (1, 4, case.channels)
         ).copy()
     run = run_engine(attention_engine, inputs)
     run.stream.synchronize()
@@ -598,8 +570,7 @@ def test_attention_value_plugin_supports_concurrent_contexts(
 
 @pytest.mark.parametrize("relationship", ("batch", "sequence", "non-square-attention"))
 def test_attention_value_plugin_rejects_runtime_shape_mismatch(
-    attention_engine: AttentionEngine,
-    relationship: str,
+    attention_engine: AttentionEngine, relationship: str
 ) -> None:
     inputs = make_host_inputs(2, 17, seed=6000)
     case = LAYER_CASES[0]
@@ -725,12 +696,10 @@ def test_attention_value_plugin_accepts_valid_static_contracts(
         pytest.param(attention_value_input_specs((2, 4, 7)), id="attention-rank"),
         pytest.param(attention_value_input_specs(value_shape=(2, 7)), id="value-rank"),
         pytest.param(
-            attention_value_input_specs((0, 4, 7, 7), (0, 7, 48)),
-            id="empty-batch",
+            attention_value_input_specs((0, 4, 7, 7), (0, 7, 48)), id="empty-batch"
         ),
         pytest.param(
-            attention_value_input_specs((2, 4, 0, 0), (2, 0, 48)),
-            id="empty-sequence",
+            attention_value_input_specs((2, 4, 0, 0), (2, 0, 48)), id="empty-sequence"
         ),
         pytest.param(
             attention_value_input_specs((2, 0, 7, 7)), id="empty-attention-heads"
@@ -768,14 +737,12 @@ def test_attention_value_plugin_accepts_valid_static_contracts(
         ),
         pytest.param(attention_value_input_specs()[:1], id="missing-input"),
         pytest.param(
-            attention_value_input_specs() + ((trt.float16, (1,)),),
-            id="extra-input",
+            attention_value_input_specs() + ((trt.float16, (1,)),), id="extra-input"
         ),
     ),
 )
 def test_attention_value_plugin_rejects_invalid_contracts(
-    plugin_creator: PluginCreatorFixture,
-    input_specs: tuple[InputSpec, ...],
+    plugin_creator: PluginCreatorFixture, input_specs: tuple[InputSpec, ...]
 ) -> None:
     _, creator = plugin_creator
     assert build_contract(creator, 4, input_specs) is None
@@ -796,9 +763,7 @@ def test_attention_value_plugin_accepts_valid_profile(
 @pytest.mark.parametrize("endpoint", (0, 1, 2), ids=("min", "opt", "max"))
 @pytest.mark.parametrize("relationship", ("batch", "sequence", "non-square-attention"))
 def test_attention_value_plugin_rejects_invalid_profile_endpoints(
-    plugin_creator: PluginCreatorFixture,
-    endpoint: int,
-    relationship: str,
+    plugin_creator: PluginCreatorFixture, endpoint: int, relationship: str
 ) -> None:
     _, creator = plugin_creator
     attention_shapes = [[1, 4, 1, 1], [2, 4, 17, 17], [3, 4, 65, 65]]
@@ -824,7 +789,7 @@ def test_attention_value_creator_exposes_complete_contract(
         TENSORRT_PLUGIN_NAMESPACE,
     )
     assert [(field.name, field.type, field.size) for field in creator.field_names] == [
-        ("num_heads", trt.PluginFieldType.INT32, 1),
+        ("num_heads", trt.PluginFieldType.INT32, 1)
     ]
 
     plugin = make_plugin(creator, 4)
@@ -884,9 +849,7 @@ def test_attention_value_creator_rejects_malformed_num_heads(
     _, creator = plugin_creator
     field = trt.PluginField("num_heads", values, field_type)
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection([field]),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection([field]), trt.TensorRTPhase.BUILD
     )
     assert plugin is None
 

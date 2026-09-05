@@ -106,9 +106,7 @@ class ParakeetTDTEncoder(torch.nn.Module):
             module.to(dtype=dtype)
 
     def forward(
-        self,
-        audio: torch.Tensor,
-        audio_lengths: torch.Tensor,
+        self, audio: torch.Tensor, audio_lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert padded waveforms into encoder embeddings.
 
@@ -132,9 +130,7 @@ class ParakeetTDTEncoder(torch.nn.Module):
 
         features, feature_lengths = self.feature_extractor(audio, audio_lengths)
         features = features.to(self.encoder.pre_encode.conv1.weight.dtype)
-        encoder_out, encoder_out_lengths = self.encoder(features, feature_lengths)
-
-        return encoder_out, encoder_out_lengths
+        return self.encoder(features, feature_lengths)
 
 
 class FastConformer(torch.nn.Module):
@@ -287,23 +283,10 @@ class ConformerLayer(torch.nn.Module):
         """
 
         # Checkpoint loading folds the Macaron 0.5 scale into both FFN outputs.
-        residual = x
-        x = self.norm_feed_forward1(x)
-        x = self.feed_forward1(x)
-        residual = residual + x
-
-        x = self.norm_self_att(residual)
-        x = self.self_attn(x, pos_emb, output_lengths)
-        residual = residual + x
-
-        x = self.norm_conv(residual)
-        x = self.conv(x, output_lengths)
-        residual = residual + x
-
-        x = self.norm_feed_forward2(residual)
-        x = self.feed_forward2(x)
-        x = residual + x
-
+        x = x + self.feed_forward1(self.norm_feed_forward1(x))
+        x = x + self.self_attn(self.norm_self_att(x), pos_emb, output_lengths)
+        x = x + self.conv(self.norm_conv(x), output_lengths)
+        x = x + self.feed_forward2(self.norm_feed_forward2(x))
         return self.norm_out(x)
 
 
@@ -334,20 +317,10 @@ class ConvSubsampling(torch.nn.Module):
         self.relu = torch.nn.ReLU()
         self.conv1 = torch.nn.Conv2d(1, conv_channels, 3, stride=2, padding=1)
         self.conv2 = torch.nn.Conv2d(
-            conv_channels,
-            conv_channels,
-            3,
-            stride=2,
-            padding=1,
-            groups=conv_channels,
+            conv_channels, conv_channels, 3, stride=2, padding=1, groups=conv_channels
         )
         self.conv3 = torch.nn.Conv2d(
-            conv_channels,
-            conv_channels,
-            3,
-            stride=2,
-            padding=1,
-            groups=conv_channels,
+            conv_channels, conv_channels, 3, stride=2, padding=1, groups=conv_channels
         )
 
         self.pointwise_conv1 = torch.nn.Conv2d(conv_channels, conv_channels, 1)
@@ -479,11 +452,7 @@ class ConformerFeedForward(torch.nn.Module):
             ``(batch_size, num_frames, model_dim)``.
         """
 
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-
-        return x
+        return self.linear2(self.activation(self.linear1(x)))
 
 
 class ConformerConvolution(torch.nn.Module):
@@ -535,8 +504,7 @@ class ConformerConvolution(torch.nn.Module):
         the depthwise weights and emits one native TensorRT plugin node.
         """
 
-        x = self.pointwise_conv1(x)
-        x = torch.nn.functional.glu(x, dim=2)
+        x = torch.nn.functional.glu(self.pointwise_conv1(x), dim=2)
 
         if torch.onnx.is_in_onnx_export():
             batch_norm_scale = self.batch_norm.weight * torch.rsqrt(
@@ -565,11 +533,9 @@ class ConformerConvolution(torch.nn.Module):
                 x.size(1), dtype=output_lengths.dtype, device=output_lengths.device
             ).unsqueeze(0) >= output_lengths.unsqueeze(1)
             x = x.masked_fill(padding_mask.unsqueeze(2), 0.0).permute(0, 2, 1)
-            x = torch.nn.functional.pad(x, (self.padding, self.padding))
-            x = self.depthwise_conv(x)
-            x = self.batch_norm(x)
-            x = self.activation(x).permute(0, 2, 1)
+            x = self.depthwise_conv(
+                torch.nn.functional.pad(x, (self.padding, self.padding))
+            )
+            x = self.activation(self.batch_norm(x)).permute(0, 2, 1)
 
-        x = self.pointwise_conv2(x)
-
-        return x
+        return self.pointwise_conv2(x)

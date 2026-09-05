@@ -192,9 +192,7 @@ def read_files(directory: Path) -> dict[str, bytes]:
 
 
 def run_build_wheel(
-    repository_dir: Path,
-    arguments: tuple[str, ...] = (),
-    **environment_overrides: str,
+    repository_dir: Path, arguments: tuple[str, ...] = (), **environment_overrides: str
 ) -> tuple[subprocess.CompletedProcess[str], list[CommandRecord]]:
     """Run outside the temporary repository and collect shim invocations.
 

@@ -136,9 +136,7 @@ def parse_args() -> argparse.Namespace:
         help="TensorRT builder optimization level.",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Keep intermediate ONNX models.",
+        "--debug", action="store_true", help="Keep intermediate ONNX models."
     )
     return parser.parse_args()
 
@@ -178,9 +176,8 @@ def adjust_state_dict(
     adjusted_state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
     bypass_scale_pattern = re.compile(r"encoder_\d+\.layers\.\d+\.bypass_scale")
 
-    for original_key, original_value in state_dict.items():
+    for original_key, value in state_dict.items():
         key = original_key
-        value = original_value
         if "log_scale" in key:
             key = key.replace("log_scale", "scale")
             value = torch.exp(value)
@@ -207,9 +204,8 @@ def adjust_state_dict(
             .replace("encoders.5", "encoder_6")
             .replace("out_combiner.bypass_scale", "bypass_scale")
             .replace("joiner.encoder_proj", "projection_output")
+            .removeprefix("encoder.")
         )
-        if key.startswith("encoder."):
-            key = key.removeprefix("encoder.")
         if bypass_scale_pattern.fullmatch(key):
             continue
         if key in (
@@ -494,7 +490,7 @@ def make_runtime_config(
                 "context_size": model_params.context_size,
                 "decoder_dim": model_params.decoder_dim,
                 "joiner_dim": model_params.joiner_dim,
-            },
+            }
         )
 
     runtime_config = OmegaConf.create(
@@ -533,7 +529,7 @@ def make_runtime_config(
                 "max_audio_seconds": args.max_audio_seconds,
             },
             "decoder_params": decoder_params,
-        },
+        }
     )
     validate_model_config(runtime_config)
     return runtime_config
@@ -792,7 +788,7 @@ def export_zipformer(args: argparse.Namespace) -> None:
         "audio": tuple(
             (args.batch_size, samples + right_padding_samples)
             for samples in audio_samples
-        ),
+        )
     }
     build_tensorrt_engine(
         encoder_onnx_path,
@@ -813,8 +809,7 @@ def export_zipformer(args: argparse.Namespace) -> None:
         if decoder_onnx_path is not None:
             remove_onnx_artifacts(decoder_onnx_path)
 
-    published_config = OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE)
-    validate_model(args.output_dir, published_config)
+    validate_model(args.output_dir, OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE))
 
     logger.info("Zipformer TensorRT export completed in %s.", args.output_dir)
 

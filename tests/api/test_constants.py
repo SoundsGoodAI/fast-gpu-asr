@@ -197,9 +197,7 @@ def test_plugin_manifest_matches_native_sources() -> None:
         )
         assert declarations == [initializers[library_name]], source_name
         namespace_includes = re.findall(
-            r'^\s*#include\s+"plugin_namespace\.h"\s*$',
-            source,
-            flags=re.MULTILINE,
+            r'^\s*#include\s+"plugin_namespace\.h"\s*$', source, flags=re.MULTILINE
         )
         declared_names = re.findall(
             r"^\s*constexpr\s+char\s+const\*\s+"
@@ -313,10 +311,7 @@ int main()
     )
 
     result = subprocess.run(
-        executable_path,
-        check=True,
-        capture_output=True,
-        timeout=60,
+        executable_path, check=True, capture_output=True, timeout=60
     )
 
     assert result.stdout == TENSORRT_PLUGIN_NAMESPACE.encode("ascii") + b"\0"

@@ -51,32 +51,17 @@ PLUGIN_INITIALIZERS = (
         "zipformer_relative_attention_plugin.so",
         "initFastGpuAsrZipformerRelativeAttentionPlugin",
     ),
-    (
-        "zipformer_convolution_plugin.so",
-        "initFastGpuAsrZipformerConvolutionPlugin",
-    ),
-    (
-        "zipformer_feature_plugin.so",
-        "initFastGpuAsrZipformerFeaturePlugin",
-    ),
-    (
-        "zipformer_resampling_plugin.so",
-        "initFastGpuAsrZipformerResamplingPlugins",
-    ),
+    ("zipformer_convolution_plugin.so", "initFastGpuAsrZipformerConvolutionPlugin"),
+    ("zipformer_feature_plugin.so", "initFastGpuAsrZipformerFeaturePlugin"),
+    ("zipformer_resampling_plugin.so", "initFastGpuAsrZipformerResamplingPlugins"),
     (
         "zipformer_output_assembly_plugin.so",
         "initFastGpuAsrZipformerOutputAssemblyPlugin",
     ),
-    (
-        "parakeet_feature_plugin.so",
-        "initFastGpuAsrParakeetFeaturePlugin",
-    ),
+    ("parakeet_feature_plugin.so", "initFastGpuAsrParakeetFeaturePlugin"),
     (
         "parakeet_flash_attention_plugin.so",
         "initFastGpuAsrParakeetFlashAttentionPlugin",
     ),
-    (
-        "parakeet_convolution_plugin.so",
-        "initFastGpuAsrParakeetConvolutionPlugin",
-    ),
+    ("parakeet_convolution_plugin.so", "initFastGpuAsrParakeetConvolutionPlugin"),
 )

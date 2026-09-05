@@ -27,12 +27,7 @@ ALTERNATE_CONFIG = {
     "joiner_dim": 6,
     "num_extra_outputs": 3,
 }
-ONNX_INPUT_NAMES = (
-    "encoder_output",
-    "targets",
-    "input_states_1",
-    "input_states_2",
-)
+ONNX_INPUT_NAMES = ("encoder_output", "targets", "input_states_1", "input_states_2")
 ONNX_OUTPUT_NAMES = (
     "token_log_probs",
     "duration_log_probs",
@@ -69,9 +64,7 @@ def make_decoder(
     return decoder.eval()
 
 
-def reorder_lstm_gates_for_onnx(
-    tensor: torch.Tensor,
-) -> np.typing.NDArray[np.float32]:
+def reorder_lstm_gates_for_onnx(tensor: torch.Tensor) -> np.typing.NDArray[np.float32]:
     """Return PyTorch IFGO gates in ONNX IOFC order as float32 NumPy values.
 
     Parameters

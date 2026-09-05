@@ -53,9 +53,7 @@ type InputSpec = tuple[trt.DataType, tuple[int, ...]]
 
 
 @pytest.fixture(scope="module")
-def plugin_creator(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> PluginCreatorFixture:
+def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFixture:
     """Compile and register the current output-assembly plugin source.
 
     Parameters
@@ -100,9 +98,7 @@ def make_plugin(creator: trt.IPluginCreatorV3One) -> trt.IPluginV3:
     """
 
     plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection([]),
-        trt.TensorRTPhase.BUILD,
+        PLUGIN_NAME, trt.PluginFieldCollection([]), trt.TensorRTPhase.BUILD
     )
     assert plugin is not None
     return plugin
@@ -209,8 +205,7 @@ def build_assembly_engine(
 
 @pytest.fixture(scope="module", params=ENGINE_CASES)
 def assembly_engine(
-    request: pytest.FixtureRequest,
-    plugin_creator: PluginCreatorFixture,
+    request: pytest.FixtureRequest, plugin_creator: PluginCreatorFixture
 ) -> AssemblyEngine:
     """Build each dtype/layout once for all inference checks.
 
@@ -253,10 +248,7 @@ def alignment_engine(plugin_creator: PluginCreatorFixture) -> AssemblyEngine:
 
 
 def make_inputs(
-    batch_size: int,
-    sequence_length: int,
-    encoder_dims: tuple[int, ...],
-    seed: int = 0,
+    batch_size: int, sequence_length: int, encoder_dims: tuple[int, ...], seed: int = 0
 ) -> tuple[np.typing.NDArray, ...]:
     """Create deterministic, distinct values for all six encoder stacks.
 
@@ -399,8 +391,7 @@ def run_engine(
 
 
 def assert_run_matches_reference(
-    run: EngineRun,
-    host_inputs: tuple[np.typing.NDArray, ...],
+    run: EngineRun, host_inputs: tuple[np.typing.NDArray, ...]
 ) -> None:
     """Compare output and unchanged inputs bit-for-bit against fresh host copies.
 
@@ -421,16 +412,13 @@ def assert_run_matches_reference(
     for actual, expected in zip(run.inputs, expected_inputs, strict=True):
         cp.testing.assert_array_equal(actual.view(cp.uint8), expected.view(cp.uint8))
     cp.testing.assert_array_equal(
-        run.output.view(cp.uint8),
-        expected_output.view(cp.uint8),
+        run.output.view(cp.uint8), expected_output.view(cp.uint8)
     )
 
 
 @pytest.mark.parametrize("batch_size,sequence_length", SHAPE_CASES)
 def test_output_assembly_plugin_matches_reference(
-    assembly_engine: AssemblyEngine,
-    batch_size: int,
-    sequence_length: int,
+    assembly_engine: AssemblyEngine, batch_size: int, sequence_length: int
 ) -> None:
     inputs = make_inputs(batch_size, sequence_length, assembly_engine.encoder_dims)
     run = run_engine(assembly_engine, inputs)
@@ -574,7 +562,7 @@ def test_output_assembly_plugin_preserves_contributor_bit_patterns(
             bits[...] = patterns[indexes]
         expected_sources = [values.view(bit_dtype).copy() for values in run.inputs[3:]]
         expected_bits = expected_assembly(
-            tuple(values.view(bit_dtype) for values in run.inputs),
+            tuple(values.view(bit_dtype) for values in run.inputs)
         )
         run.output.view(cp.uint8).fill(0xA5)
         assert run.context.execute_async_v3(run.stream.ptr)
@@ -589,10 +577,7 @@ def test_output_assembly_plugin_preserves_contributor_bit_patterns(
 @pytest.mark.parametrize("axis", (0, 1), ids=("batch", "time"))
 @pytest.mark.parametrize("delta", (-1, 1), ids=("shorter", "longer"))
 def test_output_assembly_plugin_rejects_runtime_shape_mismatch(
-    alignment_engine: AssemblyEngine,
-    input_index: int,
-    axis: int,
-    delta: int,
+    alignment_engine: AssemblyEngine, input_index: int, axis: int, delta: int
 ) -> None:
     inputs = list(make_inputs(2, 3, alignment_engine.encoder_dims))
     shape = list(inputs[input_index].shape)
@@ -644,8 +629,7 @@ def make_misaligned_copy(values: cp.ndarray) -> cp.ndarray:
     ),
 )
 def test_output_assembly_plugin_binding_alignment(
-    alignment_engine: AssemblyEngine,
-    binding: str,
+    alignment_engine: AssemblyEngine, binding: str
 ) -> None:
     inputs = make_inputs(1, 3, alignment_engine.encoder_dims)
     run = prepare_engine_run(alignment_engine, inputs)
@@ -751,21 +735,15 @@ INVALID_CONTRACT_CASES = (
         )
         for input_index in range(6)
     ),
-    pytest.param(
-        assembly_input_specs(batch_sizes=(0,) * 6),
-        id="empty-batch",
-    ),
-    pytest.param(
-        assembly_input_specs(sequence_lengths=(0,) * 6),
-        id="empty-sequence",
-    ),
+    pytest.param(assembly_input_specs(batch_sizes=(0,) * 6), id="empty-batch"),
+    pytest.param(assembly_input_specs(sequence_lengths=(0,) * 6), id="empty-sequence"),
     *(
         pytest.param(
             assembly_input_specs(
                 encoder_dims=tuple(
                     0 if index == input_index else channels
                     for index, channels in enumerate(ENCODER_DIMS)
-                ),
+                )
             ),
             id=f"encoder-{input_index + 1}-empty-channels",
         )
@@ -785,8 +763,7 @@ INVALID_CONTRACT_CASES = (
     ),
     pytest.param(
         assembly_input_specs(
-            batch_sizes=(INT32_MAX,) * 6,
-            sequence_lengths=(INT32_MAX,) * 6,
+            batch_sizes=(INT32_MAX,) * 6, sequence_lengths=(INT32_MAX,) * 6
         ),
         id="address-volume-overflow",
     ),
@@ -804,22 +781,19 @@ INVALID_CONTRACT_CASES = (
     ),
     pytest.param(
         assembly_input_specs(
-            encoder_dims=(16, 32, 48, 18, 12, 4),
-            dtypes=(trt.float32,) * 6,
+            encoder_dims=(16, 32, 48, 18, 12, 4), dtypes=(trt.float32,) * 6
         ),
         id="unaligned-output-fp32",
     ),
     pytest.param(
         assembly_input_specs(
-            encoder_dims=ENCODER_DIMS[:4] + (50, 32),
-            dtypes=(trt.float32,) * 6,
+            encoder_dims=ENCODER_DIMS[:4] + (50, 32), dtypes=(trt.float32,) * 6
         ),
         id="unaligned-encoder5-fp32",
     ),
     pytest.param(
         assembly_input_specs(
-            encoder_dims=ENCODER_DIMS[:5] + (34,),
-            dtypes=(trt.float32,) * 6,
+            encoder_dims=ENCODER_DIMS[:5] + (34,), dtypes=(trt.float32,) * 6
         ),
         id="unaligned-encoder6-fp32",
     ),
@@ -832,44 +806,33 @@ INVALID_CONTRACT_CASES = (
         id="encoder4-narrower-than-encoder5",
     ),
     pytest.param(
-        assembly_input_specs(batch_sizes=(2, 1, 1, 1, 1, 1)),
-        id="dependency-batch",
+        assembly_input_specs(batch_sizes=(2, 1, 1, 1, 1, 1)), id="dependency-batch"
     ),
     pytest.param(
-        assembly_input_specs(batch_sizes=(1, 1, 1, 2, 1, 1)),
-        id="contributor-batch",
+        assembly_input_specs(batch_sizes=(1, 1, 1, 2, 1, 1)), id="contributor-batch"
     ),
     pytest.param(
-        assembly_input_specs(sequence_lengths=(3, 4, 3, 3, 3, 3)),
-        id="dependency-time",
+        assembly_input_specs(sequence_lengths=(3, 4, 3, 3, 3, 3)), id="dependency-time"
     ),
     pytest.param(
-        assembly_input_specs(sequence_lengths=(3, 3, 3, 4, 3, 3)),
-        id="contributor-time",
+        assembly_input_specs(sequence_lengths=(3, 3, 3, 4, 3, 3)), id="contributor-time"
     ),
-    pytest.param(
-        assembly_input_specs(dtypes=(trt.int32,) * 6),
-        id="unsupported-dtype",
-    ),
+    pytest.param(assembly_input_specs(dtypes=(trt.int32,) * 6), id="unsupported-dtype"),
     *(
         pytest.param(
             assembly_input_specs(
                 dtypes=tuple(
                     trt.float32 if index == input_index else trt.float16
                     for index in range(6)
-                ),
+                )
             ),
             id=f"encoder-{input_index + 1}-mixed-dtype",
         )
         for input_index in range(6)
     ),
+    pytest.param(assembly_input_specs()[:5], id="missing-input"),
     pytest.param(
-        assembly_input_specs()[:5],
-        id="missing-input",
-    ),
-    pytest.param(
-        assembly_input_specs() + ((trt.float16, (1, 3, 8)),),
-        id="extra-input",
+        assembly_input_specs() + ((trt.float16, (1, 3, 8)),), id="extra-input"
     ),
 )
 
@@ -886,8 +849,7 @@ def test_static_contract_harness_accepts_valid_output_assembly(
 
 @pytest.mark.parametrize("input_specs", INVALID_CONTRACT_CASES)
 def test_output_assembly_plugin_rejects_invalid_contracts(
-    plugin_creator: PluginCreatorFixture,
-    input_specs: tuple[InputSpec, ...],
+    plugin_creator: PluginCreatorFixture, input_specs: tuple[InputSpec, ...]
 ) -> None:
     _, creator = plugin_creator
     assert build_engine(creator, input_specs) is None

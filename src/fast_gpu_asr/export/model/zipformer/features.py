@@ -166,9 +166,7 @@ class FeatureExtractor(torch.nn.Module):
             feature_lengths, min=self.min_frames, max=features.size(1)
         ).to(torch.int32)
         padding_mask = torch.arange(
-            features.size(1),
-            dtype=feature_lengths.dtype,
-            device=feature_lengths.device,
+            features.size(1), dtype=feature_lengths.dtype, device=feature_lengths.device
         ).unsqueeze(0) >= feature_lengths.unsqueeze(1)
         features = features.masked_fill(padding_mask.unsqueeze(2), self.zero_log)
 

@@ -99,9 +99,7 @@ class Conv2dSubsampling(torch.nn.Module):
         x = self.conv_activation(self.conv2(x))
         output_lens = torch.clamp((x_lens - 7) // 2, min=0, max=x.size(2) - 2)
         valid_frames = torch.arange(
-            x.size(2) - 2,
-            dtype=output_lens.dtype,
-            device=output_lens.device,
+            x.size(2) - 2, dtype=output_lens.dtype, device=output_lens.device
         ).unsqueeze(0) < output_lens.unsqueeze(1)
 
         if self.batch_partitions > 1:
@@ -137,8 +135,7 @@ class Conv2dSubsampling(torch.nn.Module):
             bypass = x
             x = self.depthwise_conv(x)
 
-        x = self.pointwise_conv1(x.permute(0, 2, 3, 1))
-        x = self.convnext_activation(x)
+        x = self.convnext_activation(self.pointwise_conv1(x.permute(0, 2, 3, 1)))
         x = self.pointwise_conv2(x).permute(0, 3, 1, 2)
         x = bypass + x
 
@@ -146,9 +143,7 @@ class Conv2dSubsampling(torch.nn.Module):
         x = x.permute(0, 2, 1, 3).reshape(
             batch_size, seq_len, output_dim * frequency_dim
         )
-        x = self.out_norm(self.out(x))
-
-        return x, output_lens
+        return self.out_norm(self.out(x)), output_lens
 
 
 class BiasNorm(torch.nn.Module):
@@ -187,6 +182,4 @@ class BiasNorm(torch.nn.Module):
         centered = x - self.bias.to(torch.float32)
         rms = torch.sqrt(torch.mean(centered * centered, dim=2, keepdim=True))
         rms = torch.clamp(rms, min=torch.finfo(torch.float32).tiny)
-        x = (x * self.scale.to(torch.float32) / rms).to(output_dtype)
-
-        return x
+        return (x * self.scale.to(torch.float32) / rms).to(output_dtype)

@@ -125,11 +125,7 @@ def make_model_config() -> DictConfig:
                     "blackman_coeff": 0.42,
                     "snip_edges": False,
                 },
-                "mel_opts": {
-                    "num_bins": 80,
-                    "low_freq": 20,
-                    "high_freq": 7600,
-                },
+                "mel_opts": {"num_bins": 80, "low_freq": 20, "high_freq": 7600},
             },
             "model_params": {
                 "feature_dim": 80,
@@ -152,7 +148,7 @@ def make_model_config() -> DictConfig:
                 "use_ctc": True,
                 "use_attention_decoder": False,
             },
-        },
+        }
     )
 
 
@@ -247,8 +243,7 @@ def write_zipformer_sources(model_dir: Path) -> Path:
 
 @pytest.mark.parametrize("missing_name", ("config.yaml", "model.pt", "bpe.model"))
 def test_export_zipformer_rejects_missing_source_before_replacing_output(
-    tmp_path: Path,
-    missing_name: str,
+    tmp_path: Path, missing_name: str
 ) -> None:
     source_dir = tmp_path / "source"
     model_path = write_zipformer_sources(source_dir)
@@ -292,8 +287,7 @@ def test_export_zipformer_rejects_destination_containing_sources(
 
 
 def test_export_zipformer_replaces_output_before_loading_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_path = write_zipformer_sources(tmp_path / "source")
     output_dir = tmp_path / "bundle"
@@ -316,8 +310,7 @@ def test_export_zipformer_replaces_output_before_loading_config(
 
 
 @pytest.mark.parametrize(
-    "decoder_type",
-    ("ctc_greedy_search", "transducer_greedy_search"),
+    "decoder_type", ("ctc_greedy_search", "transducer_greedy_search")
 )
 @pytest.mark.parametrize("initial_beam", (1, 6))
 def test_export_zipformer_forces_greedy_beam(
@@ -348,9 +341,7 @@ def test_export_zipformer_forces_greedy_beam(
 
 
 def test_export_zipformer_retains_nontrailing_unknown_token(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     args = make_export_args()
     args.model_path = write_zipformer_sources(tmp_path / "source")
@@ -599,15 +590,10 @@ def test_export_zipformer_validates_exact_published_artifacts(
 
 @pytest.mark.parametrize(
     ("decoder_type", "use_ctc"),
-    (
-        ("transducer_modified_beam_search", False),
-        ("ctc_greedy_search", True),
-    ),
+    (("transducer_modified_beam_search", False), ("ctc_greedy_search", True)),
 )
 def test_make_model_wires_configuration_and_state_dicts(
-    monkeypatch: pytest.MonkeyPatch,
-    decoder_type: str,
-    use_ctc: bool,
+    monkeypatch: pytest.MonkeyPatch, decoder_type: str, use_ctc: bool
 ) -> None:
     constructors = {
         name: Mock(return_value=Mock(spec=("load_state_dict", "eval")))
@@ -852,9 +838,7 @@ def test_validate_zipformer_rejects_unsupported_decoder() -> None:
     ),
 )
 def test_validate_zipformer_rejects_disabled_decoder_head(
-    decoder_type: str,
-    config_field: str,
-    message: str,
+    decoder_type: str, config_field: str, message: str
 ) -> None:
     model_config = make_model_config()
     model_config.model_params[config_field] = False
@@ -869,9 +853,7 @@ def test_validate_zipformer_rejects_disabled_decoder_head(
 
 
 @pytest.mark.parametrize("config_field", ("use_ctc", "use_transducer"))
-def test_validate_zipformer_rejects_nonboolean_decoder_flags(
-    config_field: str,
-) -> None:
+def test_validate_zipformer_rejects_nonboolean_decoder_flags(config_field: str) -> None:
     model_config = make_model_config()
     model_config.model_params[config_field] = 1
 
@@ -890,8 +872,7 @@ def test_validate_zipformer_rejects_nonboolean_decoder_flags(
     ),
 )
 def test_validate_zipformer_accepts_equivalent_fixed_values(
-    field: str,
-    value: bool | float | int,
+    field: str, value: bool | float | int
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -925,9 +906,7 @@ def test_validate_zipformer_accepts_equivalent_fixed_values(
     ),
 )
 def test_validate_zipformer_rejects_invalid_export_profile(
-    field: str,
-    value: float | int,
-    message: str,
+    field: str, value: float | int, message: str
 ) -> None:
     args = make_export_args()
     setattr(args, field, value)
@@ -946,8 +925,7 @@ def test_validate_zipformer_rejects_invalid_export_profile(
     ),
 )
 def test_validate_zipformer_rejects_unsupported_precision(
-    field: str,
-    value: str | int | None,
+    field: str, value: str | int | None
 ) -> None:
     args = make_export_args()
     setattr(args, field, value)
@@ -971,8 +949,7 @@ def test_validate_zipformer_rejects_transducer_projection_mismatch() -> None:
 )
 @pytest.mark.parametrize("input_dim", (1023, 1025))
 def test_validate_zipformer_rejects_projection_input_mismatch(
-    decoder_type: str,
-    input_dim: int,
+    decoder_type: str, input_dim: int
 ) -> None:
     with pytest.raises(RuntimeError, match=rf"accepts {input_dim} input features"):
         validate_zipformer(
@@ -1008,9 +985,7 @@ def test_validate_zipformer_ctc_ignores_transducer_predictor_limits() -> None:
 
 
 @pytest.mark.parametrize("vocab_size", (0, -1, 1.5))
-def test_validate_zipformer_rejects_invalid_vocabulary(
-    vocab_size: int | float,
-) -> None:
+def test_validate_zipformer_rejects_invalid_vocabulary(vocab_size: int | float) -> None:
     with pytest.raises(ValueError, match="vocab_size.*positive integer"):
         validate_zipformer(
             make_model_config(),
@@ -1033,15 +1008,12 @@ def test_validate_zipformer_rejects_invalid_vocabulary(
         "decoding.beam_size",
     ),
 )
-def test_validate_zipformer_rejects_nonpositive_integer_config(
-    field: str,
-) -> None:
+def test_validate_zipformer_rejects_nonpositive_integer_config(field: str) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, 0)
 
     with pytest.raises(
-        ValueError,
-        match=rf"Expected {re.escape(field)} to be a positive integer",
+        ValueError, match=rf"Expected {re.escape(field)} to be a positive integer"
     ):
         validate_zipformer(model_config, make_state_dict(), 512, make_export_args())
 
@@ -1056,8 +1028,7 @@ def test_validate_zipformer_rejects_nonpositive_integer_config(
     ),
 )
 def test_validate_zipformer_rejects_nonintegral_head_dimensions(
-    field: str,
-    value: float | str,
+    field: str, value: float | str
 ) -> None:
     model_config = make_model_config()
     model_config.model_params[field] = value
@@ -1080,15 +1051,13 @@ def test_validate_zipformer_rejects_nonintegral_head_dimensions(
     ),
 )
 def test_validate_zipformer_rejects_nonpositive_head_dimensions(
-    field: str,
-    value: int | str,
+    field: str, value: int | str
 ) -> None:
     model_config = make_model_config()
     model_config.model_params[field] = value
 
     with pytest.raises(
-        ValueError,
-        match=rf"model_params.{field} to contain one positive integer",
+        ValueError, match=rf"model_params.{field} to contain one positive integer"
     ):
         validate_zipformer(model_config, make_state_dict(), 512, make_export_args())
 
@@ -1106,8 +1075,7 @@ def test_validate_zipformer_rejects_nonpositive_head_dimensions(
     ),
 )
 def test_validate_zipformer_rejects_malformed_stack_sequence(
-    field: str,
-    value: int | str,
+    field: str, value: int | str
 ) -> None:
     model_config = make_model_config()
     model_config.model_params[field] = value
@@ -1118,15 +1086,10 @@ def test_validate_zipformer_rejects_malformed_stack_sequence(
 
 @pytest.mark.parametrize(
     ("precision", "encoder_dims", "alignment"),
-    (
-        ("fp16", "192,384,768,1020,768,384", 8),
-        ("bf16", "192,384,768,1024,764,384", 8),
-    ),
+    (("fp16", "192,384,768,1020,768,384", 8), ("bf16", "192,384,768,1024,764,384", 8)),
 )
 def test_validate_zipformer_rejects_unaligned_output_assembly_channels(
-    precision: str,
-    encoder_dims: str,
-    alignment: int,
+    precision: str, encoder_dims: str, alignment: int
 ) -> None:
     model_config = make_model_config()
     model_config.model_params.encoder_dim = encoder_dims
@@ -1147,9 +1110,7 @@ def test_validate_zipformer_rejects_unaligned_output_assembly_channels(
     ),
 )
 def test_validate_zipformer_rejects_unaligned_convolution_channels(
-    precision: str,
-    encoder_dims: str,
-    alignment: int,
+    precision: str, encoder_dims: str, alignment: int
 ) -> None:
     model_config = make_model_config()
     model_config.model_params.encoder_dim = encoder_dims
@@ -1203,9 +1164,7 @@ def test_validate_zipformer_rejects_decoder_capacity_overflow() -> None:
     ((512, 512, "decoder_input"), (1, 1024, "tokens_log_prob")),
 )
 def test_validate_zipformer_rejects_decoder_tensor_overflow(
-    joiner_dim: int,
-    vocab_size: int,
-    tensor_name: str,
+    joiner_dim: int, vocab_size: int, tensor_name: str
 ) -> None:
     model_config = make_model_config()
     model_config.model_params.joiner_dim = joiner_dim
@@ -1218,10 +1177,7 @@ def test_validate_zipformer_rejects_decoder_tensor_overflow(
 
     with pytest.raises(ValueError, match=rf"tensor {tensor_name} exceeds"):
         validate_zipformer(
-            model_config,
-            make_state_dict(output_dim=joiner_dim),
-            vocab_size,
-            args,
+            model_config, make_state_dict(output_dim=joiner_dim), vocab_size, args
         )
 
 
@@ -1256,12 +1212,10 @@ def test_validate_zipformer_feature_workspace_boundary() -> None:
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "partitions"),
-    ((128, 1), (256, 1), (384, 1), (512, 2), (1327, 4)),
+    ("batch_size", "partitions"), ((128, 1), (256, 1), (384, 1), (512, 2), (1327, 4))
 )
 def test_zipformer_subsampling_batch_partitions(
-    batch_size: int,
-    partitions: int,
+    batch_size: int, partitions: int
 ) -> None:
     args = make_export_args()
     args.batch_size = batch_size
@@ -1278,9 +1232,7 @@ def test_zipformer_subsampling_rejects_invalid_channels(
 ) -> None:
     with pytest.raises(ValueError, match="layer3_channels must be a positive integer"):
         get_subsampling_batch_partitions(
-            make_model_config(),
-            cast(int, layer3_channels),
-            make_export_args(),
+            make_model_config(), cast(int, layer3_channels), make_export_args()
         )
 
 
@@ -1312,28 +1264,16 @@ def test_zipformer_subsampling_single_item_cask_boundary() -> None:
 
 @pytest.mark.parametrize(
     ("decoder_type", "beam", "use_ctc"),
-    (
-        ("transducer_modified_beam_search", 6, False),
-        ("ctc_greedy_search", 1, True),
-    ),
+    (("transducer_modified_beam_search", 6, False), ("ctc_greedy_search", 1, True)),
 )
 def test_make_zipformer_runtime_config(
-    decoder_type: str,
-    beam: int,
-    use_ctc: bool,
-    monkeypatch: pytest.MonkeyPatch,
+    decoder_type: str, beam: int, use_ctc: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     args = make_export_args(decoder_type)
     args.beam = beam
     validate = Mock(wraps=zipformer_exporter.validate_model_config)
     monkeypatch.setattr(zipformer_exporter, "validate_model_config", validate)
-    runtime_config = make_runtime_config(
-        make_model_config(),
-        257,
-        0,
-        6000,
-        args,
-    )
+    runtime_config = make_runtime_config(make_model_config(), 257, 0, 6000, args)
     expected_decoder_params = {"beam": beam, "blank_penalty": 0.0}
     if not use_ctc:
         expected_decoder_params.update(
@@ -1376,22 +1316,16 @@ def test_make_zipformer_runtime_config(
 )
 @pytest.mark.parametrize("missing_tensor", ("weight", "bias"))
 def test_validate_zipformer_rejects_missing_decoder_head_tensor(
-    decoder_type: str,
-    projection_prefix: str,
-    missing_tensor: str,
+    decoder_type: str, projection_prefix: str, missing_tensor: str
 ) -> None:
     state_dict = make_state_dict(decoder_type)
     del state_dict[f"{projection_prefix}.{missing_tensor}"]
 
     with pytest.raises(
-        RuntimeError,
-        match=rf"does not contain the {re.escape(projection_prefix)} head",
+        RuntimeError, match=rf"does not contain the {re.escape(projection_prefix)} head"
     ):
         validate_zipformer(
-            make_model_config(),
-            state_dict,
-            512,
-            make_export_args(decoder_type),
+            make_model_config(), state_dict, 512, make_export_args(decoder_type)
         )
 
 
@@ -1419,20 +1353,14 @@ def test_validate_zipformer_rejects_missing_decoder_head_tensor(
     ),
 )
 def test_validate_zipformer_rejects_malformed_decoder_head(
-    decoder_type: str,
-    tensor_name: str,
-    tensor: torch.Tensor,
-    message: str,
+    decoder_type: str, tensor_name: str, tensor: torch.Tensor, message: str
 ) -> None:
     state_dict = make_state_dict(decoder_type)
     state_dict[tensor_name] = tensor
 
     with pytest.raises(RuntimeError, match=message):
         validate_zipformer(
-            make_model_config(),
-            state_dict,
-            512,
-            make_export_args(decoder_type),
+            make_model_config(), state_dict, 512, make_export_args(decoder_type)
         )
 
 
@@ -1529,9 +1457,7 @@ def test_validate_zipformer_rejects_ctc_vocab_mismatch() -> None:
     ),
 )
 def test_validate_zipformer_rejects_incompatible_values(
-    field: str,
-    value: bool | float | int | str,
-    message: str,
+    field: str, value: bool | float | int | str, message: str
 ) -> None:
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
@@ -1575,10 +1501,7 @@ def test_adjust_zipformer_state_dict() -> None:
             ("encoder_embed.conv.7.weight", conv3_weight),
             ("encoder_embed.conv.7.bias", conv3_bias),
             ("encoder_embed.convnext.pointwise_conv1.weight", pointwise_weight),
-            (
-                "encoder_embed.convnext.pointwise_conv2.weight",
-                second_pointwise_weight,
-            ),
+            ("encoder_embed.convnext.pointwise_conv2.weight", second_pointwise_weight),
             ("encoder.encoders.0.downsample.bias", downsample_bias),
             ("encoder.encoders.1.downsample.bias", downsample_bias),
             ("encoder.downsample_output.bias", output_downsample_bias),
@@ -1586,16 +1509,10 @@ def test_adjust_zipformer_state_dict() -> None:
                 "encoder.encoders.0.layers.0.self_attn_weights.in_proj.weight",
                 torch.randn(8, 4, generator=generator),
             ),
-            (
-                "encoder.encoders.0.layers.0.bypass_scale",
-                torch.ones(4),
-            ),
-            (
-                "encoder.encoders.1.out_combiner.bypass_scale",
-                out_combiner_scale,
-            ),
+            ("encoder.encoders.0.layers.0.bypass_scale", torch.ones(4)),
+            ("encoder.encoders.1.out_combiner.bypass_scale", out_combiner_scale),
             ("joiner.encoder_proj.weight", torch.randn(4, 8, generator=generator)),
-        ),
+        )
     )
     original_values = {key: value.clone() for key, value in state_dict.items()}
     expected = {
@@ -1636,8 +1553,7 @@ def test_adjust_zipformer_state_dict() -> None:
 )
 @pytest.mark.parametrize("pointwise_layer", ("pointwise_conv1", "pointwise_conv2"))
 def test_adjust_zipformer_state_dict_rejects_invalid_pointwise_kernel(
-    pointwise_layer: str,
-    weight_shape: tuple[int, ...],
+    pointwise_layer: str, weight_shape: tuple[int, ...]
 ) -> None:
     state_dict = OrderedDict(
         {f"encoder_embed.convnext.{pointwise_layer}.weight": torch.zeros(weight_shape)}
@@ -1751,10 +1667,7 @@ def test_export_zipformer_onnx_inputs_and_context_cache(
         "input_names": ("audio", "audio_lengths"),
         "output_names": ("encoder_output", "encoder_output_lengths"),
         "opset_version": zipformer_exporter.ONNX_OPSET_VERSION,
-        "dynamic_shapes": {
-            "audio": {1: torch.export.Dim.DYNAMIC},
-            "audio_lengths": {},
-        },
+        "dynamic_shapes": {"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
     }
     if decoder_batch is None:
         assert decoder_path is None
@@ -1795,10 +1708,7 @@ def test_export_zipformer_onnx_inputs_and_context_cache(
     ),
 )
 def test_export_zipformer_rejects_invalid_blank_before_checkpoint_load(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    blank_id: int,
-    blank_piece: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blank_id: int, blank_piece: str
 ) -> None:
     class InvalidBlankTokenizer(FakeTokenizer):
         """Inject the selected invalid blank mapping into the fake vocabulary."""
@@ -1842,9 +1752,7 @@ def test_export_zipformer_rejects_invalid_blank_before_checkpoint_load(
     args.output_dir = tmp_path / "bundle"
     args.model_path = write_zipformer_sources(tmp_path / "source")
     monkeypatch.setattr(
-        zipformer_exporter.spm,
-        "SentencePieceProcessor",
-        InvalidBlankTokenizer,
+        zipformer_exporter.spm, "SentencePieceProcessor", InvalidBlankTokenizer
     )
 
     load_checkpoint = Mock()

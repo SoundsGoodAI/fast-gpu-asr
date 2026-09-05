@@ -170,9 +170,7 @@ class FeatureExtractor(torch.nn.Module):
 
         feature_lengths = (audio_lengths // self.hop_length).to(torch.int32)
         frame_mask = torch.arange(
-            features.size(1),
-            dtype=feature_lengths.dtype,
-            device=feature_lengths.device,
+            features.size(1), dtype=feature_lengths.dtype, device=feature_lengths.device
         ).unsqueeze(0) >= feature_lengths.unsqueeze(1)
         valid_frames = (~frame_mask).unsqueeze(2).to(features.dtype)
         normalization_lengths = feature_lengths.clamp_min(1).unsqueeze(1).unsqueeze(2)

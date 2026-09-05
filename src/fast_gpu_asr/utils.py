@@ -381,14 +381,8 @@ def validate_model_config(model_config: DictConfig) -> None:
                     "decoder_params.context_size",
                     model_config.decoder_params.context_size,
                 ),
-                (
-                    "decoder_params.decoder_dim",
-                    model_config.decoder_params.decoder_dim,
-                ),
-                (
-                    "decoder_params.joiner_dim",
-                    model_config.decoder_params.joiner_dim,
-                ),
+                ("decoder_params.decoder_dim", model_config.decoder_params.decoder_dim),
+                ("decoder_params.joiner_dim", model_config.decoder_params.joiner_dim),
             )
 
     for name, value in positive_integer_values:
@@ -413,7 +407,6 @@ def validate_model_config(model_config: DictConfig) -> None:
         )
 
     beam = model_config.decoder_params.beam
-    decoder_type = model_config.decoder_type
     if decoder_type in ("ctc_greedy_search", "transducer_greedy_search") and beam != 1:
         raise ASRInitializationError(f"Expected beam=1 for {decoder_type}, got {beam}.")
     if beam > model_config.vocab_size:

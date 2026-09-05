@@ -40,14 +40,13 @@ inline bool deviceSupportsAmpereCompute() noexcept
     int device{};
     int major{};
     return cudaGetDevice(&device) == cudaSuccess
-        && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device)
-            == cudaSuccess
-        && major >= 8;
+           && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device)
+                  == cudaSuccess
+           && major >= 8;
 }
 
 constexpr std::span<int32_t const> getCublasComputeTactics(
-    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT,
-    bool ampereCompute = true) noexcept
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT, bool ampereCompute = true) noexcept
 {
     switch (type)
     {
@@ -57,16 +56,15 @@ constexpr std::span<int32_t const> getCublasComputeTactics(
             return {};
         }
         [[fallthrough]];
-    case nvinfer1::DataType::kHALF:
-        return kReducedStorageCublasComputeTactics;
+    case nvinfer1::DataType::kHALF: return kReducedStorageCublasComputeTactics;
     case nvinfer1::DataType::kFLOAT:
         return std::span<int32_t const>(kCublasComputeTactics).first(ampereCompute ? 4 : 2);
     default: return {};
     }
 }
 
-constexpr bool isCublasComputeTactic(int32_t tactic,
-    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
+constexpr bool isCublasComputeTactic(
+    int32_t tactic, nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
 {
     for (int32_t const candidate : getCublasComputeTactics(type))
     {
@@ -79,8 +77,7 @@ constexpr bool isCublasComputeTactic(int32_t tactic,
 }
 
 constexpr int32_t getCublasComputeTacticCount(
-    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT,
-    bool ampereCompute = true) noexcept
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT, bool ampereCompute = true) noexcept
 {
     return static_cast<int32_t>(getCublasComputeTactics(type, ampereCompute).size());
 }
@@ -99,15 +96,11 @@ constexpr cublasComputeType_t getCublasComputeType(int32_t tactic) noexcept
     }
 }
 
-inline int32_t writeCublasComputeTactics(int32_t* tactics,
-    int32_t nbTactics,
-    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT,
-    bool ampereCompute = true) noexcept
+inline int32_t writeCublasComputeTactics(int32_t* tactics, int32_t nbTactics,
+    nvinfer1::DataType type = nvinfer1::DataType::kFLOAT, bool ampereCompute = true) noexcept
 {
-    std::span<int32_t const> const validTactics =
-        getCublasComputeTactics(type, ampereCompute);
-    if (tactics == nullptr
-        || validTactics.empty()
+    std::span<int32_t const> const validTactics = getCublasComputeTactics(type, ampereCompute);
+    if (tactics == nullptr || validTactics.empty()
         || nbTactics != static_cast<int32_t>(validTactics.size()))
     {
         return 1;
@@ -119,8 +112,7 @@ inline int32_t writeCublasComputeTactics(int32_t* tactics,
     return 0;
 }
 
-inline int32_t setCublasComputeTactic(int32_t tactic,
-    int32_t& selectedTactic,
+inline int32_t setCublasComputeTactic(int32_t tactic, int32_t& selectedTactic,
     nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
 {
     // TensorRT restores a serialized tactic before runtime shapes are known.

@@ -31,10 +31,7 @@ FACTORS = (1, 2, 3, 4, 8)
 CHANNEL_CASES = {"even_multiblock": 514, "odd_multiblock": 513}
 SHAPE_CASES = ((1, 1), (2, 3), (2, 6), (2, 8), (2, 17), (3, 65))
 
-type PluginCreatorsFixture = tuple[
-    ctypes.CDLL,
-    dict[str, trt.IPluginCreatorV3One],
-]
+type PluginCreatorsFixture = tuple[ctypes.CDLL, dict[str, trt.IPluginCreatorV3One]]
 
 
 @dataclass(frozen=True)
@@ -52,13 +49,7 @@ DTYPE_CASES = (
     DTypeCase("fp32", trt.float32, cp.float32, torch.float32, 1e-5),
     DTypeCase("fp16", trt.float16, cp.float16, torch.float16, 3e-3),
     pytest.param(
-        DTypeCase(
-            "bf16",
-            trt.bfloat16,
-            cp.dtype("bfloat16"),
-            torch.bfloat16,
-            3e-2,
-        ),
+        DTypeCase("bf16", trt.bfloat16, cp.dtype("bfloat16"), torch.bfloat16, 3e-2),
         marks=pytest.mark.sm80,
     ),
 )
@@ -75,9 +66,7 @@ class ResamplingEngine:
 
 
 @pytest.fixture(scope="module")
-def plugin_creators(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> PluginCreatorsFixture:
+def plugin_creators(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorsFixture:
     """Compile and register the current Zipformer resampling plugin source.
 
     Parameters
@@ -113,10 +102,7 @@ def plugin_creators(
     }
 
 
-def make_plugin(
-    creator: trt.IPluginCreatorV3One,
-    factor: int,
-) -> trt.IPluginV3:
+def make_plugin(creator: trt.IPluginCreatorV3One, factor: int) -> trt.IPluginV3:
     """Create one resampling plugin with a fixed temporal factor.
 
     Parameters
@@ -166,8 +152,7 @@ def set_profile_shape(profile, name, minimum, optimum, maximum) -> None:
 
 @pytest.fixture(scope="module", params=DTYPE_CASES, ids=lambda case: case.name)
 def resampling_engine(
-    request: pytest.FixtureRequest,
-    plugin_creators: PluginCreatorsFixture,
+    request: pytest.FixtureRequest, plugin_creators: PluginCreatorsFixture
 ) -> ResamplingEngine:
     """Build a dynamic engine covering scalar and vector resampling paths.
 
@@ -545,9 +530,7 @@ def run_engine(
 
 @pytest.mark.parametrize("batch_size,sequence_length", SHAPE_CASES)
 def test_resampling_plugins_match_reference(
-    resampling_engine: ResamplingEngine,
-    batch_size: int,
-    sequence_length: int,
+    resampling_engine: ResamplingEngine, batch_size: int, sequence_length: int
 ) -> None:
     run = run_engine(resampling_engine, batch_size, sequence_length)
 
@@ -574,8 +557,7 @@ def test_resampling_plugins_repeat_boundary_frames(
     sequence_length = 5
     input_overrides = {
         f"weights_{factor}": np.array(
-            ((1.0,), (2.0,), (4.0,), (8.0,)),
-            dtype=np.float32,
+            ((1.0,), (2.0,), (4.0,), (8.0,)), dtype=np.float32
         )
     }
     for case_name, channels in CHANNEL_CASES.items():
@@ -618,8 +600,7 @@ def test_resampling_plugins_use_fp32_intermediates(
     sequence_length = 8
     # FP16/BF16 accumulation rounds this alternating sum to 1; FP32 yields 4.
     cancellation_values = np.array(
-        (2048.0, 1.0, -2048.0, 1.0, 2048.0, 1.0, -2048.0, 1.0),
-        dtype=np.float32,
+        (2048.0, 1.0, -2048.0, 1.0, 2048.0, 1.0, -2048.0, 1.0), dtype=np.float32
     )
     input_overrides = {f"weights_{factor}": np.ones((factor, 1), dtype=np.float32)}
     for case_name, channels in CHANNEL_CASES.items():
@@ -702,10 +683,7 @@ def test_resampling_plugins_reuse_context_across_dynamic_shapes(
 def test_resampling_plugins_support_concurrent_contexts(
     resampling_engine: ResamplingEngine,
 ) -> None:
-    runs = (
-        run_engine(resampling_engine, 3, 65),
-        run_engine(resampling_engine, 2, 17),
-    )
+    runs = (run_engine(resampling_engine, 3, 65), run_engine(resampling_engine, 2, 17))
     assert runs[0].context is not runs[1].context
     assert runs[0].stream.ptr != runs[1].stream.ptr
 
@@ -729,8 +707,7 @@ def test_resampling_plugins_support_concurrent_contexts(
 
 @pytest.mark.parametrize("invalid_relationship", ("batch", "time"))
 def test_upsample_plugin_rejects_runtime_shape_mismatch(
-    resampling_engine: ResamplingEngine,
-    invalid_relationship: str,
+    resampling_engine: ResamplingEngine, invalid_relationship: str
 ) -> None:
     run = run_engine(resampling_engine, 2, 17)
     case_name = "odd_multiblock"
@@ -742,10 +719,7 @@ def test_upsample_plugin_rejects_runtime_shape_mismatch(
         if invalid_relationship == "batch"
         else (2, 8, CHANNEL_CASES[case_name])
     )
-    assert run.context.set_input_shape(
-        later_name,
-        invalid_shape,
-    )
+    assert run.context.set_input_shape(later_name, invalid_shape)
 
     with run.stream:
         for output in run.device_outputs.values():
@@ -982,9 +956,7 @@ def test_upsample_plugin_rejects_invalid_profile_endpoints(
     scale = network.add_input("scale", trt.float16, (channels,))
     assert all(tensor is not None for tensor in (early, later, scale))
     layer = network.add_plugin_v3(
-        [early, later, scale],
-        [],
-        make_plugin(creators[UPSAMPLE_NAME], factor=2),
+        [early, later, scale], [], make_plugin(creators[UPSAMPLE_NAME], factor=2)
     )
     assert layer is not None
     output = layer.get_output(0)
@@ -996,11 +968,7 @@ def test_upsample_plugin_rejects_invalid_profile_endpoints(
     later_shapes[invalid_endpoint][axis] += 1 if invalid_endpoint == 0 else -1
     profile = builder.create_optimization_profile()
     set_profile_shape(
-        profile,
-        "early",
-        (1, 1, channels),
-        (2, 17, channels),
-        (3, 65, channels),
+        profile, "early", (1, 1, channels), (2, 17, channels), (3, 65, channels)
     )
     set_profile_shape(profile, "later", *later_shapes)
     config = builder.create_builder_config()
@@ -1011,8 +979,7 @@ def test_upsample_plugin_rejects_invalid_profile_endpoints(
 
 @pytest.mark.parametrize("plugin_name", (DOWNSAMPLE_NAME, UPSAMPLE_NAME))
 def test_resampling_creators_expose_complete_contract(
-    plugin_creators: PluginCreatorsFixture,
-    plugin_name: str,
+    plugin_creators: PluginCreatorsFixture, plugin_name: str
 ) -> None:
     _, creators = plugin_creators
     creator = creators[plugin_name]
@@ -1041,8 +1008,7 @@ def test_resampling_creators_expose_complete_contract(
 
 @pytest.mark.parametrize("dtype_case", DTYPE_CASES, ids=lambda case: case.name)
 def test_resampling_plugins_match_reference_with_folded_constants(
-    plugin_creators: PluginCreatorsFixture,
-    dtype_case: DTypeCase,
+    plugin_creators: PluginCreatorsFixture, dtype_case: DTypeCase
 ) -> None:
     _, creators = plugin_creators
     dtype = dtype_case.trt_dtype
@@ -1059,21 +1025,12 @@ def test_resampling_plugins_match_reference_with_folded_constants(
 
     weight_source = np.array((0.25, -0.5, 1.0), dtype=np.float32)[:, None]
     scale_source = np.array(
-        (-0.25, 0.0, 0.25, 0.5, 1.0, 1.25, -1.0, 0.75),
-        dtype=np.float32,
+        (-0.25, 0.0, 0.25, 0.5, 1.0, 1.25, -1.0, 0.75), dtype=np.float32
     )
     weight_values = cp.asnumpy(cp.asarray(weight_source, dtype=dtype_case.cupy_dtype))
     scale_values = cp.asnumpy(cp.asarray(scale_source, dtype=dtype_case.cupy_dtype))
-    weight_storage = trt.Weights(
-        dtype,
-        weight_values.ctypes.data,
-        weight_values.size,
-    )
-    scale_storage = trt.Weights(
-        dtype,
-        scale_values.ctypes.data,
-        scale_values.size,
-    )
+    weight_storage = trt.Weights(dtype, weight_values.ctypes.data, weight_values.size)
+    scale_storage = trt.Weights(dtype, scale_values.ctypes.data, scale_values.size)
     weight_layer = network.add_constant(weight_values.shape, weight_storage)
     scale_layer = network.add_constant(scale_values.shape, scale_storage)
     assert weight_layer is not None and scale_layer is not None
@@ -1105,11 +1062,7 @@ def test_resampling_plugins_match_reference_with_folded_constants(
         (3, 65, channels),
     )
     set_profile_shape(
-        profile,
-        "constant_later",
-        (1, 1, channels),
-        (2, 6, channels),
-        (3, 22, channels),
+        profile, "constant_later", (1, 1, channels), (2, 6, channels), (3, 22, channels)
     )
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 28)
@@ -1163,40 +1116,23 @@ def test_resampling_plugins_match_reference_with_folded_constants(
     expected_weight = quantize(weight_source, dtype_case)
     expected_scale = quantize(scale_source, dtype_case)
     np.testing.assert_array_equal(
-        cp.asnumpy(early_device).astype(np.float32),
-        expected_early,
+        cp.asnumpy(early_device).astype(np.float32), expected_early
     )
     np.testing.assert_array_equal(
-        cp.asnumpy(later_device).astype(np.float32),
-        expected_later,
+        cp.asnumpy(later_device).astype(np.float32), expected_later
     )
-    np.testing.assert_array_equal(
-        weight_values.astype(np.float32),
-        expected_weight,
-    )
-    np.testing.assert_array_equal(
-        scale_values.astype(np.float32),
-        expected_scale,
-    )
+    np.testing.assert_array_equal(weight_values.astype(np.float32), expected_weight)
+    np.testing.assert_array_equal(scale_values.astype(np.float32), expected_scale)
     np.testing.assert_allclose(
         cp.asnumpy(down_device).astype(np.float32),
-        downsample_reference(
-            expected_early,
-            expected_weight,
-            factor,
-            dtype_case,
-        ),
+        downsample_reference(expected_early, expected_weight, factor, dtype_case),
         rtol=dtype_case.tolerance,
         atol=dtype_case.tolerance,
     )
     np.testing.assert_allclose(
         cp.asnumpy(up_device).astype(np.float32),
         upsample_reference(
-            expected_early,
-            expected_later,
-            expected_scale,
-            factor,
-            dtype_case,
+            expected_early, expected_later, expected_scale, factor, dtype_case
         ),
         rtol=dtype_case.tolerance,
         atol=dtype_case.tolerance,

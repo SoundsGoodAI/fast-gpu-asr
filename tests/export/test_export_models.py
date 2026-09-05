@@ -95,9 +95,7 @@ def make_random_tensor(
     """
 
     return torch.randn(
-        shape,
-        dtype=dtype,
-        generator=torch.Generator().manual_seed(seed),
+        shape, dtype=dtype, generator=torch.Generator().manual_seed(seed)
     )
 
 
@@ -330,7 +328,7 @@ def make_fast_conformer(subsampling_batch_partitions: int = 1) -> FastConformer:
         Two-layer, 16-channel CPU encoder in evaluation mode.
     """
 
-    encoder = FastConformer(
+    return FastConformer(
         input_dim=16,
         n_layers=2,
         model_dim=16,
@@ -340,14 +338,11 @@ def make_fast_conformer(subsampling_batch_partitions: int = 1) -> FastConformer:
         pos_emb_max_len=64,
         conv_kernel_size=3,
         subsampling_batch_partitions=subsampling_batch_partitions,
-    )
-    return encoder.eval()
+    ).eval()
 
 
 def reference_parakeet_subsampling(
-    module: ConvSubsampling,
-    features: torch.Tensor,
-    feature_lengths: torch.Tensor,
+    module: ConvSubsampling, features: torch.Tensor, feature_lengths: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Use functional convolutions and recompute valid lengths at each stage.
 
@@ -414,7 +409,7 @@ def make_parakeet_encoder(dtype: torch.dtype = torch.float16) -> ParakeetTDTEnco
         isolated generator.
     """
 
-    encoder = ParakeetTDTEncoder(
+    return ParakeetTDTEncoder(
         samp_freq=16000,
         frame_shift_ms=10,
         frame_length_ms=25,
@@ -431,8 +426,7 @@ def make_parakeet_encoder(dtype: torch.dtype = torch.float16) -> ParakeetTDTEnco
         conv_kernel_size=3,
         subsampling_batch_partitions=1,
         dtype=dtype,
-    )
-    return encoder.eval()
+    ).eval()
 
 
 def make_zipformer(
@@ -776,10 +770,7 @@ def test_parakeet_conformer_convolution_exports_exact_folded_plugin_inputs(
     onnx_path = tmp_path / "conformer_convolution_contract.onnx"
     torch.onnx.export(
         convolution,
-        (
-            make_random_tensor((2, 17, 8), 43),
-            torch.tensor((17, 9), dtype=torch.int32),
-        ),
+        (make_random_tensor((2, 17, 8), 43), torch.tensor((17, 9), dtype=torch.int32)),
         onnx_path,
         input_names=("x", "output_lengths"),
         output_names=("output",),
@@ -904,9 +895,7 @@ def test_parakeet_flash_attention_exports_as_tensorrt_plugin(
     assert get_onnx_shape(model, "output") == (2, 7, 12)
 
 
-def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(
-    tmp_path: Path,
-) -> None:
+def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(tmp_path: Path) -> None:
     encoder = make_parakeet_encoder()
     audio = torch.zeros(2, 8000)
     audio_lengths = torch.full((2,), 8000, dtype=torch.int64)
@@ -915,10 +904,7 @@ def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(
         encoder,
         (audio, audio_lengths),
         onnx_path,
-        dynamic_shapes={
-            "audio": {1: torch.export.Dim.DYNAMIC},
-            "audio_lengths": {},
-        },
+        dynamic_shapes={"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
         input_names=("audio", "audio_lengths"),
         output_names=("encoder_output", "encoder_output_lengths"),
         opset_version=ONNX_OPSET_VERSION,
@@ -989,10 +975,7 @@ def test_zipformer_encoder_exports_dynamic_plugin_contract(tmp_path: Path) -> No
         encoder,
         (audio, audio_lengths),
         onnx_path,
-        dynamic_shapes={
-            "audio": {1: torch.export.Dim.DYNAMIC},
-            "audio_lengths": {},
-        },
+        dynamic_shapes={"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
         input_names=("audio", "audio_lengths"),
         output_names=("encoder_output", "encoder_output_lengths"),
         opset_version=ONNX_OPSET_VERSION,
@@ -1131,8 +1114,7 @@ def test_fast_conformer_matches_independent_sequences() -> None:
     for index, length in enumerate(lengths):
         with torch.inference_mode():
             expected, expected_lengths = encoder(
-                features[index : index + 1, : int(length)],
-                lengths[index : index + 1],
+                features[index : index + 1, : int(length)], lengths[index : index + 1]
             )
         torch.testing.assert_close(actual_lengths[index], expected_lengths[0])
         torch.testing.assert_close(
@@ -1145,10 +1127,7 @@ def test_fast_conformer_matches_independent_sequences() -> None:
 
 @pytest.mark.parametrize(
     "length_values",
-    (
-        (29, 37, 45, 53),
-        (29, 37, 41, 45, 49, 51, 53),
-    ),
+    ((29, 37, 45, 53), (29, 37, 41, 45, 49, 51, 53)),
     ids=("even", "uneven"),
 )
 def test_partitioned_fast_conformer_subsampling_matches_unsplit(
@@ -1236,13 +1215,11 @@ def test_zipformer_encoder_matches_independent_waveforms() -> None:
     assert torch.isfinite(actual).all()
     for index, audio_length in enumerate(lengths.tolist()):
         individual_audio = add_zipformer_right_context(
-            raw_audio[index : index + 1, :audio_length],
-            lengths[index : index + 1],
+            raw_audio[index : index + 1, :audio_length], lengths[index : index + 1]
         )
         with torch.inference_mode():
             expected, expected_lengths = encoder(
-                individual_audio,
-                lengths[index : index + 1],
+                individual_audio, lengths[index : index + 1]
             )
         torch.testing.assert_close(actual_lengths[index], expected_lengths[0])
         torch.testing.assert_close(

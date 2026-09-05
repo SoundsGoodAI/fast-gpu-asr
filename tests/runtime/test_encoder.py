@@ -609,8 +609,7 @@ class FakeEncoderEngine:
         return (2,)
 
     def create_execution_context(
-        self,
-        strategy: trt.ExecutionContextAllocationStrategy,
+        self, strategy: trt.ExecutionContextAllocationStrategy
     ) -> FakeExecutionContext | None:
         """Return the configured user-managed execution context.
 
@@ -690,18 +689,14 @@ def make_runtime_encoder(
         lambda size, dtype: np.empty(size, dtype=dtype),
     )
     monkeypatch.setattr(
-        encoder_module.cp.cuda,
-        "Memory",
-        lambda size: SimpleNamespace(ptr=9000 + size),
+        encoder_module.cp.cuda, "Memory", lambda size: SimpleNamespace(ptr=9000 + size)
     )
     memory_pool = SimpleNamespace(free_all_blocks=lambda: None)
     monkeypatch.setattr(
         encoder_module.cp, "get_default_memory_pool", lambda: memory_pool
     )
     monkeypatch.setattr(
-        encoder_module.cp,
-        "get_default_pinned_memory_pool",
-        lambda: memory_pool,
+        encoder_module.cp, "get_default_pinned_memory_pool", lambda: memory_pool
     )
     monkeypatch.setattr(encoder_module, "cpu_count", lambda: 1)
     if trim_devices is None:
@@ -717,9 +712,7 @@ def make_runtime_encoder(
         ),
     )
     monkeypatch.setattr(
-        encoder_module.cp.cuda.runtime,
-        "CUDARuntimeError",
-        FakeCaptureError,
+        encoder_module.cp.cuda.runtime, "CUDARuntimeError", FakeCaptureError
     )
     return encoder
 
@@ -890,11 +883,7 @@ def test_encoder_initializes_engine_metadata_and_resources(
         pool_calls.append((max_workers, thread_name_prefix))
         return SimpleNamespace()
 
-    monkeypatch.setattr(
-        encoder_module,
-        "ThreadPoolExecutor",
-        make_audio_copy_pool,
-    )
+    monkeypatch.setattr(encoder_module, "ThreadPoolExecutor", make_audio_copy_pool)
 
     engine_path = tmp_path / "encoder.trt"
     stream = FakeStream(device)
@@ -962,9 +951,7 @@ def test_copy_audio_range_reflects_and_zero_pads() -> None:
     )
 
 
-def test_encoder_supports_zero_right_padding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_encoder_supports_zero_right_padding(monkeypatch: pytest.MonkeyPatch) -> None:
     encoder = make_runtime_encoder(monkeypatch)
     encoder.right_padding_samples = 0
 
@@ -975,13 +962,7 @@ def test_encoder_supports_zero_right_padding(
     assert isinstance(encoder.audio, FakeArray)
     np.testing.assert_array_equal(
         encoder.audio.values.reshape(2, 4),
-        np.array(
-            (
-                (1.0, 2.0, 3.0, 0.0),
-                (0.0, 0.0, 0.0, 0.0),
-            ),
-            dtype=np.float32,
-        ),
+        np.array(((1.0, 2.0, 3.0, 0.0), (0.0, 0.0, 0.0, 0.0)), dtype=np.float32),
     )
     np.testing.assert_array_equal(encoder.lengths.values, [3, 4])
     assert encoder.encoder.audio_shape == (2, 4)
@@ -990,9 +971,7 @@ def test_encoder_supports_zero_right_padding(
     np.testing.assert_array_equal(output_lengths.values, [2])
 
 
-def test_encoder_prepares_partial_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_encoder_prepares_partial_batch(monkeypatch: pytest.MonkeyPatch) -> None:
     encoder = make_runtime_encoder(monkeypatch)
     encoder.aux_streams = [FakeScope(1), FakeScope(2)]  # type: ignore[list-item]
     waveform = np.arange(6, dtype=np.float32)[::2]
@@ -1004,10 +983,7 @@ def test_encoder_prepares_partial_batch(
     np.testing.assert_array_equal(
         encoder.audio.values.reshape(2, 6),
         np.array(
-            (
-                (0.0, 2.0, 4.0, 4.0, 2.0, 0.0),
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-            ),
+            ((0.0, 2.0, 4.0, 4.0, 2.0, 0.0), (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
             dtype=np.float32,
         ),
     )
@@ -1043,8 +1019,7 @@ def test_encoder_clears_inactive_rows_when_reusing_partial_batch(
 
     assert isinstance(encoder.audio, FakeArray)
     np.testing.assert_array_equal(
-        encoder.audio.values.reshape(2, 6)[1],
-        np.zeros(6, dtype=np.float32),
+        encoder.audio.values.reshape(2, 6)[1], np.zeros(6, dtype=np.float32)
     )
     np.testing.assert_array_equal(encoder.lengths.values, [3, 4])
 
@@ -1075,9 +1050,7 @@ def test_encoder_converts_audio_and_accepts_exact_maximum_profile(
     np.testing.assert_array_equal(output_lengths.values, [2])
 
 
-def test_encoder_stages_audio_in_parallel(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_encoder_stages_audio_in_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     encoder = make_runtime_encoder(monkeypatch)
     encoder.audio_copy_pool = ThreadPoolExecutor(max_workers=2)
     monkeypatch.setattr(encoder_module, "AUDIO_SAMPLES_PER_WORKER", 1)
@@ -1124,10 +1097,7 @@ def test_encoder_stages_audio_in_parallel(
     np.testing.assert_array_equal(
         encoder.audio.values.reshape(2, 6),
         np.array(
-            (
-                (1.0, 2.0, 3.0, 3.0, 2.0, 0.0),
-                (4.0, 5.0, 5.0, 4.0, 0.0, 0.0),
-            ),
+            ((1.0, 2.0, 3.0, 3.0, 2.0, 0.0), (4.0, 5.0, 5.0, 4.0, 0.0, 0.0)),
             dtype=np.float32,
         ),
     )
@@ -1177,9 +1147,7 @@ def test_encoder_synchronizes_before_clearing_graph_for_smaller_shape(
 ) -> None:
     trim_devices: list[int] = []
     encoder = make_runtime_encoder(
-        monkeypatch,
-        trim_devices,
-        encoder_type=GraphClearTrackingEncoder,
+        monkeypatch, trim_devices, encoder_type=GraphClearTrackingEncoder
     )
     large_waveform = np.ones(6, dtype=np.float32)
 
@@ -1284,11 +1252,7 @@ def test_encoder_synchronizes_before_growing_context_memory(
 
     encoder.cuda_graph_supported = False
     encoder.encoder.required_device_memory_size = 96
-    monkeypatch.setattr(
-        encoder_module.cp.cuda,
-        "Memory",
-        record_memory_allocation,
-    )
+    monkeypatch.setattr(encoder_module.cp.cuda, "Memory", record_memory_allocation)
     encoder([waveform])
 
     assert original_memory is not None
@@ -1331,9 +1295,7 @@ def test_encoder_synchronizes_enqueued_dma_after_parallel_copy_failure(
     original_copy = encoder.copy_audio_range
 
     def recording_set(
-        array: FakeArray,
-        source: np.typing.NDArray[np.generic],
-        stream: FakeScope,
+        array: FakeArray, source: np.typing.NDArray[np.generic], stream: FakeScope
     ) -> None:
         """Signal when the emulated host-to-device transfer is enqueued.
 
@@ -1384,12 +1346,7 @@ def test_encoder_synchronizes_enqueued_dma_after_parallel_copy_failure(
     monkeypatch.setattr(encoder, "copy_audio_range", copy_or_fail)
     try:
         with pytest.raises(RuntimeError) as error:
-            encoder(
-                [
-                    np.ones(3, dtype=np.float32),
-                    np.ones(3, dtype=np.float32),
-                ]
-            )
+            encoder([np.ones(3, dtype=np.float32), np.ones(3, dtype=np.float32)])
     finally:
         encoder.audio_copy_pool.shutdown(wait=True)
 
@@ -1401,24 +1358,17 @@ def test_encoder_synchronizes_enqueued_dma_after_parallel_copy_failure(
 
 @pytest.mark.parametrize(
     ("failed_ndim", "expected_synchronizations"),
-    (
-        pytest.param(2, 0, id="audio-transfer"),
-        pytest.param(1, 1, id="length-transfer"),
-    ),
+    (pytest.param(2, 0, id="audio-transfer"), pytest.param(1, 1, id="length-transfer")),
 )
 def test_encoder_cleans_up_after_serial_transfer_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    failed_ndim: int,
-    expected_synchronizations: int,
+    monkeypatch: pytest.MonkeyPatch, failed_ndim: int, expected_synchronizations: int
 ) -> None:
     encoder = make_runtime_encoder(monkeypatch)
     failure = RuntimeError("transfer failed")
     original_set = FakeArray.set
 
     def set_or_fail(
-        array: FakeArray,
-        source: np.typing.NDArray[np.generic],
-        stream: FakeScope,
+        array: FakeArray, source: np.typing.NDArray[np.generic], stream: FakeScope
     ) -> None:
         """Fail the transfer whose host source has the selected rank.
 
@@ -1454,8 +1404,7 @@ def test_encoder_cleans_up_after_serial_transfer_failure(
 
 @pytest.mark.parametrize("second_worker_fails", (False, True))
 def test_encoder_preserves_early_parallel_copy_failure_while_draining_workers(
-    monkeypatch: pytest.MonkeyPatch,
-    second_worker_fails: bool,
+    monkeypatch: pytest.MonkeyPatch, second_worker_fails: bool
 ) -> None:
     encoder = make_runtime_encoder(monkeypatch)
     encoder.audio_copy_pool = ThreadPoolExecutor(max_workers=1)
@@ -1508,12 +1457,7 @@ def test_encoder_preserves_early_parallel_copy_failure_while_draining_workers(
     monkeypatch.setattr(encoder, "copy_audio_range", copy_or_fail)
     try:
         with pytest.raises(RuntimeError) as error:
-            encoder(
-                [
-                    np.ones(3, dtype=np.float32),
-                    np.ones(3, dtype=np.float32),
-                ]
-            )
+            encoder([np.ones(3, dtype=np.float32), np.ones(3, dtype=np.float32)])
     finally:
         encoder.audio_copy_pool.shutdown(wait=True)
 
@@ -1526,8 +1470,7 @@ def test_encoder_preserves_early_parallel_copy_failure_while_draining_workers(
 
 @pytest.mark.parametrize("failure", ("capture", "execution"))
 def test_encoder_disables_cuda_graph_after_capture_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
+    monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     trim_devices: list[int] = []
     encoder = make_runtime_encoder(monkeypatch, trim_devices)
@@ -1646,9 +1589,7 @@ def test_encoder_reports_cuda_graph_memory_trim_failure(
     ),
 )
 def test_encoder_reports_tensorrt_runtime_rejection(
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-    message: str,
+    monkeypatch: pytest.MonkeyPatch, failure: str, message: str
 ) -> None:
     encoder = make_runtime_encoder(monkeypatch)
     if failure == "shape":
@@ -1666,18 +1607,14 @@ def test_encoder_reports_tensorrt_runtime_rejection(
     ("audios", "message"),
     (
         ([], "Expected 1 to 2 audio waveforms"),
-        (
-            [np.ones(1, dtype=np.float32)] * 3,
-            "Expected 1 to 2 audio waveforms",
-        ),
+        ([np.ones(1, dtype=np.float32)] * 3, "Expected 1 to 2 audio waveforms"),
         ([np.empty(0, dtype=np.float32)], "non-empty one-dimensional"),
         ([np.ones((1, 2), dtype=np.float32)], "non-empty one-dimensional"),
         ([np.ones(9, dtype=np.float32)], "2.000-second TensorRT profile"),
     ),
 )
 def test_encoder_rejects_invalid_audio_before_cuda(
-    audios: list[np.typing.NDArray[np.float32]],
-    message: str,
+    audios: list[np.typing.NDArray[np.float32]], message: str
 ) -> None:
     encoder = make_uninitialized_encoder()
 
@@ -1704,9 +1641,7 @@ def test_encoder_rejects_invalid_execution_context_initialization(
         fake_context.accept_profile = False
     monkeypatch.setattr(encoder_module.cp.cuda, "Device", lambda _: device)
     monkeypatch.setattr(
-        encoder_module,
-        "get_engine",
-        lambda _: FakeEncoderEngine(fake_context),
+        encoder_module, "get_engine", lambda _: FakeEncoderEngine(fake_context)
     )
     monkeypatch.setattr(
         encoder_module,

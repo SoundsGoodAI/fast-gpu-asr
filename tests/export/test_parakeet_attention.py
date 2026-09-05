@@ -137,9 +137,7 @@ def test_parakeet_attention_matches_indexed_reference(
     attention = make_attention(dtype)
     x = torch.randn(2, sequence_length, FEATURE_DIM, dtype=dtype, generator=generator)
     pos_emb = torch.randn(
-        (1, 2 * sequence_length - 1, FEATURE_DIM),
-        dtype=dtype,
-        generator=generator,
+        (1, 2 * sequence_length - 1, FEATURE_DIM), dtype=dtype, generator=generator
     )
     output_lengths = torch.tensor(
         (sequence_length, max(1, sequence_length - 2)), dtype=torch.int32
@@ -290,9 +288,7 @@ def test_parakeet_attention_ignores_padded_keys_for_valid_queries(
     changed_inputs = inputs.clone()
     changed_inputs[:, valid_length:] *= -8
     positions = torch.randn(
-        (1, 2 * sequence_length - 1, FEATURE_DIM),
-        dtype=dtype,
-        generator=generator,
+        (1, 2 * sequence_length - 1, FEATURE_DIM), dtype=dtype, generator=generator
     )
     output_lengths = torch.tensor((valid_length,), dtype=torch.int32)
 
@@ -308,17 +304,13 @@ def test_parakeet_attention_ignores_padded_keys_for_valid_queries(
     torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
     torch.testing.assert_close(changed_output, changed_expected, atol=atol, rtol=rtol)
     torch.testing.assert_close(
-        output[:, :valid_length],
-        changed_output[:, :valid_length],
-        atol=atol,
-        rtol=rtol,
+        output[:, :valid_length], changed_output[:, :valid_length], atol=atol, rtol=rtol
     )
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize(
-    ("max_len", "sequence_length"),
-    ((1, 1), (8, 1), (8, 2), (8, 8)),
+    ("max_len", "sequence_length"), ((1, 1), (8, 1), (8, 2), (8, 8))
 )
 def test_parakeet_relative_positional_encoding_matches_formula(
     dtype: torch.dtype, max_len: int, sequence_length: int

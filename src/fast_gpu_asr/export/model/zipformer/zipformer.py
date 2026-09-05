@@ -217,11 +217,7 @@ class Zipformer2(torch.nn.Module):
         self.downsample_output = SimpleDownsample(2)
         self.projection_output = torch.nn.Linear(projection_dim, output_dim)
 
-        for module in (
-            self.subsampling,
-            *encoders,
-            self.downsample_output,
-        ):
+        for module in (self.subsampling, *encoders, self.downsample_output):
             module.to(dtype=dtype)
 
         if dtype == torch.bfloat16:
@@ -257,9 +253,7 @@ class Zipformer2(torch.nn.Module):
         x, x_lens = self.subsampling(x, x_lens)
 
         padding_mask = torch.arange(
-            x.size(1),
-            dtype=x_lens.dtype,
-            device=x_lens.device,
+            x.size(1), dtype=x_lens.dtype, device=x_lens.device
         ).unsqueeze(0) >= x_lens.unsqueeze(1)
 
         # Encoder 1
@@ -371,14 +365,11 @@ class Zipformer2Encoder(torch.nn.Module):
         self.upsample = SimpleUpsample(downsample)
 
         self.layers = torch.nn.ModuleList(
-            [copy.deepcopy(encoder_layer) for _ in range(num_layers)],
+            [copy.deepcopy(encoder_layer) for _ in range(num_layers)]
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        lengths: torch.Tensor,
-        padding_mask: torch.Tensor,
+        self, x: torch.Tensor, lengths: torch.Tensor, padding_mask: torch.Tensor
     ) -> torch.Tensor:
         """Encode one stack and restore its original temporal resolution.
 
@@ -408,9 +399,7 @@ class Zipformer2Encoder(torch.nn.Module):
         for mod in self.layers:
             x = mod(x, pos_emb, downsampled_padding_mask, downsampled_lengths)
 
-        x = self.upsample(x_orig, x, self.bypass_scale)
-
-        return x
+        return self.upsample(x_orig, x, self.bypass_scale)
 
 
 class Zipformer2EncoderLayer(torch.nn.Module):
@@ -515,10 +504,8 @@ class Zipformer2EncoderLayer(torch.nn.Module):
         x = x + self.conv_module2(x, valid_lengths)
 
         x = x + self.feed_forward3(x)
-        x = self.norm(x)
-        x = self.bypass(x_orig, x)
 
-        return x
+        return self.bypass(x_orig, self.norm(x))
 
 
 class ConvolutionModule(torch.nn.Module):
@@ -568,8 +555,7 @@ class ConvolutionModule(torch.nn.Module):
             Output with the same shape and dtype as ``x``.
         """
 
-        x = self.in_proj(x)
-        x = torch.nn.functional.glu(x, dim=2)
+        x = torch.nn.functional.glu(self.in_proj(x), dim=2)
 
         if torch.onnx.is_in_onnx_export():
             depthwise_weight = (
@@ -588,12 +574,9 @@ class ConvolutionModule(torch.nn.Module):
                 x.size(1), dtype=valid_lengths.dtype, device=valid_lengths.device
             ).unsqueeze(0) >= valid_lengths.unsqueeze(1)
             x = x.masked_fill(padding_mask.unsqueeze(2), 0.0).permute(0, 2, 1)
-            x = self.depthwise_conv(x)
-            x = self.activation(x).permute(0, 2, 1)
+            x = self.activation(self.depthwise_conv(x)).permute(0, 2, 1)
 
-        x = self.out_proj(x)  # (batch_size, seq_len, embed_dim)
-
-        return x
+        return self.out_proj(x)
 
 
 class FeedforwardModule(torch.nn.Module):
@@ -631,11 +614,7 @@ class FeedforwardModule(torch.nn.Module):
             Output with the same shape and dtype as ``x``.
         """
 
-        x = self.in_proj(x)
-        x = self.activation(x)
-        x = self.out_proj(x)
-
-        return x
+        return self.out_proj(self.activation(self.in_proj(x)))
 
 
 class BypassModule(torch.nn.Module):
@@ -733,9 +712,8 @@ class SimpleDownsample(torch.nn.Module):
         x = torch.nn.functional.pad(x, (0, 0, 0, downsample - 1), mode="replicate")
         x = x[:, : output_length * downsample]
         x = x.reshape(batch_size, output_length, downsample, channels)
-        x = torch.sum(x * self.weights, dim=2)
 
-        return x
+        return torch.sum(x * self.weights, dim=2)
 
 
 class SimpleUpsample(torch.nn.Module):

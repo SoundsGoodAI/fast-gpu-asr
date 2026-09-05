@@ -177,10 +177,7 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             "decoder.prednet.pred_rnn_layers",
             model_config.decoder.prednet.pred_rnn_layers,
         ),
-        (
-            "joint.jointnet.encoder_hidden",
-            model_config.joint.jointnet.encoder_hidden,
-        ),
+        ("joint.jointnet.encoder_hidden", model_config.joint.jointnet.encoder_hidden),
         ("joint.jointnet.joint_hidden", model_config.joint.jointnet.joint_hidden),
         ("joint.num_extra_outputs", model_config.joint.num_extra_outputs),
         ("decoding.greedy.max_symbols", model_config.decoding.greedy.max_symbols),
@@ -906,10 +903,9 @@ def build_tensorrt_engine(
     load_tensorrt_plugins()
 
     builder = trt.Builder(trt_logger)
-    network_flags = 1 << int(
-        trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.PREFER_AOT_PYTHON_PLUGINS)
     )
-    network = builder.create_network(network_flags)
     parser = trt.OnnxParser(network, trt_logger)
     if not parser.parse_from_file(str(onnx_path)):
         errors = "\n".join(

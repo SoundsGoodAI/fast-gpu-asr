@@ -33,6 +33,12 @@ STANDARD_SELF_HOSTED_LABELS = {"self-hosted", "linux", "x64"}
 MANUAL_GPU_CONDITION = (
     "github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests"
 )
+PUBLISH_CONDITION = (
+    "github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests && "
+    "(inputs.publish_to == 'testpypi' || inputs.publish_to == 'pypi') && "
+    "startsWith(github.ref, 'refs/tags/v') && "
+    "github.repository == 'SoundsGoodAI/fast-gpu-asr'"
+)
 YAML_BOOLEAN_TAG = "tag:yaml.org,2002:bool"
 
 
@@ -67,10 +73,7 @@ def load_yaml_mapping(path: Path) -> dict[str, Any]:
         Parsed top-level mapping with GitHub-compatible boolean values.
     """
 
-    document = yaml.load(
-        path.read_text(encoding="utf8"),
-        Loader=GitHubActionsLoader,
-    )
+    document = yaml.load(path.read_text(encoding="utf8"), Loader=GitHubActionsLoader)
     assert isinstance(document, dict), path
     return document
 
@@ -387,6 +390,10 @@ def test_ci_protects_gpu_runs_and_checkout_credentials() -> None:
         if "pull_request" in events:
             for scope in (workflow, *jobs.values()):
                 permissions = scope.get("permissions", workflow.get("permissions"))
+                if scope is jobs.get("publish"):
+                    assert " ".join(scope["if"].split()) == PUBLISH_CONDITION
+                    assert permissions == {"id-token": "write"}
+                    continue
                 if permissions != "read-all":
                     assert isinstance(permissions, dict), workflow_path
                     assert set(permissions.values()) <= {"none", "read"}, workflow_path
@@ -432,6 +439,10 @@ def test_ci_quality_job_enforces_repository_checks() -> None:
         "Install development environment": "uv sync --frozen --extra dev",
         "Lint": "uv run --frozen ruff check .",
         "Check formatting": "uv run --frozen ruff format --check .",
+        "Check CUDA formatting": (
+            "uv run --frozen python "
+            "src/fast_gpu_asr/decoder/lint_gpu_kernels.py --check"
+        ),
         "Compile Python sources": (
             "uv run --frozen python -m compileall -q src tests scripts"
         ),
@@ -439,20 +450,11 @@ def test_ci_quality_job_enforces_repository_checks() -> None:
     for name, expected_script in expected_steps.items():
         assert_required_run_step(quality_job, name, expected_script)
 
-    actionlint_step = get_named_step(
-        quality_job,
-        "Validate GitHub Actions workflows",
-    )
+    actionlint_step = get_named_step(quality_job, "Validate GitHub Actions workflows")
     assert_mandatory_step(actionlint_step)
     actionlint_environment = actionlint_step["env"]
-    assert re.fullmatch(
-        r"[0-9a-f]{64}",
-        actionlint_environment["ACTIONLINT_SHA256"],
-    )
-    assert re.fullmatch(
-        r"\d+\.\d+\.\d+",
-        actionlint_environment["ACTIONLINT_VERSION"],
-    )
+    assert re.fullmatch(r"[0-9a-f]{64}", actionlint_environment["ACTIONLINT_SHA256"])
+    assert re.fullmatch(r"\d+\.\d+\.\d+", actionlint_environment["ACTIONLINT_VERSION"])
     actionlint_script = actionlint_step["run"]
     actionlint_commands = {
         line.strip() for line in actionlint_script.splitlines() if line.strip()
@@ -528,6 +530,84 @@ def test_ci_jobs_checkout_source_and_bootstrap_uv_reproducibly() -> None:
             )
 
     assert len(setup_uv_versions) == 1
+
+
+@pytest.mark.parametrize(
+    ("gpu_tests", "ref", "error"),
+    (
+        ("true", "refs/tags/v0.1.0", None),
+        ("false", "refs/tags/v0.1.0", "run_gpu_tests=true"),
+        ("true", "refs/heads/main", "version tag v0.1.0"),
+        ("true", "refs/heads/v0.1.0", "version tag v0.1.0"),
+        ("true", "refs/tags/v0.2.0", "version tag v0.1.0"),
+    ),
+)
+def test_ci_release_request_requires_gpu_tests_and_matching_tag(
+    tmp_path: Path, gpu_tests: str, ref: str, error: str | None
+) -> None:
+    job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["quality"]
+    step = get_named_step(job, "Validate release request")
+    assert step["if"] == (
+        "github.event_name == 'workflow_dispatch' && inputs.publish_to != 'none'"
+    )
+    assert step["env"] == {"RUN_GPU_TESTS": "${{ inputs.run_gpu_tests }}"}
+    assert step.get("continue-on-error") in (None, False)
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
+    result = subprocess.run(
+        (sys.executable, "-I", "-c", get_python_heredoc(step["run"])),
+        cwd=tmp_path,
+        env={**os.environ, "RUN_GPU_TESTS": gpu_tests, "GITHUB_REF": ref},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if error is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert error in result.stderr
+
+
+def test_ci_publishes_only_its_tested_wheel_with_scoped_credentials() -> None:
+    workflow = load_yaml_mapping(WORKFLOW_PATH)
+    publish_input = workflow["on"]["workflow_dispatch"]["inputs"]["publish_to"]
+    assert publish_input["type"] == "choice"
+    assert publish_input["default"] == "none"
+    assert publish_input["options"] == ["none", "testpypi", "pypi"]
+
+    gpu_job = workflow["jobs"]["gpu-tests"]
+    metadata_step = assert_required_run_step(
+        gpu_job,
+        "Validate PyPI metadata",
+        "uvx --from twine twine check --strict dist/*.whl",
+    )
+    assert (
+        gpu_job["steps"].index(get_named_step(gpu_job, "Build platform wheel"))
+        < gpu_job["steps"].index(metadata_step)
+        < gpu_job["steps"].index(get_named_step(gpu_job, "Upload wheel"))
+    )
+
+    job = workflow["jobs"]["publish"]
+    assert job["needs"] == ["gpu-tests"]
+    assert " ".join(job["if"].split()) == PUBLISH_CONDITION
+    assert job["permissions"] == {"id-token": "write"}
+    assert job["environment"]["name"] == "${{ inputs.publish_to }}"
+    download = get_action_step(job, "actions/download-artifact")
+    publish = get_action_step(job, "pypa/gh-action-pypi-publish")
+    assert job["steps"] == [download, publish]
+    assert_mandatory_step(download)
+    assert_mandatory_step(publish)
+    assert download["with"] == {
+        "name": get_named_step(gpu_job, "Upload wheel")["with"]["name"],
+        "path": "dist",
+    }
+    assert publish["with"] == {
+        "repository-url": (
+            "${{ inputs.publish_to == 'pypi' && 'https://upload.pypi.org/legacy/' "
+            "|| 'https://test.pypi.org/legacy/' }}"
+        ),
+        "attestations": True,
+    }
 
 
 def test_gpu_ci_verifies_every_native_plugin_library() -> None:
@@ -719,11 +799,7 @@ def test_gpu_ci_runs_complete_suite_and_cleans_runner() -> None:
         "Run complete GPU test suite",
         'uv run --frozen pytest -q --junitxml="${RUNNER_TEMP}/gpu-test-results.xml"',
     )
-    assert_pytest_is_not_filtered(
-        workflow,
-        gpu_job,
-        gpu_test_step,
-    )
+    assert_pytest_is_not_filtered(workflow, gpu_job, gpu_test_step)
 
     build_step = get_named_step(gpu_job, "Build platform wheel")
     assert_mandatory_step(build_step)
@@ -935,9 +1011,7 @@ def test_ci_runs_hosted_tests_for_every_supported_python() -> None:
     }.items():
         assert_required_run_step(python_job, name, expected_script)
     assert_pytest_is_not_filtered(
-        workflow,
-        python_job,
-        get_named_step(python_job, "Run CPU test suite"),
+        workflow, python_job, get_named_step(python_job, "Run CPU test suite")
     )
 
     needs = gpu_job["needs"]
