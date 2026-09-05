@@ -285,7 +285,15 @@ def test_decoder_onnx_contract(
     onnx_path = tmp_path / "parakeet_decoder.onnx"
     state_shape = (pred_rnn_layers, 2, 12)
 
-    with torch.inference_mode():
+    # PyTorch rebuilds its internal LSTM cache during export; weights are checked below.
+    with (
+        torch.inference_mode(),
+        pytest.warns(
+            UserWarning,
+            match=r"The tensor attributes self\.lstm\._flat_weights\[\d+\]"
+            r"(?:, self\.lstm\._flat_weights\[\d+\])* were assigned during export\.",
+        ),
+    ):
         torch.onnx.export(
             decoder,
             (

@@ -3,6 +3,7 @@
 
 """Tests for model-bundle, tokenizer, and TensorRT engine validation."""
 
+from contextlib import nullcontext
 from pathlib import Path
 from pickle import UnpicklingError
 from typing import cast
@@ -2347,7 +2348,12 @@ def test_validate_zipformer_context_lookup_rejects_invalid_content(
 
     torch.save(payload, tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE)
 
-    with pytest.raises(ASRInitializationError, match=message):
+    expected_warning = (
+        pytest.warns(UserWarning, match="Validating sparse tensor invariants")
+        if malformation == "sparse"
+        else nullcontext()
+    )
+    with expected_warning, pytest.raises(ASRInitializationError, match=message):
         validate_zipformer_context_lookup(tmp_path, model_config)
 
 

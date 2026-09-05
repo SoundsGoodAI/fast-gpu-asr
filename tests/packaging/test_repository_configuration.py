@@ -654,7 +654,7 @@ def test_gpu_ci_selects_headers_from_installed_tensorrt(
             **os.environ,
             "RUNNER_TEMP": str(tmp_path),
             "GITHUB_ENV": str(github_env),
-            "CPATH": "/existing/includes",
+            "CPLUS_INCLUDE_PATH": "/existing/includes",
             "TENSORRT_VERSION": version,
             "METADATA_QUERY": metadata_query,
         },
@@ -668,7 +668,7 @@ def test_gpu_ci_selects_headers_from_installed_tensorrt(
     assert "--strip-components=2" in result.stdout.splitlines()
     assert f"TensorRT-{release}/include" in result.stdout.splitlines()
     assert github_env.read_text() == (
-        f"CPATH={tmp_path}/tensorrt-headers:/existing/includes\n"
+        f"CPLUS_INCLUDE_PATH={tmp_path}/tensorrt-headers:/existing/includes\n"
     )
 
 

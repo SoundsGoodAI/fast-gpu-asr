@@ -139,7 +139,8 @@ jobs:
           mkdir -p "${headers_dir}"
           tar -xzf "${archive}" -C "${headers_dir}" --strip-components=2 \
             "TensorRT-${headers_release}/include"
-          printf 'CPATH=%s:%s\n' "${headers_dir}" "${CPATH:-}" >> "${GITHUB_ENV}"
+          # Treat vendor headers as system headers without hiding plugin diagnostics.
+          printf 'CPLUS_INCLUDE_PATH=%s:%s\n' "${headers_dir}" "${CPLUS_INCLUDE_PATH:-}" >> "${GITHUB_ENV}"
       - name: Configure Python CUDA toolchain
         shell: bash
         run: |

@@ -461,19 +461,24 @@ def test_relative_attention_exports_as_tensorrt_plugin(
     onnx_path = tmp_path / "relative_attention.onnx"
     dynamic_sequence_length = torch.export.Dim("sequence_length", min=1, max=32)
 
-    torch.onnx.export(
-        make_projected_relative_attention(dtype).eval(),
-        inputs,
-        onnx_path,
-        input_names=("x", "pos_emb", "key_padding_mask"),
-        output_names=("attention_weights",),
-        dynamic_shapes=(
-            {1: dynamic_sequence_length},
-            {1: 2 * dynamic_sequence_length - 1},
-            {1: dynamic_sequence_length},
-        ),
-        opset_version=ONNX_OPSET_VERSION,
-    )
+    # Reusing the required shared dimension triggers PyTorch's duplicate-name warning.
+    with pytest.warns(
+        UserWarning,
+        match=r"The axis name: sequence_length .*another axis: sequence_length\.",
+    ):
+        torch.onnx.export(
+            make_projected_relative_attention(dtype).eval(),
+            inputs,
+            onnx_path,
+            input_names=("x", "pos_emb", "key_padding_mask"),
+            output_names=("attention_weights",),
+            dynamic_shapes=(
+                {1: dynamic_sequence_length},
+                {1: 2 * dynamic_sequence_length - 1},
+                {1: dynamic_sequence_length},
+            ),
+            opset_version=ONNX_OPSET_VERSION,
+        )
 
     model = onnx.shape_inference.infer_shapes(onnx.load(onnx_path))
     custom_node = check_onnx_model_with_custom_plugin(
@@ -641,18 +646,23 @@ def test_attention_value_products_export_as_tensorrt_plugin(
     onnx_path = tmp_path / "attention_value.onnx"
     dynamic_sequence_length = torch.export.Dim("sequence_length", min=1, max=32)
 
-    torch.onnx.export(
-        module,
-        (x, attention_weights),
-        onnx_path,
-        input_names=("x", "attention_weights"),
-        output_names=("output",),
-        dynamic_shapes=(
-            {1: dynamic_sequence_length},
-            {2: dynamic_sequence_length, 3: dynamic_sequence_length},
-        ),
-        opset_version=ONNX_OPSET_VERSION,
-    )
+    # Keep query/key lengths tied to x; automatic dimensions lose that contract.
+    with pytest.warns(
+        UserWarning,
+        match=r"The axis name: sequence_length .*another axis: sequence_length\.",
+    ):
+        torch.onnx.export(
+            module,
+            (x, attention_weights),
+            onnx_path,
+            input_names=("x", "attention_weights"),
+            output_names=("output",),
+            dynamic_shapes=(
+                {1: dynamic_sequence_length},
+                {2: dynamic_sequence_length, 3: dynamic_sequence_length},
+            ),
+            opset_version=ONNX_OPSET_VERSION,
+        )
 
     model = onnx.shape_inference.infer_shapes(onnx.load(onnx_path))
     custom_node = check_onnx_model_with_custom_plugin(
