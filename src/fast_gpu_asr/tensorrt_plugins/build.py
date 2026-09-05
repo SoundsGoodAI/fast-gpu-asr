@@ -153,6 +153,8 @@ def main() -> None:
             for source_name, _ in PLUGIN_BUILDS
         )
         for output_path in output_paths:
+            if output_path.is_symlink():
+                raise RuntimeError(f"Compiler output is a symbolic link: {output_path}")
             if not output_path.is_file():
                 raise RuntimeError(f"Compiler output not found: {output_path}")
             if output_path.stat().st_size == 0:

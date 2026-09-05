@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+
 """Validate models, prepare ONNX graphs, and build TensorRT engines.
 
 This module centralizes model validation, graph cleanup, and TensorRT builder
@@ -8,6 +9,7 @@ configuration shared by the Parakeet and Zipformer exporters.
 
 import argparse
 import logging
+import math
 from collections import OrderedDict
 from pathlib import Path
 
@@ -16,7 +18,13 @@ import tensorrt as trt
 import torch
 from omegaconf import DictConfig
 
-from ..constants import INT32_MAX, PARAKEET_MAX_ENCODER_FRAMES, TRANSDUCER_DECODER_TYPES
+from ..constants import (
+    DECODER_TYPES,
+    INT32_MAX,
+    PARAKEET_MAX_ENCODER_FRAMES,
+    PRECISION_DTYPES,
+    TRANSDUCER_DECODER_TYPES,
+)
 from ..tensorrt_plugins import load_tensorrt_plugins
 
 logger = logging.getLogger(__name__)
@@ -42,6 +50,8 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
     ValueError
         Raised when the source architecture is unsupported or an export
         argument cannot produce a valid fixed-batch TensorRT profile.
+    TypeError
+        Raised when the configured TDT durations are not iterable.
     """
 
     expected_values = (
@@ -97,11 +107,25 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             f"got {args.decoder_type}."
         )
 
-    if list(model_config.encoder.att_context_size) != [-1, -1]:
+    for name in ("encoder_precision", "decoder_precision"):
+        value = getattr(args, name)
+        if not isinstance(value, str) or value not in PRECISION_DTYPES:
+            raise ValueError(
+                f"{name} must be one of {tuple(PRECISION_DTYPES)}, got {value}."
+            )
+
+    configured_attention_context = model_config.encoder.att_context_size
+    try:
+        attention_context = list(configured_attention_context)
+    except TypeError as error:
         raise ValueError(
             "Only full-context offline attention is supported; expected "
-            f"encoder.att_context_size=[-1, -1], got "
-            f"{list(model_config.encoder.att_context_size)}."
+            f"encoder.att_context_size=[-1, -1], got {configured_attention_context}."
+        ) from error
+    if attention_context != [-1, -1]:
+        raise ValueError(
+            "Only full-context offline attention is supported; expected "
+            f"encoder.att_context_size=[-1, -1], got {attention_context}."
         )
 
     positive_float_values = (
@@ -109,8 +133,10 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         ("preprocessor.window_size", model_config.preprocessor.window_size),
     )
     for name, value in positive_float_values:
-        if not isinstance(value, float) or value <= 0.0:
-            raise ValueError(f"Expected {name} to be a positive float, got {value}.")
+        if not isinstance(value, float) or not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"Expected {name} to be a positive finite float, got {value}."
+            )
 
     preemph = model_config.preprocessor.get("preemph", 0.97)
     if not isinstance(preemph, float) or not 0.0 <= preemph < 1.0:
@@ -224,10 +250,13 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         args.opt_audio_seconds,
         args.max_audio_seconds,
     )
-    if not 0.0 < audio_seconds[0] <= audio_seconds[1] <= audio_seconds[2]:
+    if (
+        not all(isinstance(value, (int, float)) for value in audio_seconds)
+        or not 0.0 < audio_seconds[0] <= audio_seconds[1] <= audio_seconds[2]
+    ):
         raise ValueError(
-            "Expected 0 < min_audio_seconds <= opt_audio_seconds <= "
-            f"max_audio_seconds, got {audio_seconds}."
+            "Expected 0 < min_audio_seconds <= opt_audio_seconds <= max_audio_seconds, "
+            f"got {audio_seconds}."
         )
 
     if audio_seconds[2] > INT32_MAX / model_config.sample_rate:
@@ -326,6 +355,7 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
 
     max_samples = round(args.max_audio_seconds * sample_rate)
     feature_frames = max_samples // hop_length + 1
+    # Match the feature plugin's in-place R2C buffer and aligned cuBLAS scratch.
     transform_bytes = args.batch_size * feature_frames * (n_fft + 2) * 4
     cublas_offset = (transform_bytes + 255) // 256 * 256
     if cublas_offset + (16 << 20) > INT32_MAX:
@@ -382,11 +412,23 @@ def validate_zipformer(
         Raised when the source configuration or an export argument is
         unsupported.
     RuntimeError
-        Raised when the checkpoint lacks the selected decoder head or its CTC
-        output dimension does not match the tokenizer vocabulary.
+        Raised when the checkpoint lacks the selected decoder head or its
+        weight and bias shapes disagree with the encoder or decoder dimensions.
     """
 
     decoder_type = args.decoder_type
+    if decoder_type not in DECODER_TYPES:
+        raise ValueError(
+            f"Zipformer export supports only {DECODER_TYPES}, got {decoder_type}."
+        )
+
+    for name in ("encoder_precision", "decoder_precision"):
+        value = getattr(args, name)
+        if not isinstance(value, str) or value not in PRECISION_DTYPES:
+            raise ValueError(
+                f"{name} must be one of {tuple(PRECISION_DTYPES)}, got {value}."
+            )
+
     expected_values = (
         (
             "model_params.subsampling_factor",
@@ -599,7 +641,7 @@ def validate_zipformer(
     head_dims: dict[str, int] = {}
     for name in ("query_head_dim", "value_head_dim", "pos_head_dim"):
         value = model_config.model_params[name]
-        if type(value) not in (int, str):
+        if not isinstance(value, (int, str)):
             raise ValueError(
                 f"Expected model_params.{name} to contain one integer, got {value}."
             )
@@ -635,9 +677,21 @@ def validate_zipformer(
         )
 
     weight = state_dict[projection_weight]
+    if weight.ndim != 2:
+        raise RuntimeError(
+            f"The {projection_prefix} weight must have rank 2, got "
+            f"shape {tuple(weight.shape)}."
+        )
+
+    bias = state_dict[projection_bias]
     output_dim = weight.size(0)
-    input_dim = weight.size(1)
-    expected_input_dim = max(encoder_dims)
+    if bias.ndim != 1 or bias.size(0) != output_dim:
+        raise RuntimeError(
+            f"The {projection_prefix} bias must have shape ({output_dim},), got "
+            f"{tuple(bias.shape)}."
+        )
+
+    expected_input_dim, input_dim = max(encoder_dims), weight.size(1)
     if input_dim != expected_input_dim:
         raise RuntimeError(
             f"The {projection_prefix} head accepts {input_dim} input features, but "
@@ -680,8 +734,11 @@ def validate_zipformer(
             f"{model_config.feature_opts.frame_opts.samp_freq} Hz."
         )
 
-    if not isinstance(args.beam, int) or args.beam < 1:
-        raise ValueError(f"beam must be positive, got {args.beam}.")
+    if not isinstance(args.beam, int) or not 1 <= args.beam <= vocab_size:
+        raise ValueError(
+            f"beam must be a positive integer between 1 and {vocab_size}, got "
+            f"{args.beam}."
+        )
 
     if decoder_type != "ctc_greedy_search":
         decoder_capacity = args.batch_size
@@ -716,21 +773,6 @@ def validate_zipformer(
     frame_length_ms = model_config.feature_opts.frame_opts.frame_length_ms
     frame_length = frame_length_ms * sample_rate // 1000
     frame_shift = frame_shift_ms * sample_rate // 1000
-    if frame_length < 2:
-        raise ValueError(
-            f"feature_opts.frame_opts.frame_length_ms produces a "
-            f"{frame_length}-sample window; expected at least 2."
-        )
-    if frame_shift < 1:
-        raise ValueError(
-            "feature_opts.frame_opts.frame_shift_ms must produce at least "
-            "one sample per frame."
-        )
-    if frame_shift_ms > frame_length_ms:
-        raise ValueError(
-            "feature_opts.frame_opts.frame_shift_ms must not exceed "
-            "feature_opts.frame_opts.frame_length_ms."
-        )
 
     min_audio_samples = round(args.min_audio_seconds * sample_rate)
     min_feature_frames = (min_audio_samples + frame_shift // 2) // frame_shift
@@ -751,6 +793,7 @@ def validate_zipformer(
         )
 
     fft_length = 2 ** (frame_length - 1).bit_length()
+    # Match the feature plugin's in-place R2C buffer and aligned cuBLAS scratch.
     transform_bytes = args.batch_size * max_feature_frames * (fft_length + 2) * 4
     cublas_offset = (transform_bytes + 255) // 256 * 256
     if cublas_offset + (16 << 20) > INT32_MAX:
@@ -761,15 +804,29 @@ def validate_zipformer(
 
 
 def remove_onnx_artifacts(onnx_path: Path) -> None:
-    """Remove an ONNX graph and its adjacent external-data artifacts.
+    """Remove an ONNX graph and its local external-data artifacts.
 
     Parameters
     ----------
     onnx_path : Path
         Path to the ONNX graph. External-data locations referenced by the graph
-        are removed from the same directory.
+        are removed from its directory or subdirectories. Missing external-data
+        files are ignored; a missing graph raises ``FileNotFoundError``.
+
+    Raises
+    ------
+    ValueError
+        Raised when an external-data location is empty, absolute, or resolves
+        outside the ONNX model directory.
+
+    Notes
+    -----
+    The graph is removed even when parsing or external-data cleanup fails.
+    Parsing and filesystem errors propagate to the caller; cleanup is not
+    transactional.
     """
 
+    model_dir = onnx_path.parent.resolve()
     try:
         model = onnx.load(onnx_path, load_external_data=False)
         external_data_locations = {
@@ -779,7 +836,18 @@ def remove_onnx_artifacts(onnx_path: Path) -> None:
             if entry.key == "location"
         }
         for location in external_data_locations:
-            (onnx_path.parent / location).unlink(missing_ok=True)
+            external_path = onnx_path.parent / location
+            resolved_path = external_path.resolve()
+            if (
+                not location
+                or Path(location).is_absolute()
+                or not resolved_path.is_relative_to(model_dir)
+            ):
+                raise ValueError(
+                    "Unsafe ONNX external-data location outside the model "
+                    f"directory: {location}."
+                )
+            external_path.unlink(missing_ok=True)
     finally:
         onnx_path.unlink(missing_ok=True)
 
@@ -796,9 +864,10 @@ def build_tensorrt_engine(
     static inputs must not have profile entries. The builder enables TF32,
     sparse-weight optimizations, all tactic sources exposed by the installed
     TensorRT release, and the requested optimization level. The workspace pool
-    retains TensorRT's device-specific default so all affordable tactics remain
-    eligible. FP16 and BF16 builder flags are enabled when available. Native
-    custom plugins referenced by the ONNX graph are loaded before parsing.
+    retains TensorRT's default limit of total device memory; it is not a budget
+    based on currently free memory. FP16 and BF16 builder flags are enabled when
+    available. Native custom plugins referenced by the ONNX graph are loaded
+    before parsing.
 
     Parameters
     ----------
@@ -810,17 +879,25 @@ def build_tensorrt_engine(
         Dynamic input names mapped to their minimum, optimum, and maximum
         shapes. Pass an empty dictionary for a fully static graph.
     optimization_level : int
-        TensorRT builder optimization level.
+        TensorRT builder optimization level from 0 through 5.
 
     Raises
     ------
     ValueError
-        Raised when profile names do not exactly match the dynamic network
-        inputs or when TensorRT rejects a profile shape.
+        Raised when the optimization level is unsupported, profile names do
+        not exactly match the dynamic network inputs, or TensorRT rejects a
+        profile or profile shape.
     RuntimeError
         Raised when TensorRT plugins cannot be initialized, the ONNX graph
-        cannot be parsed, or the serialized engine cannot be built.
+        cannot be parsed, tactic sources are rejected, or the serialized engine
+        cannot be built.
     """
+
+    if not isinstance(optimization_level, int) or not 0 <= optimization_level <= 5:
+        raise ValueError(
+            "optimization_level must be an integer from 0 through 5, got "
+            f"{optimization_level}."
+        )
 
     trt_logger = trt.Logger(trt.Logger.INFO)
     if not trt.init_libnvinfer_plugins(trt_logger, ""):
@@ -870,15 +947,18 @@ def build_tensorrt_engine(
     if profiles:
         optimization_profile = builder.create_optimization_profile()
         for input_name, (min_shape, opt_shape, max_shape) in profiles.items():
-            profile_result = optimization_profile.set_shape(
-                input_name, min_shape, opt_shape, max_shape
-            )
-            if profile_result is False:
+            try:
+                optimization_profile.set_shape(
+                    input_name, min_shape, opt_shape, max_shape
+                )
+            except ValueError as error:
                 raise ValueError(
                     f"Invalid TensorRT profile for {input_name}: "
                     f"{min_shape}, {opt_shape}, {max_shape}."
-                )
-        builder_config.add_optimization_profile(optimization_profile)
+                ) from error
+
+        if builder_config.add_optimization_profile(optimization_profile) < 0:
+            raise ValueError("TensorRT rejected optimization profile.")
 
     logger.info("Building %s with profiles=%s.", engine_path, profiles)
     serialized_engine = builder.build_serialized_network(network, builder_config)

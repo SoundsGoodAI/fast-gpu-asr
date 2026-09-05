@@ -25,14 +25,13 @@ class PostProcessor:
             Input audio sampling rate in hertz.
         """
 
-        self.tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
-        self.sample_rate = sample_rate
+        tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
+        token_pieces = tokenizer.id_to_piece(list(range(tokenizer.vocab_size())))
 
-        token_pieces = self.tokenizer.id_to_piece(
-            list(range(self.tokenizer.vocab_size()))
-        )
+        self.sample_rate = sample_rate
+        self.tokenizer = tokenizer
         self.starts_word = tuple(piece.startswith("▁") for piece in token_pieces)
-        self.standalone_word_id = self.tokenizer.piece_to_id("▁")
+        self.standalone_word_id = tokenizer.piece_to_id("▁")
 
     def __call__(
         self,
@@ -60,13 +59,16 @@ class PostProcessor:
         ------
         ASRInferenceError
             Raised when batch dimensions or token and timestamp counts differ or
-            an audio waveform is malformed.
+            an audio waveform or decoder timestamp is malformed.
         """
 
         if not len(audios) == len(token_ids) == len(timestamps):
             raise ASRInferenceError(
                 "Decoder batch size differs from the input audio batch size."
             )
+
+        if not token_ids:
+            return [], []
 
         texts = self.tokenizer.decode(token_ids)
         word_timestamps: list[list[tuple[str, float, float]]] = [[] for _ in token_ids]
@@ -96,9 +98,19 @@ class PostProcessor:
             word_left: int | None = None
             rounded_word_start = 0.0
             pending_word_start: float | None = None
+            previous_timestamp = 0.0
             for token_index, (token_id, timestamp) in enumerate(
                 zip(utt_token_ids, utt_timestamps, strict=True)
             ):
+                if not np.isfinite(timestamp) or timestamp < previous_timestamp:
+                    raise ASRInferenceError(
+                        "Expected finite, non-negative, nondecreasing decoder "
+                        f"timestamps, got {timestamp} at token {token_index} of "
+                        f"utterance {utt_idx}."
+                    )
+
+                previous_timestamp = timestamp
+
                 if token_id == self.standalone_word_id:
                     # Consecutive standalone markers retain the earliest boundary.
                     if pending_word_start is None:

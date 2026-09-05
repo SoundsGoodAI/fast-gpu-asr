@@ -42,7 +42,7 @@ jobs:
       - name: Check lockfile
         run: uv lock --check
       - name: Install development environment
-        run: uv sync --frozen --extra dev --extra export
+        run: uv sync --frozen --extra dev
       - name: Lint
         run: uv run --frozen ruff check .
       - name: Check formatting
@@ -68,7 +68,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           version: "0.11.21"
       - name: Install development environment
-        run: uv sync --frozen --extra dev --extra export
+        run: uv sync --frozen --extra dev
       - name: Compile Python sources
         run: uv run --frozen python -m compileall -q src tests scripts
       - name: Run CPU test suite
@@ -103,7 +103,7 @@ jobs:
           python-version: "3.14"
           version: "0.11.21"
       - name: Install CUDA, export, and test dependencies
-        run: uv sync --frozen --extra dev --extra export
+        run: uv sync --frozen --extra dev
       - name: Configure Python CUDA toolchain
         shell: bash
         run: |

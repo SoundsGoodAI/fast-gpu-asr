@@ -362,7 +362,7 @@ class ZipformerModifiedBeamSearchDecoder:
                 )
             self.initial_decoder_input = self.context_lookup[
                 cp.array(initial_lookup_indexes)
-            ]
+            ].astype(self.decoder_input.dtype, copy=False)
 
             self.output_tokens: cp.ndarray | None = None
             self.output_timestamps: cp.ndarray | None = None

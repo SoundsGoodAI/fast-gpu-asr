@@ -59,11 +59,7 @@ The project resolves Torch from the PyTorch CPU wheel index when installed with
 `uv`. GPU execution is provided by CuPy, TensorRT, and the native CUDA plugins;
 CUDA-enabled Torch is not required.
 
-Install the additional ONNX dependencies before exporting models:
-
-```bash
-uv sync --frozen --extra export
-```
+ONNX and ONNXScript are included in the default installation for model export.
 
 Serialized TensorRT engines depend on the TensorRT version, plugin binaries, and
 GPU architecture used to build them. Build and validate each bundle on the target
@@ -244,7 +240,7 @@ Install all test and export dependencies, build the native plugins, and run the
 quality checks:
 
 ```bash
-uv sync --frozen --extra dev --extra export
+uv sync --frozen --extra dev
 uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
 uv run --frozen pytest
 uv run --frozen ruff check .

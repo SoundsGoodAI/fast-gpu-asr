@@ -25,7 +25,25 @@ logger = logging.getLogger(__name__)
 
 
 def positive_integer(value: str) -> int:
-    """Parse a strictly positive command-line integer for ``argparse``."""
+    """Parse a strictly positive command-line integer.
+
+    Parameters
+    ----------
+    value : str
+        Command-line value to parse.
+
+    Returns
+    -------
+    int
+        Parsed positive integer.
+
+    Raises
+    ------
+    ValueError
+        Raised when ``value`` is not an integer.
+    argparse.ArgumentTypeError
+        Raised when the parsed integer is less than one.
+    """
 
     parsed = int(value)
     if parsed < 1:
@@ -35,7 +53,25 @@ def positive_integer(value: str) -> int:
 
 
 def nonnegative_integer(value: str) -> int:
-    """Parse a nonnegative command-line integer for ``argparse``."""
+    """Parse a nonnegative command-line integer.
+
+    Parameters
+    ----------
+    value : str
+        Command-line value to parse.
+
+    Returns
+    -------
+    int
+        Parsed nonnegative integer.
+
+    Raises
+    ------
+    ValueError
+        Raised when ``value`` is not an integer.
+    argparse.ArgumentTypeError
+        Raised when the parsed integer is negative.
+    """
 
     parsed = int(value)
     if parsed < 0:
@@ -110,36 +146,47 @@ def read_pcm16(path: Path) -> tuple[np.typing.NDArray[np.float32], int]:
     Returns
     -------
     tuple[np.typing.NDArray[np.float32], int]
-        Normalized waveform and its sampling rate.
+        Waveform normalized to ``[-1.0, 1.0)`` and its sampling rate in hertz.
 
     Raises
     ------
     ValueError
-        Raised when the file is not mono PCM16, is empty, or contains a
-        truncated or partial PCM frame.
+        Raised when the WAV container is malformed, the file is not mono
+        PCM16, is empty, or contains a truncated or partial PCM frame.
     """
 
-    with wave.open(str(path), "rb") as wav_file:
-        if wav_file.getnchannels() != 1 or wav_file.getsampwidth() != 2:
-            raise ValueError("Expected a mono PCM16 WAV file.")
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            if wav_file.getnchannels() != 1 or wav_file.getsampwidth() != 2:
+                raise ValueError("Expected a mono PCM16 WAV file.")
 
-        sample_rate = wav_file.getframerate()
-        # Request one extra frame so a data chunk ending in one stray byte is
-        # returned and rejected by the exact payload-size check below.
-        audio_bytes = wav_file.readframes(wav_file.getnframes() + 1)
-        expected_bytes = wav_file.getnframes() * 2
-        if len(audio_bytes) != expected_bytes:
-            raise ValueError(f"Truncated PCM16 WAV file {path}.")
+            sample_rate = wav_file.getframerate()
+            # Request one extra frame so a data chunk ending in one stray byte is
+            # returned and rejected by the exact payload-size check below.
+            audio_bytes = wav_file.readframes(wav_file.getnframes() + 1)
+            expected_bytes = wav_file.getnframes() * 2
+            if len(audio_bytes) != expected_bytes:
+                raise ValueError(f"Truncated PCM16 WAV file {path}.")
 
-        audio = np.frombuffer(audio_bytes, dtype=np.dtype("<i2"))
-        if audio.size == 0:
-            raise ValueError(f"Expected nonempty PCM16 WAV file {path}.")
+            audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+            audio /= 2**15
+            if audio.size == 0:
+                raise ValueError(f"Expected nonempty PCM16 WAV file {path}.")
 
-    return audio.astype(np.float32) / np.float32(2**15), sample_rate
+    except (EOFError, wave.Error) as error:
+        detail = str(error) or type(error).__name__
+        raise ValueError(f"Invalid WAV file {path}: {detail}.") from error
+
+    return audio, sample_rate
 
 
 def main() -> None:
-    """Run repeated batched inference and print median component timings.
+    """Run repeated batched inference and log benchmark measurements.
+
+    The logged JSON object contains median ``encoder_sec``, ``decoder_sec``,
+    ``postprocess_sec``, and independently measured ``total_sec`` durations. It
+    also reports the batch's ``audio_seconds``, end-to-end ``rtfx``, and
+    ``cupy_memory_pool_bytes`` retained by CuPy's default memory pool.
 
     Notes
     -----

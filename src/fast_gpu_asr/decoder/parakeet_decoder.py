@@ -502,22 +502,31 @@ class ParakeetModifiedBeamSearchDecoder:
                                 executed = False
                                 break
 
-                            TDT_SELECT_TOKENS_KERNEL(
-                                (self.decoder_capacity,),
-                                (self.token_selection_threads,),
-                                (
-                                    self.token_log_probs,
-                                    self.hypothesis_scores,
-                                    self.time_indexes,
-                                    self.search_output_lengths,
-                                    self.top_token_scores,
-                                    self.top_token_indexes,
-                                    np.int32(self.blank_id),
-                                    np.int32(self.beam),
-                                ),
-                                shared_mem=self.token_selection_shared_memory_bytes,
-                                stream=self.stream,
-                            )
+                            try:
+                                TDT_SELECT_TOKENS_KERNEL(
+                                    (self.decoder_capacity,),
+                                    (self.token_selection_threads,),
+                                    (
+                                        self.token_log_probs,
+                                        self.hypothesis_scores,
+                                        self.time_indexes,
+                                        self.search_output_lengths,
+                                        self.top_token_scores,
+                                        self.top_token_indexes,
+                                        np.int32(self.blank_id),
+                                        np.int32(self.beam),
+                                    ),
+                                    shared_mem=self.token_selection_shared_memory_bytes,
+                                    stream=self.stream,
+                                )
+                            except cp.cuda.driver.CUDADriverError as error:
+                                # TensorRT can invalidate capture while still
+                                # reporting a successful asynchronous enqueue. The
+                                # next driver launch is where CUDA then reports 901.
+                                if not capture or error.status != 901:
+                                    raise
+                                executed = False
+                                break
 
                             TDT_BEAM_SEARCH_KERNEL(
                                 (self.batch_size,),

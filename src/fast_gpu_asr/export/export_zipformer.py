@@ -577,8 +577,13 @@ def export_model_to_onnx(
     Raises
     ------
     RuntimeError
-        Raised when a transducer decoder is provided without its joiner.
+        Raised when only one transducer decoder component is provided.
     """
+
+    if decoder is None and joiner is not None:
+        raise RuntimeError("The Zipformer transducer decoder was not initialized.")
+    if decoder is not None and joiner is None:
+        raise RuntimeError("The Zipformer transducer joiner was not initialized.")
 
     encoder_path = args.output_dir / ZIPFORMER_ONNX_FILE
     decoder_path = args.output_dir / ZIPFORMER_DECODER_ONNX_FILE
@@ -613,8 +618,6 @@ def export_model_to_onnx(
 
     if decoder is None:
         return encoder_path, None
-    if joiner is None:
-        raise RuntimeError("The Zipformer transducer joiner was not initialized.")
 
     context_lookup = decoder.make_context_lookup(chunk_size=8192)
     context_lookup_path = args.output_dir / ZIPFORMER_DECODER_CONTEXTS_FILE

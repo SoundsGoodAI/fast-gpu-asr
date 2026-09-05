@@ -5,11 +5,14 @@
 
 import argparse
 import io
+import re
 import sys
 import tarfile
 from collections import OrderedDict
 from pathlib import Path
+from unittest.mock import Mock, call
 
+import onnx
 import pytest
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -27,11 +30,16 @@ from fast_gpu_asr.export.export_parakeet import (
     parse_args,
 )
 from fast_gpu_asr.export.export_utils import validate_parakeet
-from fast_gpu_asr.utils import ASRInitializationError, validate_model_config
 
 
 def make_model_config() -> DictConfig:
-    """Return a compact valid source configuration for Parakeet export tests."""
+    """Return a compact valid source configuration for Parakeet export tests.
+
+    Returns
+    -------
+    DictConfig
+        Fresh NeMo-style configuration that each test can mutate independently.
+    """
 
     return OmegaConf.create(
         {
@@ -90,7 +98,14 @@ def make_model_config() -> DictConfig:
 
 
 def make_export_args() -> argparse.Namespace:
-    """Return valid Parakeet exporter arguments suitable for local mutation."""
+    """Return valid Parakeet exporter arguments suitable for local mutation.
+
+    Returns
+    -------
+    argparse.Namespace
+        Fresh batch-one FP32 modified-beam-search arguments with placeholder
+        paths; callers exercising file access must replace those paths.
+    """
 
     return argparse.Namespace(
         batch_size=1,
@@ -108,13 +123,19 @@ def make_export_args() -> argparse.Namespace:
     )
 
 
+@pytest.mark.parametrize("use_symlink", (False, True), ids=("direct", "symlink"))
 def test_export_parakeet_rejects_destination_containing_source(
     tmp_path: Path,
+    use_symlink: bool,
 ) -> None:
     output_dir = tmp_path / "bundle"
     output_dir.mkdir()
-    model_path = output_dir / "model.nemo"
-    model_path.write_bytes(b"source")
+    contained_model_path = output_dir / "model.nemo"
+    contained_model_path.write_bytes(b"source")
+    model_path = contained_model_path
+    if use_symlink:
+        model_path = tmp_path / "model-link.nemo"
+        model_path.symlink_to(contained_model_path)
     args = make_export_args()
     args.model_path = model_path
     args.output_dir = output_dir
@@ -122,14 +143,14 @@ def test_export_parakeet_rejects_destination_containing_source(
     with pytest.raises(ValueError, match="contains required source file"):
         export_parakeet(args)
 
-    assert model_path.read_bytes() == b"source"
+    assert contained_model_path.read_bytes() == b"source"
+    if use_symlink:
+        assert model_path.is_symlink()
 
 
 def test_export_parakeet_rejects_missing_source_before_replacing_output(
     tmp_path: Path,
 ) -> None:
-    """Preserve an existing bundle when the source archive does not exist."""
-
     output_dir = tmp_path / "bundle"
     output_dir.mkdir()
     sentinel_path = output_dir / "existing.trt"
@@ -138,13 +159,13 @@ def test_export_parakeet_rejects_missing_source_before_replacing_output(
     args.model_path = tmp_path / "missing.nemo"
     args.output_dir = output_dir
 
-    with pytest.raises(FileNotFoundError, match=str(args.model_path)):
+    with pytest.raises(FileNotFoundError, match=re.escape(str(args.model_path))):
         export_parakeet(args)
 
     assert sentinel_path.read_bytes() == b"existing"
 
 
-def test_export_parakeet_writes_directly_to_output_directory(
+def test_export_parakeet_replaces_output_before_extraction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,32 +179,90 @@ def test_export_parakeet_writes_directly_to_output_directory(
     args.model_path = model_path
     args.output_dir = output_dir
 
-    def fail_export(*_args: object) -> None:
-        (output_dir / "model.trt").write_bytes(b"partial")
-        raise RuntimeError("engine build failed")
+    temporary_dirs: list[Path] = []
+
+    def fail_export(extracted_model_path: Path, temporary_dir: Path) -> None:
+        """Fail after checking that export cleared the previous bundle.
+
+        Parameters
+        ----------
+        extracted_model_path : Path
+            Source archive path supplied by the exporter.
+        temporary_dir : Path
+            Extraction directory recorded for the later cleanup assertion.
+
+        Raises
+        ------
+        RuntimeError
+            Always, to simulate archive extraction failure.
+        """
+
+        temporary_dirs.append(temporary_dir)
+        assert extracted_model_path == model_path
+        assert temporary_dir.is_dir()
+        assert not any(output_dir.iterdir())
+        raise RuntimeError("archive extraction failed")
 
     monkeypatch.setattr(parakeet_exporter, "extract_parakeet_archive", fail_export)
 
-    with pytest.raises(RuntimeError, match="engine build failed"):
+    with pytest.raises(RuntimeError, match="archive extraction failed"):
         export_parakeet(args)
 
-    assert not sentinel_path.exists()
-    assert (output_dir / "model.trt").read_bytes() == b"partial"
+    assert len(temporary_dirs) == 1
+    assert not temporary_dirs[0].exists()
+    assert not any(output_dir.iterdir())
+    assert model_path.read_bytes() == b"source"
 
 
-def test_export_parakeet_forces_greedy_beam(
+@pytest.mark.parametrize(
+    ("decoder_type", "initial_beam", "expected_beam", "warning_expected"),
+    (
+        pytest.param("transducer_greedy_search", 1, 1, False, id="greedy-already-one"),
+        pytest.param("transducer_greedy_search", 6, 1, True, id="greedy-override"),
+        pytest.param(
+            "transducer_modified_beam_search",
+            6,
+            6,
+            False,
+            id="modified-beam-preserved",
+        ),
+    ),
+)
+def test_export_parakeet_applies_decoder_beam_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    decoder_type: str,
+    initial_beam: int,
+    expected_beam: int,
+    warning_expected: bool,
 ) -> None:
     model_path = tmp_path / "model.nemo"
     model_path.write_bytes(b"source")
     args = make_export_args()
     args.model_path = model_path
     args.output_dir = tmp_path / "bundle"
-    args.decoder_type = "transducer_greedy_search"
-    args.beam = 6
+    args.decoder_type = decoder_type
+    args.beam = initial_beam
+    observed_beams: list[int] = []
 
-    def stop_export(*_args: object) -> None:
+    def stop_export(_model_path: Path, _temporary_dir: Path) -> None:
+        """Capture the effective beam before any source processing.
+
+        Parameters
+        ----------
+        _model_path : Path
+            Unused archive path from the extraction callback.
+        _temporary_dir : Path
+            Unused extraction directory from the callback.
+
+        Raises
+        ------
+        RuntimeError
+            Always, to stop export immediately after recording the beam.
+        """
+
+        observed_beams.append(args.beam)
         raise RuntimeError("stop export")
 
     monkeypatch.setattr(
@@ -192,635 +271,524 @@ def test_export_parakeet_forces_greedy_beam(
         stop_export,
     )
 
-    with pytest.raises(RuntimeError, match="stop export"):
+    with (
+        caplog.at_level("WARNING", logger=parakeet_exporter.__name__),
+        pytest.raises(RuntimeError, match="stop export"),
+    ):
         export_parakeet(args)
 
-    assert args.beam == 1
+    assert observed_beams == [expected_beam]
+    assert ("Overriding beam" in caplog.text) is warning_expected
 
 
-def test_parse_args_reads_required_values_and_defaults(
+@pytest.mark.parametrize(
+    ("command", "overrides"),
+    (
+        pytest.param(
+            "export --model-path model.nemo --output-dir output --batch-size 1 "
+            "--decoder-type transducer_greedy_search --beam 1 "
+            "--min-audio-seconds 0.1 --opt-audio-seconds 15 --max-audio-seconds 40",
+            {
+                "decoder_type": "transducer_greedy_search",
+                "beam": 1,
+                "min_audio_seconds": 0.1,
+            },
+            id="defaults",
+        ),
+        pytest.param(
+            "export --model-path model.nemo --output-dir output --batch-size 256 "
+            "--decoder-type transducer_modified_beam_search --beam 6 "
+            "--encoder-precision bf16 --decoder-precision fp16 "
+            "--min-audio-seconds 0.1 --opt-audio-seconds 8 --max-audio-seconds 40 "
+            "--optimization-level 3 --debug",
+            {
+                "batch_size": 256,
+                "encoder_precision": "bf16",
+                "decoder_precision": "fp16",
+                "min_audio_seconds": 0.1,
+                "opt_audio_seconds": 8.0,
+                "optimization_level": 3,
+                "debug": True,
+            },
+            id="overrides",
+        ),
+    ),
+)
+def test_parse_args(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    overrides: dict[str, bool | float | int | str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", command.split())
+    expected = make_export_args()
+    vars(expected).update(overrides)
+
+    assert parse_args() == expected
+
+
+def test_main_configures_logging_and_runs_export(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "fast-gpu-asr-export-parakeet",
-            "--model-path",
-            "model.nemo",
-            "--output-dir",
-            "output",
-            "--batch-size",
-            "1",
-            "--decoder-type",
-            "transducer_greedy_search",
-            "--beam",
-            "1",
-            "--min-audio-seconds",
-            "0.1",
-            "--opt-audio-seconds",
-            "15",
-            "--max-audio-seconds",
-            "40",
-        ],
+    args = make_export_args()
+    parse = Mock(return_value=args)
+    export = Mock()
+    configure_logging = Mock()
+    monkeypatch.setattr(parakeet_exporter, "parse_args", parse)
+    monkeypatch.setattr(parakeet_exporter, "export_parakeet", export)
+    monkeypatch.setattr(parakeet_exporter.logging, "basicConfig", configure_logging)
+
+    parakeet_exporter.main()
+
+    parse.assert_called_once_with()
+    export.assert_called_once_with(args)
+    configure_logging.assert_called_once_with(
+        format="%(asctime)s %(levelname)s %(message)s",
+        level=parakeet_exporter.logging.INFO,
     )
-
-    args = parse_args()
-
-    assert args.model_path == Path("model.nemo")
-    assert args.output_dir == Path("output")
-    assert args.batch_size == 1
-    assert args.decoder_type == "transducer_greedy_search"
-    assert args.beam == 1
-    assert args.encoder_precision == "fp32"
-    assert args.decoder_precision == "fp32"
-    assert args.min_audio_seconds == 0.1
-    assert args.opt_audio_seconds == 15.0
-    assert args.max_audio_seconds == 40.0
-    assert args.optimization_level == 5
-    assert args.debug is False
 
 
 def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeDecoder:
-        output_proj = torch.nn.Linear(1, 1, dtype=torch.float16)
+    def record_export(module, inputs, path, **kwargs) -> None:
+        """Check the inference context while Mock records the ONNX arguments.
 
-    calls: list[tuple[object, tuple[torch.Tensor, ...], Path, dict[str, object]]] = []
+        Parameters
+        ----------
+        module : torch.nn.Module
+            Model passed to the mocked ONNX exporter.
+        inputs : tuple[torch.Tensor, ...]
+            Example inputs, inspected through the Mock's call record.
+        path : Path
+            Requested graph destination; no file is written.
+        **kwargs : dict
+            ONNX options captured by the surrounding Mock.
+        """
 
-    def record_export(
-        module: object,
-        inputs: tuple[torch.Tensor, ...],
-        path: Path,
-        **kwargs: object,
-    ) -> None:
-        calls.append((module, inputs, path, kwargs))
+        assert torch.is_inference_mode_enabled()
 
-    monkeypatch.setattr(parakeet_exporter.torch.onnx, "export", record_export)
+    export = Mock(side_effect=record_export)
+    monkeypatch.setattr(parakeet_exporter.torch.onnx, "export", export)
     args = make_export_args()
     args.output_dir = tmp_path
     args.batch_size = 3
     args.beam = 4
-    args.opt_audio_seconds = 2.5
-    encoder = object()
-    decoder = FakeDecoder()
+    args.opt_audio_seconds = 2.75
+    model_config = make_model_config()
+    model_config.encoder.d_model = 384
+    model_config.decoder.prednet.pred_hidden = 192
+    model_config.decoder.prednet.pred_rnn_layers = 3
+    model_config.joint.jointnet.encoder_hidden = 384
+    encoder = torch.nn.Identity()
+    decoder = torch.nn.Module()
+    decoder.output_proj = torch.nn.Linear(1, 1, dtype=torch.float16, device="meta")
 
-    encoder_path, decoder_path = export_model_to_onnx(
-        encoder,  # type: ignore[arg-type]
-        decoder,  # type: ignore[arg-type]
-        make_model_config(),
-        args,
-    )
+    paths = export_model_to_onnx(encoder, decoder, model_config, args)
 
-    assert encoder_path == tmp_path / "parakeet.onnx"
-    assert decoder_path == tmp_path / "tdt_decoder.onnx"
-    assert len(calls) == 2
+    assert paths == (tmp_path / "parakeet.onnx", tmp_path / "tdt_decoder.onnx")
+    assert export.call_count == 2
+    encoder_call, decoder_call = export.call_args_list
+    for export_call, module, path in zip(
+        export.call_args_list,
+        (encoder, decoder),
+        paths,
+        strict=True,
+    ):
+        assert export_call.args[0] is module
+        assert export_call.args[2] == path
 
-    encoder_module, encoder_inputs, encoder_export_path, encoder_kwargs = calls[0]
-    assert encoder_module is encoder
-    assert encoder_export_path == encoder_path
-    assert tuple(encoder_inputs[0].shape) == (3, 40_000)
-    assert encoder_inputs[0].dtype == torch.float32
-    assert torch.count_nonzero(encoder_inputs[0]).item() == 0
-    assert tuple(encoder_inputs[1].shape) == (3,)
-    assert encoder_inputs[1].dtype == torch.int64
-    assert torch.equal(
-        encoder_inputs[1],
-        torch.full((3,), 40_000, dtype=torch.int64),
+    torch.testing.assert_close(
+        encoder_call.args[1],
+        (torch.zeros(3, 44_000), torch.full((3,), 44_000, dtype=torch.int64)),
+        rtol=0,
+        atol=0,
     )
-    assert encoder_kwargs["input_names"] == ("audio", "audio_lengths")
-    assert encoder_kwargs["output_names"] == (
-        "encoder_output",
-        "encoder_output_lengths",
-    )
-    dynamic_shapes = encoder_kwargs["dynamic_shapes"]
-    assert dynamic_shapes == {
-        "audio": {1: torch.export.Dim.DYNAMIC},
-        "audio_lengths": {},
+    assert encoder_call.kwargs == {
+        "input_names": ("audio", "audio_lengths"),
+        "output_names": ("encoder_output", "encoder_output_lengths"),
+        "dynamic_shapes": {
+            "audio": {1: torch.export.Dim.DYNAMIC},
+            "audio_lengths": {},
+        },
+        "opset_version": parakeet_exporter.ONNX_OPSET_VERSION,
     }
-    assert encoder_kwargs["opset_version"] == parakeet_exporter.ONNX_OPSET_VERSION
-
-    decoder_module, decoder_inputs, decoder_export_path, decoder_kwargs = calls[1]
-    assert decoder_module is decoder
-    assert decoder_export_path == decoder_path
-    assert tuple(decoder_inputs[0].shape) == (12, 1024)
-    assert tuple(decoder_inputs[1].shape) == (12, 1)
-    assert tuple(decoder_inputs[2].shape) == (2, 12, 640)
-    assert tuple(decoder_inputs[3].shape) == (2, 12, 640)
-    assert decoder_inputs[0].dtype == torch.float16
-    assert decoder_inputs[1].dtype == torch.int32
-    assert decoder_inputs[2].dtype == torch.float16
-    assert decoder_inputs[3].dtype == torch.float16
-    assert all(torch.count_nonzero(tensor).item() == 0 for tensor in decoder_inputs)
-    assert decoder_kwargs["input_names"] == (
-        "encoder_output",
-        "targets",
-        "input_states_1",
-        "input_states_2",
+    torch.testing.assert_close(
+        decoder_call.args[1],
+        (
+            torch.zeros(12, 384, dtype=torch.float16),
+            torch.zeros(12, 1, dtype=torch.int32),
+            torch.zeros(3, 12, 192, dtype=torch.float16),
+            torch.zeros(3, 12, 192, dtype=torch.float16),
+        ),
+        rtol=0,
+        atol=0,
     )
-    assert decoder_kwargs["output_names"] == (
-        "token_log_probs",
-        "duration_log_probs",
-        "output_states_1",
-        "output_states_2",
-    )
-    assert "dynamic_shapes" not in decoder_kwargs
-    assert decoder_kwargs["opset_version"] == parakeet_exporter.ONNX_OPSET_VERSION
+    assert decoder_call.kwargs == {
+        "input_names": (
+            "encoder_output",
+            "targets",
+            "input_states_1",
+            "input_states_2",
+        ),
+        "output_names": (
+            "token_log_probs",
+            "duration_log_probs",
+            "output_states_1",
+            "output_states_2",
+        ),
+        "opset_version": parakeet_exporter.ONNX_OPSET_VERSION,
+    }
 
 
 @pytest.mark.parametrize("debug", (False, True))
+@pytest.mark.parametrize(("batch_size", "partitions"), ((3, 1), (128, 2)))
 def test_export_parakeet_validates_exact_published_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     debug: bool,
+    batch_size: int,
+    partitions: int,
 ) -> None:
-    """Wire every export stage correctly and validate only published artifacts."""
-
-    output_dir = tmp_path / "bundle"
-    source_config_path = tmp_path / "source.yaml"
-    checkpoint_path = tmp_path / "weights.ckpt"
-    tokenizer_path = tmp_path / "source.model"
-    source_config = make_model_config()
-    OmegaConf.save(source_config, source_config_path)
-    checkpoint_path.write_bytes(b"checkpoint")
-    tokenizer_path.write_bytes(b"tokenizer")
     args = make_export_args()
-    args.batch_size = 3
+    args.batch_size = batch_size
     args.beam = 4
     args.debug = debug
     args.encoder_precision = "fp16"
     args.decoder_precision = "bf16"
+    args.optimization_level = 3
     args.model_path = tmp_path / "model.nemo"
-    args.model_path.write_bytes(b"archive")
-    args.output_dir = output_dir
-    adjusted_state_dict = OrderedDict((("adjusted", torch.zeros(1)),))
-    checkpoint_state_dict = OrderedDict((("source", torch.ones(1)),))
-    encoder = object()
-    decoder = object()
-    runtime_configs: list[DictConfig] = []
-    build_calls: list[
-        tuple[
-            Path,
-            Path,
-            dict[
-                str,
-                tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
-            ],
-            int,
-        ]
-    ] = []
-    events: list[str] = []
-
-    def extract_archive(
-        model_path: Path, temporary_dir: Path
-    ) -> tuple[Path, Path, Path]:
-        events.append("extract")
-        assert model_path == args.model_path
-        assert temporary_dir.is_dir()
-        assert temporary_dir != output_dir
-        return source_config_path, checkpoint_path, tokenizer_path
-
-    def validate_source(
-        model_config: DictConfig,
-        export_args: argparse.Namespace,
-    ) -> None:
-        events.append("source-validate")
-        assert OmegaConf.to_container(model_config) == OmegaConf.to_container(
-            source_config
+    args.output_dir = tmp_path / "nested" / "bundle"
+    source_config = make_model_config()
+    source_config.tokenizer = {"model_path": "nemo:artifacts/source.model"}
+    weight = torch.arange(4, dtype=torch.float32)
+    checkpoint = io.BytesIO()
+    torch.save(OrderedDict({"decoder.prediction.embed.weight": weight}), checkpoint)
+    with tarfile.open(args.model_path, "w") as archive:
+        add_archive_member(
+            archive,
+            "model_config.yaml",
+            OmegaConf.to_yaml(source_config).encode(),
         )
-        assert export_args is args
+        add_archive_member(archive, "model_weights.ckpt", checkpoint.getvalue())
+        add_archive_member(archive, "artifacts/source.model", b"tokenizer")
+    source_bytes = args.model_path.read_bytes()
+    encoder, decoder = torch.nn.Identity(), torch.nn.Identity()
+    construct_model = Mock(return_value=(encoder, decoder))
+    validate_source = Mock(wraps=validate_parakeet)
+    load_checkpoint = Mock(wraps=torch.load)
+    validate_config = Mock(wraps=parakeet_exporter.validate_model_config)
 
-    def load_checkpoint(
-        path: Path,
-        *,
-        map_location: torch.device,
-        weights_only: bool,
-    ) -> OrderedDict[str, torch.Tensor]:
-        events.append("checkpoint-load")
-        assert path == checkpoint_path
-        assert map_location == torch.device("cpu")
-        assert weights_only is True
-        return checkpoint_state_dict
+    def export_onnx(encoder, decoder, model_config, export_args) -> tuple[Path, Path]:
+        """Write small ONNX graphs so production cleanup can run unchanged.
 
-    def adjust_checkpoint(
-        state_dict: OrderedDict[str, torch.Tensor],
-    ) -> OrderedDict[str, torch.Tensor]:
-        events.append("checkpoint-adjust")
-        assert state_dict is checkpoint_state_dict
-        return adjusted_state_dict
+        Parameters
+        ----------
+        encoder : torch.nn.Module
+            Placeholder encoder recorded by the surrounding Mock.
+        decoder : torch.nn.Module
+            Placeholder decoder recorded by the surrounding Mock.
+        model_config : DictConfig
+            Source configuration passed by the exporter.
+        export_args : argparse.Namespace
+            Arguments providing the output directory.
 
-    def get_partitions(
-        model_config: DictConfig,
-        export_args: argparse.Namespace,
-    ) -> int:
-        events.append("partition")
-        assert OmegaConf.to_container(model_config) == OmegaConf.to_container(
-            source_config
+        Returns
+        -------
+        tuple[Path, Path]
+            Newly written encoder and decoder graph paths.
+        """
+
+        paths = tuple(
+            export_args.output_dir / name
+            for name in ("parakeet.onnx", "tdt_decoder.onnx")
         )
-        assert export_args is args
-        return 2
+        for path in paths:
+            onnx.save(
+                onnx.helper.make_model(
+                    onnx.helper.make_graph([], path.stem, [], []),
+                ),
+                path,
+            )
+        return paths
 
-    def make_export_model(
-        model_config: DictConfig,
-        state_dict: OrderedDict[str, torch.Tensor],
-        partitions: int,
-        encoder_dtype: torch.dtype,
-        decoder_dtype: torch.dtype,
-    ) -> tuple[object, object]:
-        events.append("model")
-        assert OmegaConf.to_container(model_config) == OmegaConf.to_container(
-            source_config
-        )
-        assert state_dict is adjusted_state_dict
-        assert partitions == 2
-        assert encoder_dtype == torch.float16
-        assert decoder_dtype == torch.bfloat16
-        return encoder, decoder
+    def build_engine(onnx_path, engine_path, profiles, optimization_level) -> None:
+        """Stand in for TensorRT only after extraction resources are released.
 
-    real_make_runtime_config = parakeet_exporter.make_runtime_config
+        Parameters
+        ----------
+        onnx_path : Path
+            Existing graph whose basename becomes the engine's sentinel bytes.
+        engine_path : Path
+            Destination engine path.
+        profiles : dict
+            Optimization profiles recorded by the surrounding Mock.
+        optimization_level : int
+            Builder level recorded by the surrounding Mock.
+        """
 
-    def record_runtime_config(
-        model_config: DictConfig,
-        export_args: argparse.Namespace,
-    ) -> DictConfig:
-        events.append("runtime-config")
-        assert OmegaConf.to_container(model_config) == OmegaConf.to_container(
-            source_config
-        )
-        assert export_args is args
-        runtime_config = real_make_runtime_config(model_config, export_args)
-        runtime_configs.append(runtime_config)
-        return runtime_config
-
-    def export_onnx(
-        export_encoder: object,
-        export_decoder: object,
-        model_config: DictConfig,
-        export_args: argparse.Namespace,
-    ) -> tuple[Path, Path]:
-        assert export_encoder is encoder
-        assert export_decoder is decoder
-        assert OmegaConf.to_container(model_config) == OmegaConf.to_container(
-            source_config
-        )
-        assert export_args is args
-        encoder_path = output_dir / parakeet_exporter.PARAKEET_ONNX_FILE
-        decoder_path = output_dir / parakeet_exporter.PARAKEET_DECODER_ONNX_FILE
-        encoder_path.write_bytes(b"encoder")
-        decoder_path.write_bytes(b"decoder")
-        events.append("onnx")
-        return encoder_path, decoder_path
-
-    def build_engine(
-        onnx_path: Path,
-        engine_path: Path,
-        profiles: dict[
-            str,
-            tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
-        ],
-        optimization_level: int,
-    ) -> None:
-        engine_path.write_bytes(b"engine")
-        build_calls.append((onnx_path, engine_path, profiles, optimization_level))
-        events.append(f"build:{engine_path.name}")
-
-    def remove_graph(path: Path) -> None:
-        path.unlink()
-        events.append(f"remove:{path.name}")
+        assert onnx_path.is_file()
+        assert not load_checkpoint.call_args.args[0].parent.exists()
+        engine_path.write_bytes(onnx_path.name.encode())
 
     def validate_bundle(model_dir: Path, model_config: DictConfig) -> None:
-        events.append("validate")
-        assert len(runtime_configs) == 1
-        assert model_config is not runtime_configs[0]
-        assert OmegaConf.to_container(model_config) == OmegaConf.to_container(
-            runtime_configs[0]
-        )
-        assert (
-            model_dir / parakeet_exporter.TOKENIZER_FILE
-        ).read_bytes() == b"tokenizer"
-        assert (model_dir / parakeet_exporter.MODEL_CONFIG_FILE).is_file()
-        assert (model_dir / parakeet_exporter.PARAKEET_TENSORRT_FILE).is_file()
-        assert (model_dir / parakeet_exporter.PARAKEET_DECODER_TENSORRT_FILE).is_file()
-        assert (model_dir / parakeet_exporter.PARAKEET_ONNX_FILE).exists() is debug
-        assert (
-            model_dir / parakeet_exporter.PARAKEET_DECODER_ONNX_FILE
-        ).exists() is debug
+        """Check the reloaded config and the complete published bundle.
 
-    monkeypatch.setattr(parakeet_exporter, "extract_parakeet_archive", extract_archive)
+        Parameters
+        ----------
+        model_dir : Path
+            Published directory to check for the exact expected artifact set.
+        model_config : DictConfig
+            Reloaded runtime metadata, compared with its saved source.
+        """
+
+        assert model_dir == args.output_dir
+        assert model_config is not validate_config.call_args.args[0]
+        assert model_config == validate_config.call_args.args[0]
+        assert model_config == OmegaConf.load(model_dir / "model_config.yaml")
+        expected_files = {
+            "model_config.yaml",
+            "bpe.model",
+            "parakeet.trt",
+            "tdt_decoder.trt",
+        }
+        if debug:
+            expected_files.update(("parakeet.onnx", "tdt_decoder.onnx"))
+        assert {path.name for path in model_dir.iterdir()} == expected_files
+        assert all(path.is_file() for path in model_dir.iterdir())
+        assert (model_dir / "bpe.model").read_bytes() == b"tokenizer"
+        assert (model_dir / "parakeet.trt").read_bytes() == b"parakeet.onnx"
+        assert (model_dir / "tdt_decoder.trt").read_bytes() == b"tdt_decoder.onnx"
+
+    export_onnx_mock = Mock(side_effect=export_onnx)
+    build = Mock(side_effect=build_engine)
+    validate = Mock(side_effect=validate_bundle)
+    monkeypatch.setattr(parakeet_exporter, "make_model", construct_model)
     monkeypatch.setattr(parakeet_exporter, "validate_parakeet", validate_source)
     monkeypatch.setattr(parakeet_exporter.torch, "load", load_checkpoint)
-    monkeypatch.setattr(parakeet_exporter, "adjust_state_dict", adjust_checkpoint)
-    monkeypatch.setattr(
-        parakeet_exporter,
-        "get_subsampling_batch_partitions",
-        get_partitions,
-    )
-    monkeypatch.setattr(parakeet_exporter, "make_model", make_export_model)
-    monkeypatch.setattr(
-        parakeet_exporter,
-        "make_runtime_config",
-        record_runtime_config,
-    )
-    monkeypatch.setattr(parakeet_exporter, "export_model_to_onnx", export_onnx)
-    monkeypatch.setattr(parakeet_exporter, "build_tensorrt_engine", build_engine)
-    monkeypatch.setattr(parakeet_exporter, "remove_onnx_artifacts", remove_graph)
-    monkeypatch.setattr(parakeet_exporter, "validate_model", validate_bundle)
+    monkeypatch.setattr(parakeet_exporter, "validate_model_config", validate_config)
+    monkeypatch.setattr(parakeet_exporter, "export_model_to_onnx", export_onnx_mock)
+    monkeypatch.setattr(parakeet_exporter, "build_tensorrt_engine", build)
+    monkeypatch.setattr(parakeet_exporter, "validate_model", validate)
 
-    parakeet_exporter.export_parakeet(args)
+    export_parakeet(args)
 
-    sample_rate = source_config.sample_rate
-    expected_profile = tuple(
-        (args.batch_size, round(seconds * sample_rate))
-        for seconds in (
-            args.min_audio_seconds,
-            args.opt_audio_seconds,
-            args.max_audio_seconds,
-        )
+    validate_source.assert_called_once_with(source_config, args)
+    load_checkpoint.assert_called_once_with(
+        load_checkpoint.call_args.args[0],
+        map_location=torch.device("cpu"),
+        weights_only=True,
     )
-    assert build_calls == [
-        (
-            output_dir / parakeet_exporter.PARAKEET_ONNX_FILE,
-            output_dir / parakeet_exporter.PARAKEET_TENSORRT_FILE,
-            {"audio": expected_profile},
-            args.optimization_level,
+    assert load_checkpoint.call_args.args[0].name == "model_weights.ckpt"
+    construct_model.assert_called_once()
+    config, state_dict, *settings = construct_model.call_args.args
+    assert config == source_config
+    torch.testing.assert_close(
+        state_dict,
+        OrderedDict({"embedding.weight": weight}),
+        rtol=0,
+        atol=0,
+    )
+    assert settings == [partitions, torch.float16, torch.bfloat16]
+    export_onnx_mock.assert_called_once_with(encoder, decoder, source_config, args)
+    validate_config.assert_called_once()
+    validate.assert_called_once_with(args.output_dir, validate_config.call_args.args[0])
+    assert build.call_args_list == [
+        call(
+            args.output_dir / "parakeet.onnx",
+            args.output_dir / "parakeet.trt",
+            {
+                "audio": (
+                    (batch_size, 8_000),
+                    (batch_size, 240_000),
+                    (batch_size, 640_000),
+                )
+            },
+            3,
         ),
-        (
-            output_dir / parakeet_exporter.PARAKEET_DECODER_ONNX_FILE,
-            output_dir / parakeet_exporter.PARAKEET_DECODER_TENSORRT_FILE,
+        call(
+            args.output_dir / "tdt_decoder.onnx",
+            args.output_dir / "tdt_decoder.trt",
             {},
-            args.optimization_level,
+            3,
         ),
     ]
-    expected_events = [
-        "extract",
-        "source-validate",
-        "checkpoint-load",
-        "checkpoint-adjust",
-        "partition",
-        "model",
-        "runtime-config",
-        "onnx",
-        f"build:{parakeet_exporter.PARAKEET_TENSORRT_FILE}",
-        f"build:{parakeet_exporter.PARAKEET_DECODER_TENSORRT_FILE}",
-    ]
-    if not debug:
-        expected_events.extend(
-            (
-                f"remove:{parakeet_exporter.PARAKEET_ONNX_FILE}",
-                f"remove:{parakeet_exporter.PARAKEET_DECODER_ONNX_FILE}",
-            )
-        )
-    expected_events.append("validate")
-    assert events == expected_events
-    assert events[-1] == "validate"
+    assert args.model_path.read_bytes() == source_bytes
 
 
+@pytest.mark.parametrize(
+    ("feature_values", "expected_feature_values"),
+    (
+        pytest.param({}, (0.97, 0, 8_000), id="defaults"),
+        pytest.param(
+            {"preemph": 0.5, "lowfreq": 80, "highfreq": 7_600},
+            (0.5, 80, 7_600),
+            id="configured",
+        ),
+    ),
+)
 def test_make_model_wires_configuration_and_state_dicts(
     monkeypatch: pytest.MonkeyPatch,
+    feature_values: dict[str, float | int],
+    expected_feature_values: tuple[float, int, int],
 ) -> None:
-    """Construct both modules with exact source metadata and strict state loading."""
-
-    class FakeModule:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-            self.loaded_state_dict: OrderedDict[str, torch.Tensor] | None = None
-            self.strict: bool | None = None
-            self.eval_called = False
-
-        def load_state_dict(
-            self,
-            state_dict: OrderedDict[str, torch.Tensor],
-            *,
-            strict: bool,
-        ) -> None:
-            self.loaded_state_dict = state_dict
-            self.strict = strict
-
-        def eval(self) -> None:
-            self.eval_called = True
-
-    modules: list[FakeModule] = []
-
-    def make_fake_module(**kwargs: object) -> FakeModule:
-        module = FakeModule(**kwargs)
-        modules.append(module)
-        return module
-
-    monkeypatch.setattr(parakeet_exporter, "ParakeetTDTEncoder", make_fake_module)
-    monkeypatch.setattr(parakeet_exporter, "Decoder", make_fake_module)
+    make_encoder = Mock(return_value=Mock(spec=torch.nn.Module))
+    make_decoder = Mock(return_value=Mock(spec=torch.nn.Module))
+    monkeypatch.setattr(parakeet_exporter, "ParakeetTDTEncoder", make_encoder)
+    monkeypatch.setattr(parakeet_exporter, "Decoder", make_decoder)
     encoder_weight = torch.ones(1)
-    embedding_weight = torch.ones(2)
-    ignored_weight = torch.ones(3)
-    state_dict = OrderedDict(
+    decoder_weights = OrderedDict(
         (
-            ("encoder.weight", encoder_weight),
-            ("embedding.weight", embedding_weight),
-            ("ignored.weight", ignored_weight),
+            ("embedding.weight", torch.ones(2)),
+            ("lstm.weight_ih_l0", torch.ones(3)),
+            ("lstm.weight_hh_l2", torch.ones(4)),
+            ("lstm.bias_ih_l1", torch.ones(5)),
+            ("decoder_proj.weight", torch.ones(6)),
+            ("encoder_proj.bias", torch.ones(7)),
+            ("output_proj.weight", torch.ones(8)),
         )
     )
+    state_dict = OrderedDict(
+        (
+            ("encoder.pre_encode.conv1.weight", encoder_weight),
+            *decoder_weights.items(),
+            ("feature_extractor.window", torch.ones(9)),
+        )
+    )
+    model_config = make_model_config()
+    model_config.preprocessor.update(feature_values)
+    model_config.preprocessor.window_stride = 0.012
+    model_config.preprocessor.window_size = 0.031
+    model_config.preprocessor.features = 96
+    model_config.encoder.n_layers = 7
+    model_config.encoder.d_model = 384
+    model_config.encoder.subsampling_conv_channels = 80
+    model_config.encoder.ff_expansion_factor = 3
+    model_config.encoder.n_heads = 6
+    model_config.encoder.pos_emb_max_len = 777
+    model_config.encoder.conv_kernel_size = 15
+    model_config.decoder.vocab_size = 321
+    model_config.decoder.prednet.pred_hidden = 192
+    model_config.decoder.prednet.pred_rnn_layers = 3
+    model_config.joint.jointnet.encoder_hidden = 384
+    model_config.joint.jointnet.joint_hidden = 224
+    model_config.joint.num_extra_outputs = 7
 
     encoder, decoder = make_model(
-        make_model_config(),
+        model_config,
         state_dict,
         3,
         torch.float16,
         torch.bfloat16,
     )
 
-    assert modules == [encoder, decoder]
-    assert encoder.kwargs == {
-        "samp_freq": 16_000,
-        "frame_shift_ms": 10,
-        "frame_length_ms": 25,
-        "feature_dim": 128,
-        "preemph": 0.97,
-        "low_freq": 0,
-        "high_freq": 8_000,
-        "n_layers": 24,
-        "model_dim": 1_024,
-        "subsampling_conv_channels": 256,
-        "feed_forward_expansion_factor": 4,
-        "n_heads": 8,
-        "pos_emb_max_len": 5_000,
-        "conv_kernel_size": 9,
-        "subsampling_batch_partitions": 3,
-        "dtype": torch.float16,
-    }
-    assert decoder.kwargs == {
-        "vocab_size": 1_024,
-        "encoder_dim": 1_024,
-        "decoder_dim": 640,
-        "joiner_dim": 640,
-        "pred_rnn_layers": 2,
-        "num_extra_outputs": 5,
-        "dtype": torch.bfloat16,
-    }
-    assert encoder.loaded_state_dict is not None
-    assert tuple(encoder.loaded_state_dict) == ("encoder.weight",)
-    assert encoder.loaded_state_dict["encoder.weight"] is encoder_weight
-    assert decoder.loaded_state_dict is not None
-    assert tuple(decoder.loaded_state_dict) == ("embedding.weight",)
-    assert decoder.loaded_state_dict["embedding.weight"] is embedding_weight
-    assert encoder.strict is True
-    assert decoder.strict is True
-    assert encoder.eval_called is True
-    assert decoder.eval_called is True
-
-
-def test_make_parakeet_runtime_config() -> None:
-    """Publish every runtime field and omit source-only architecture metadata."""
-
-    runtime_config = make_runtime_config(
-        make_model_config(),
-        make_export_args(),
+    assert encoder is make_encoder.return_value
+    assert decoder is make_decoder.return_value
+    make_encoder.assert_called_once_with(
+        samp_freq=16_000,
+        frame_shift_ms=12,
+        frame_length_ms=31,
+        feature_dim=96,
+        preemph=expected_feature_values[0],
+        low_freq=expected_feature_values[1],
+        high_freq=expected_feature_values[2],
+        n_layers=7,
+        model_dim=384,
+        subsampling_conv_channels=80,
+        feed_forward_expansion_factor=3,
+        n_heads=6,
+        pos_emb_max_len=777,
+        conv_kernel_size=15,
+        subsampling_batch_partitions=3,
+        dtype=torch.float16,
     )
+    make_decoder.assert_called_once_with(
+        vocab_size=321,
+        encoder_dim=384,
+        decoder_dim=192,
+        joiner_dim=224,
+        pred_rnn_layers=3,
+        num_extra_outputs=7,
+        dtype=torch.bfloat16,
+    )
+    for module, expected_weights in (
+        (encoder, OrderedDict({"encoder.pre_encode.conv1.weight": encoder_weight})),
+        (decoder, decoder_weights),
+    ):
+        module.load_state_dict.assert_called_once_with(expected_weights, strict=True)
+        module.eval.assert_called_once_with()
 
-    validate_model_config(runtime_config)
+
+def test_make_parakeet_runtime_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    model_config = make_model_config()
+    model_config.model_defaults.tdt_durations = [0, 2, 4]
+    model_config.preprocessor.window_stride = 0.012
+    model_config.preprocessor.features = 96
+    model_config.encoder.n_layers = 7
+    model_config.encoder.d_model = 384
+    model_config.encoder.pos_emb_max_len = 777
+    model_config.decoder.vocab_size = 321
+    model_config.decoder.prednet.pred_hidden = 192
+    model_config.decoder.prednet.pred_rnn_layers = 3
+    model_config.joint.jointnet.encoder_hidden = 384
+    model_config.joint.jointnet.joint_hidden = 224
+    model_config.joint.num_extra_outputs = 3
+    model_config.decoding.greedy.max_symbols = 7
+    args = make_export_args()
+    args.beam = 5
+    args.min_audio_seconds = 0.25
+    args.opt_audio_seconds = 7.5
+    args.max_audio_seconds = 30.0
+    validate = Mock(wraps=parakeet_exporter.validate_model_config)
+    monkeypatch.setattr(parakeet_exporter, "validate_model_config", validate)
+    runtime_config = make_runtime_config(model_config, args)
+
+    validate.assert_called_once_with(runtime_config)
     assert OmegaConf.to_container(runtime_config, resolve=True) == {
         "model_type": "parakeet_asr",
         "decoder_type": "transducer_modified_beam_search",
         "model_samplerate": 16_000,
-        "vocab_size": 1_024,
-        "blank_id": 1_024,
+        "vocab_size": 321,
+        "blank_id": 321,
         "audio_encoder_params": {
-            "feature_dim": 128,
-            "frame_shift_ms": 10,
-            "n_layers": 24,
-            "model_dim": 1_024,
-            "pos_emb_max_len": 5_000,
+            "feature_dim": 96,
+            "frame_shift_ms": 12,
+            "n_layers": 7,
+            "model_dim": 384,
+            "pos_emb_max_len": 777,
             "subsampling_factor": 8,
-            "min_audio_seconds": 0.5,
-            "opt_audio_seconds": 15.0,
-            "max_audio_seconds": 40.0,
+            "min_audio_seconds": 0.25,
+            "opt_audio_seconds": 7.5,
+            "max_audio_seconds": 30.0,
         },
         "decoder_params": {
-            "encoder_dim": 1_024,
-            "decoder_dim": 640,
-            "joiner_dim": 640,
-            "pred_rnn_layers": 2,
-            "num_extra_outputs": 5,
-            "beam": 6,
+            "encoder_dim": 384,
+            "decoder_dim": 192,
+            "joiner_dim": 224,
+            "pred_rnn_layers": 3,
+            "num_extra_outputs": 3,
+            "beam": 5,
             "blank_penalty": 0.0,
-            "max_symbols_per_timestep": 10,
-            "tdt_durations": [0, 1, 2, 3, 4],
+            "max_symbols_per_timestep": 7,
+            "tdt_durations": [0, 2, 4],
         },
     }
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
-    (
-        (
-            "audio_encoder_params.model_dim",
-            512,
-            "model_dim and decoder_params.encoder_dim",
-        ),
-        (
-            "decoder_params.num_extra_outputs",
-            4,
-            "number of decoder_params.tdt_durations",
-        ),
-        (
-            "decoder_params.tdt_durations",
-            [1, 2, 3, 4, 5],
-            "must contain zero",
-        ),
-        (
-            "decoder_params.tdt_durations",
-            [0, 1, 1, 3, 4],
-            "must contain unique values",
-        ),
-        (
-            "decoder_params.tdt_durations",
-            [0, 1, 2, 3, 1 << 31],
-            "signed 32-bit integers",
-        ),
-        (
-            "audio_encoder_params.pos_emb_max_len",
-            0,
-            "positive integer",
-        ),
-        ("blank_id", 1024.0, "Expected blank_id=1024"),
-        ("decoder_params.beam", 1025, "beam <= vocab_size"),
-    ),
+    "decoder_type",
+    ("transducer_modified_beam_search", "transducer_greedy_search"),
 )
-def test_validate_model_config_rejects_inconsistent_parakeet_values(
-    field: str,
-    value: float | int | list[int],
-    message: str,
-) -> None:
-    runtime_config = make_runtime_config(
-        make_model_config(),
-        make_export_args(),
-    )
-    OmegaConf.update(runtime_config, field, value)
-
-    with pytest.raises(ASRInitializationError, match=message):
-        validate_model_config(runtime_config)
-
-
-def test_validate_model_config_rejects_search_candidate_overflow() -> None:
-    runtime_config = make_runtime_config(
-        make_model_config(),
-        make_export_args(),
-    )
-    runtime_config.vocab_size = 50_000
-    runtime_config.blank_id = 50_000
-    runtime_config.decoder_params.beam = 50_000
-
-    with pytest.raises(
-        ASRInitializationError, match="Parakeet per-utterance search table"
-    ):
-        validate_model_config(runtime_config)
-
-
-def test_validate_model_config_rejects_invalid_audio_profile() -> None:
-    runtime_config = make_runtime_config(
-        make_model_config(),
-        make_export_args(),
-    )
-    runtime_config.audio_encoder_params.opt_audio_seconds = 0.25
-
-    with pytest.raises(
-        ASRInitializationError,
-        match="min_audio_seconds <= opt_audio_seconds",
-    ):
-        validate_model_config(runtime_config)
-
-
-def test_validate_model_config_accepts_parakeet_greedy_mode() -> None:
-    runtime_config = make_runtime_config(
-        make_model_config(),
-        make_export_args(),
-    )
-    runtime_config.decoder_type = "transducer_greedy_search"
-    runtime_config.decoder_params.beam = 1
-
-    validate_model_config(runtime_config)
-
-
-def test_validate_parakeet_accepts_beam_one_modified_beam() -> None:
+def test_validate_parakeet_accepts_beam_one(decoder_type: str) -> None:
+    model_config = make_model_config()
     args = make_export_args()
+    args.decoder_type = decoder_type
     args.beam = 1
 
-    validate_parakeet(make_model_config(), args)
-    runtime_config = make_runtime_config(make_model_config(), args)
+    validate_parakeet(model_config, args)
+    runtime_config = make_runtime_config(model_config, args)
 
-    assert runtime_config.decoder_type == "transducer_modified_beam_search"
-    assert runtime_config.decoder_params.beam == 1
-
-
-def test_validate_parakeet_accepts_greedy_export() -> None:
-    args = make_export_args()
-    args.decoder_type = "transducer_greedy_search"
-    args.beam = 1
-
-    validate_parakeet(make_model_config(), args)
-    runtime_config = make_runtime_config(make_model_config(), args)
-
-    assert runtime_config.decoder_type == "transducer_greedy_search"
+    assert runtime_config.decoder_type == decoder_type
     assert runtime_config.decoder_params.beam == 1
 
 
@@ -902,6 +870,7 @@ def test_validate_parakeet_rejects_encoder_decoder_interface_mismatch() -> None:
     (
         ([], "non-negative signed 32-bit integers"),
         ([0, 1, 2, 3, -1], "non-negative signed 32-bit integers"),
+        ([0, 1, 2.0, 3, 4], "non-negative signed 32-bit integers"),
         ([0, 1, 1, 3, 4], "unique values"),
         ([1, 2, 3, 4, 5], "contain zero"),
         ([0, 1, 2, 3], "must match joint.num_extra_outputs"),
@@ -909,7 +878,7 @@ def test_validate_parakeet_rejects_encoder_decoder_interface_mismatch() -> None:
     ),
 )
 def test_validate_parakeet_rejects_invalid_tdt_durations(
-    durations: list[int],
+    durations: list[float | int],
     message: str,
 ) -> None:
     model_config = make_model_config()
@@ -920,13 +889,22 @@ def test_validate_parakeet_rejects_invalid_tdt_durations(
 
 
 def test_validate_parakeet_rejects_only_zero_duration() -> None:
-    """Require at least one advancing TDT duration even for one duration output."""
-
     model_config = make_model_config()
     model_config.model_defaults.tdt_durations = [0]
     model_config.joint.num_extra_outputs = 1
 
     with pytest.raises(ValueError, match="zero and at least one positive duration"):
+        validate_parakeet(model_config, make_export_args())
+
+
+@pytest.mark.parametrize("durations", (None, 1))
+def test_validate_parakeet_rejects_nonsequence_tdt_durations(
+    durations: int | None,
+) -> None:
+    model_config = make_model_config()
+    model_config.model_defaults.tdt_durations = durations
+
+    with pytest.raises(TypeError, match="not iterable"):
         validate_parakeet(model_config, make_export_args())
 
 
@@ -942,19 +920,20 @@ def test_validate_parakeet_rejects_audio_sample_dimension_overflow() -> None:
     ("field", "value", "message"),
     (
         ("batch_size", 0, "batch_size must be positive"),
+        ("batch_size", 1.5, "batch_size must be positive"),
         ("beam", 0, "beam must be positive"),
+        ("beam", 1.5, "beam must be positive"),
         ("min_audio_seconds", 0.0, "Expected 0 < min_audio_seconds"),
+        ("min_audio_seconds", "0.5", "Expected 0 < min_audio_seconds"),
         ("opt_audio_seconds", 0.25, "min_audio_seconds <= opt_audio_seconds"),
         ("max_audio_seconds", 10.0, "opt_audio_seconds <= max_audio_seconds"),
     ),
 )
 def test_validate_parakeet_rejects_invalid_export_arguments(
     field: str,
-    value: float | int,
+    value: float | int | str,
     message: str,
 ) -> None:
-    """Reject invalid fixed-batch and duration-profile arguments."""
-
     args = make_export_args()
     setattr(args, field, value)
 
@@ -962,9 +941,54 @@ def test_validate_parakeet_rejects_invalid_export_arguments(
         validate_parakeet(make_model_config(), args)
 
 
-def test_validate_parakeet_normalization_length_boundary() -> None:
-    """Require two feature frames for unbiased per-feature variance."""
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("preprocessor.frame_splicing", True),
+        ("preprocessor.n_fft", 512.0),
+        ("preprocessor.log", 1),
+        ("preprocessor.mag_power", 2),
+        ("preprocessor.pad_to", False),
+        ("preprocessor.pad_value", 0),
+        ("encoder.subsampling_factor", 8.0),
+        ("encoder.xscaling", 0),
+        ("encoder.untie_biases", 1),
+        ("encoder.use_bias", 0),
+        ("decoder.blank_as_pad", 1),
+    ),
+)
+def test_validate_parakeet_accepts_equivalent_fixed_values(
+    field: str,
+    value: bool | float | int,
+) -> None:
+    model_config = make_model_config()
+    OmegaConf.update(model_config, field, value)
 
+    validate_parakeet(model_config, make_export_args())
+
+
+def test_validate_parakeet_accepts_omitted_optional_preprocessor_defaults() -> None:
+    model_config = make_model_config()
+    for field in ("n_fft", "log", "pad_to", "pad_value"):
+        del model_config.preprocessor[field]
+
+    validate_parakeet(model_config, make_export_args())
+
+
+@pytest.mark.parametrize("field", ("encoder_precision", "decoder_precision"))
+@pytest.mark.parametrize("value", ("fp8", None, True, ["fp32"]))
+def test_validate_parakeet_rejects_unsupported_precision(
+    field: str,
+    value: bool | list[str] | str | None,
+) -> None:
+    args = make_export_args()
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=rf"{field} must be one of"):
+        validate_parakeet(make_model_config(), args)
+
+
+def test_validate_parakeet_normalization_length_boundary() -> None:
     args = make_export_args()
     args.min_audio_seconds = 320 / 16_000
     validate_parakeet(make_model_config(), args)
@@ -1077,23 +1101,30 @@ def test_validate_parakeet_rejects_unsupported_fixed_values(
     field: str,
     value: bool | float | int | str | list[int] | None,
 ) -> None:
-    """Reject every fixed source-model semantic required by the exporter."""
-
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=re.escape(field)):
         validate_parakeet(model_config, make_export_args())
 
 
 def test_validate_parakeet_rejects_unsupported_decoder_type() -> None:
-    """Reject decoder modes that the Parakeet TDT bundle cannot provide."""
-
     args = make_export_args()
     args.decoder_type = "ctc_greedy_search"
 
     with pytest.raises(ValueError, match="supports only"):
         validate_parakeet(make_model_config(), args)
+
+
+@pytest.mark.parametrize("attention_context", (None, -1))
+def test_validate_parakeet_rejects_nonsequence_attention_context(
+    attention_context: int | None,
+) -> None:
+    model_config = make_model_config()
+    model_config.encoder.att_context_size = attention_context
+
+    with pytest.raises(ValueError, match="full-context offline attention"):
+        validate_parakeet(model_config, make_export_args())
 
 
 @pytest.mark.parametrize(("window_size", "n_fft"), ((0.016, 256), (0.033, 1024)))
@@ -1127,8 +1158,6 @@ def test_subsampling_batch_uses_minimum_cask_safe_partitions(
     batch_size: int,
     expected_partitions: int,
 ) -> None:
-    """Choose the smallest safe partition count at production batch sizes."""
-
     args = make_export_args()
     args.batch_size = batch_size
     args.max_audio_seconds = 40.0
@@ -1139,12 +1168,40 @@ def test_subsampling_batch_uses_minimum_cask_safe_partitions(
     )
 
 
-def test_subsampling_batch_rejects_single_item_over_cask_limit() -> None:
+def test_subsampling_batch_partitions_use_configured_frontend_dimensions() -> None:
+    model_config = make_model_config()
+    model_config.preprocessor.window_stride = 0.02
+    model_config.preprocessor.features = 80
+    model_config.encoder.subsampling_conv_channels = 128
     args = make_export_args()
-    args.max_audio_seconds = 20_000.0
+    args.batch_size = 256
 
+    assert get_subsampling_batch_partitions(model_config, args) == 1
+
+
+def test_subsampling_batch_cask_single_item_boundary() -> None:
+    model_config = make_model_config()
+    args = make_export_args()
+    args.batch_size = 1
+    sample_rate = model_config.preprocessor.sample_rate
+    hop_length = round(model_config.preprocessor.window_stride * sample_rate)
+    elements_per_frame = model_config.encoder.subsampling_conv_channels * (
+        (model_config.preprocessor.features + 1) // 2
+    )
+    cask_element_limit = 1 << 31
+    assert cask_element_limit % elements_per_frame == 0
+    maximum_conv1_frames = cask_element_limit // elements_per_frame
+
+    accepted_feature_frames = 2 * maximum_conv1_frames - 1
+    accepted_samples = (accepted_feature_frames - 1) * hop_length
+    args.max_audio_seconds = accepted_samples / sample_rate
+    assert get_subsampling_batch_partitions(model_config, args) == 1
+
+    rejected_feature_frames = 2 * maximum_conv1_frames + 1
+    rejected_samples = (rejected_feature_frames - 1) * hop_length
+    args.max_audio_seconds = rejected_samples / sample_rate
     with pytest.raises(ValueError, match="One Parakeet subsampling item exceeds"):
-        get_subsampling_batch_partitions(make_model_config(), args)
+        get_subsampling_batch_partitions(model_config, args)
 
 
 def add_archive_member(
@@ -1152,7 +1209,17 @@ def add_archive_member(
     name: str,
     data: bytes = b"data",
 ) -> None:
-    """Add one regular in-memory file to a test tar archive."""
+    """Add one regular in-memory file to a test tar archive.
+
+    Parameters
+    ----------
+    archive : tarfile.TarFile
+        Archive already open for writing.
+    name : str
+        Member name stored verbatim, including intentionally unsafe test paths.
+    data : bytes
+        Contents of the new member.
+    """
 
     member = tarfile.TarInfo(name)
     member.size = len(data)
@@ -1160,16 +1227,18 @@ def add_archive_member(
 
 
 @pytest.mark.parametrize(
-    "tokenizer_reference",
-    ("nemo:nested/tokenizer.model", "nested/tokenizer.model"),
+    ("tokenizer_reference", "tokenizer_name"),
+    (
+        ("nemo:nested/nemo_tokenizer.model", "nemo_tokenizer.model"),
+        ("nested/archive_tokenizer.model", "archive_tokenizer.model"),
+    ),
     ids=("nemo-uri", "archive-path"),
 )
 def test_extract_parakeet_archive_resolves_tokenizer_reference(
     tmp_path: Path,
     tokenizer_reference: str,
+    tokenizer_name: str,
 ) -> None:
-    """Extract required files and resolve both supported tokenizer path forms."""
-
     archive_path = tmp_path / "model.nemo"
     config = OmegaConf.create({"tokenizer": {"model_path": tokenizer_reference}})
     with tarfile.open(archive_path, "w") as archive:
@@ -1179,7 +1248,8 @@ def test_extract_parakeet_archive_resolves_tokenizer_reference(
             OmegaConf.to_yaml(config).encode(),
         )
         add_archive_member(archive, "model/model_weights.ckpt", b"checkpoint")
-        add_archive_member(archive, "artifacts/tokenizer.model", b"tokenizer")
+        add_archive_member(archive, "artifacts/tokenizer.model", b"wrong")
+        add_archive_member(archive, f"artifacts/{tokenizer_name}", b"tokenizer")
     output_dir = tmp_path / "extracted"
     output_dir.mkdir()
 
@@ -1190,12 +1260,38 @@ def test_extract_parakeet_archive_resolves_tokenizer_reference(
 
     assert config_path == output_dir / "model_config.yaml"
     assert checkpoint_path == output_dir / "model_weights.ckpt"
-    assert tokenizer_path == output_dir / "tokenizer.model"
-    assert OmegaConf.to_container(OmegaConf.load(config_path)) == {
-        "tokenizer": {"model_path": tokenizer_reference}
-    }
+    assert tokenizer_path == output_dir / tokenizer_name
+    assert OmegaConf.load(config_path) == config
     assert checkpoint_path.read_bytes() == b"checkpoint"
     assert tokenizer_path.read_bytes() == b"tokenizer"
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    ("model_config.yaml", "model_weights.ckpt", "custom_tokenizer.model"),
+)
+def test_extract_parakeet_archive_rejects_missing_required_member(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    archive_path = tmp_path / "model.nemo"
+    config = OmegaConf.create(
+        {"tokenizer": {"model_path": "nemo:artifacts/custom_tokenizer.model"}}
+    )
+    members = {
+        "model_config.yaml": OmegaConf.to_yaml(config).encode(),
+        "model_weights.ckpt": b"checkpoint",
+        "custom_tokenizer.model": b"tokenizer",
+    }
+    with tarfile.open(archive_path, "w") as archive:
+        for name, data in members.items():
+            if name != missing_name:
+                add_archive_member(archive, f"model/{name}", data)
+
+    output_dir = tmp_path / "extracted"
+    output_dir.mkdir()
+    with pytest.raises(FileNotFoundError, match=missing_name):
+        extract_parakeet_archive(archive_path, output_dir)
 
 
 def test_extract_member_matches_exact_basename(tmp_path: Path) -> None:
@@ -1208,6 +1304,21 @@ def test_extract_member_matches_exact_basename(tmp_path: Path) -> None:
         output_path = extract_member(archive, "model_config.yaml", tmp_path)
 
     assert output_path.read_bytes() == b"right"
+
+
+def test_extract_member_flattens_untrusted_archive_path(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.nemo"
+    output_dir = tmp_path / "extracted"
+    output_dir.mkdir()
+    with tarfile.open(archive_path, "w") as archive:
+        add_archive_member(archive, "../model_config.yaml", b"config")
+
+    with tarfile.open(archive_path) as archive:
+        output_path = extract_member(archive, "model_config.yaml", output_dir)
+
+    assert output_path == output_dir / "model_config.yaml"
+    assert output_path.read_bytes() == b"config"
+    assert not (tmp_path / "model_config.yaml").exists()
 
 
 def test_extract_member_rejects_ambiguous_basename(tmp_path: Path) -> None:
@@ -1281,7 +1392,29 @@ def test_validate_parakeet_rejects_wrong_scalar_types(field: str, value: str) ->
     model_config = make_model_config()
     OmegaConf.update(model_config, field, value)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=re.escape(field.rsplit(".", 1)[-1])):
+        validate_parakeet(model_config, make_export_args())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("preprocessor.window_stride", "preprocessor.window_size"),
+)
+@pytest.mark.parametrize(
+    "value",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+    ),
+)
+def test_validate_parakeet_rejects_nonfinite_feature_timing(
+    field: str,
+    value: float,
+) -> None:
+    model_config = make_model_config()
+    OmegaConf.update(model_config, field, value)
+
+    with pytest.raises(ValueError, match="positive finite float"):
         validate_parakeet(model_config, make_export_args())
 
 
@@ -1309,185 +1442,165 @@ def test_validate_parakeet_rejects_invalid_feature_values(
         validate_parakeet(model_config, make_export_args())
 
 
-def test_rename_parakeet_state_dict() -> None:
-    pointwise_weight = torch.randn(8, 4, 1)
-    second_pointwise_weight = torch.randn(4, 8, 1)
-    feed_forward_weight = torch.randn(4, 8)
-    second_feed_forward_weight = torch.randn(8, 4)
-    query_weight = torch.randn(4, 4)
-    key_weight = torch.randn(4, 4)
-    value_weight = torch.randn(4, 4)
-    subsampling_conv1_weight = torch.randn(8, 1, 3, 3)
-    subsampling_conv2_weight = torch.randn(8, 8, 3, 3)
-    subsampling_pointwise1_weight = torch.randn(8, 8, 1, 1)
-    subsampling_conv3_weight = torch.randn(8, 8, 3, 3)
-    subsampling_pointwise2_weight = torch.randn(8, 8, 1, 1)
-    embedding_weight = torch.randn(16, 4)
-    lstm_weight = torch.randn(16, 4)
-    output_projection_weight = torch.randn(16, 4)
-    decoder_projection_weight = torch.randn(4, 4)
-    encoder_projection_weight = torch.randn(4, 4)
-    untouched_weight = torch.randn(4)
+def test_adjust_state_dict_converts_complete_parakeet_layout() -> None:
+    rng = torch.Generator().manual_seed(0)
+    pointwise_weight = torch.randn(8, 4, 1, generator=rng)
+    second_pointwise_weight = torch.randn(4, 8, 1, generator=rng)
+    feed_forward_weight = torch.randn(4, 8, generator=rng)
+    second_feed_forward_weight = torch.randn(8, 4, generator=rng)
+    query_weight = torch.randn(4, 4, generator=rng)
+    key_weight = torch.randn(4, 4, generator=rng)
+    value_weight = torch.randn(4, 4, generator=rng)
+    subsampling_conv1_weight = torch.randn(8, 1, 3, 3, generator=rng)
+    subsampling_conv2_weight = torch.randn(8, 8, 3, 3, generator=rng)
+    subsampling_pointwise1_weight = torch.randn(8, 8, 1, 1, generator=rng)
+    subsampling_conv3_weight = torch.randn(8, 8, 3, 3, generator=rng)
+    subsampling_pointwise2_weight = torch.randn(8, 8, 1, 1, generator=rng)
+    embedding_weight = torch.randn(16, 4, generator=rng)
+    lstm_weight = torch.randn(16, 4, generator=rng)
+    output_projection_weight = torch.randn(16, 4, generator=rng)
+    decoder_projection_weight = torch.randn(4, 4, generator=rng)
+    encoder_projection_weight = torch.randn(4, 4, generator=rng)
+    untouched_weight = torch.randn(4, generator=rng)
     state_dict = OrderedDict(
-        (
-            (
-                "encoder.pre_encode.conv.0.weight",
-                subsampling_conv1_weight,
-            ),
-            (
-                "encoder.pre_encode.conv.2.weight",
-                subsampling_conv2_weight,
-            ),
-            (
-                "encoder.pre_encode.conv.3.weight",
-                subsampling_pointwise1_weight,
-            ),
-            (
-                "encoder.pre_encode.conv.5.weight",
-                subsampling_conv3_weight,
-            ),
-            (
-                "encoder.pre_encode.conv.6.weight",
-                subsampling_pointwise2_weight,
-            ),
-            (
-                "encoder.layers.0.conv.pointwise_conv1.weight",
-                pointwise_weight,
-            ),
-            (
-                "encoder.layers.0.conv.pointwise_conv2.weight",
-                second_pointwise_weight,
-            ),
-            (
-                "encoder.layers.0.feed_forward1.linear2.weight",
-                feed_forward_weight,
-            ),
-            (
-                "encoder.layers.0.feed_forward2.linear2.weight",
-                second_feed_forward_weight,
-            ),
-            ("encoder.layers.0.self_attn.linear_q.weight", query_weight),
-            ("encoder.layers.0.self_attn.linear_k.weight", key_weight),
-            ("encoder.layers.0.self_attn.linear_v.weight", value_weight),
-            (
-                "decoder.prediction.embed.weight",
-                embedding_weight,
-            ),
-            (
-                "decoder.prediction.dec_rnn.lstm.weight_ih_l0",
-                lstm_weight,
-            ),
-            (
-                "joint.joint_net.2.weight",
-                output_projection_weight,
-            ),
-            (
-                "joint.pred.weight",
-                decoder_projection_weight,
-            ),
-            (
-                "joint.enc.weight",
-                encoder_projection_weight,
-            ),
-            ("encoder.layers.0.norm_out.weight", untouched_weight),
+        {
+            "encoder.pre_encode.conv.0.weight": subsampling_conv1_weight,
+            "encoder.pre_encode.conv.2.weight": subsampling_conv2_weight,
+            "encoder.pre_encode.conv.3.weight": subsampling_pointwise1_weight,
+            "encoder.pre_encode.conv.5.weight": subsampling_conv3_weight,
+            "encoder.pre_encode.conv.6.weight": subsampling_pointwise2_weight,
+            "encoder.layers.0.conv.pointwise_conv1.weight": pointwise_weight,
+            "encoder.layers.0.conv.pointwise_conv2.weight": second_pointwise_weight,
+            "encoder.layers.0.feed_forward1.linear2.weight": feed_forward_weight,
+            "encoder.layers.0.feed_forward2.linear2.weight": second_feed_forward_weight,
+            "encoder.layers.0.self_attn.linear_q.weight": query_weight,
+            "encoder.layers.0.self_attn.linear_k.weight": key_weight,
+            "encoder.layers.0.self_attn.linear_v.weight": value_weight,
+            "decoder.prediction.embed.weight": embedding_weight,
+            "decoder.prediction.dec_rnn.lstm.weight_ih_l0": lstm_weight,
+            "joint.joint_net.2.weight": output_projection_weight,
+            "joint.pred.weight": decoder_projection_weight,
+            "joint.enc.weight": encoder_projection_weight,
+            "encoder.layers.0.norm_out.weight": untouched_weight,
+        }
+    )
+    original_items = tuple(state_dict.items())
+    original_values = {key: value.clone() for key, value in original_items}
+    expected = {
+        "encoder.pre_encode.conv1.weight": subsampling_conv1_weight,
+        "encoder.pre_encode.conv2.weight": subsampling_conv2_weight,
+        "encoder.pre_encode.pointwise_conv1.weight": subsampling_pointwise1_weight,
+        "encoder.pre_encode.conv3.weight": subsampling_conv3_weight,
+        "encoder.pre_encode.pointwise_conv2.weight": subsampling_pointwise2_weight,
+        "encoder.layers.0.conv.pointwise_conv1.weight": pointwise_weight.squeeze(2),
+        "encoder.layers.0.conv.pointwise_conv2.weight": second_pointwise_weight.squeeze(
+            2
         ),
-    )
+        "encoder.layers.0.feed_forward1.linear2.weight": feed_forward_weight * 0.5,
+        "encoder.layers.0.feed_forward2.linear2.weight": second_feed_forward_weight
+        * 0.5,
+        "encoder.layers.0.self_attn.linear_qkv.weight": torch.cat(
+            (query_weight, key_weight, value_weight),
+        ),
+        "embedding.weight": embedding_weight,
+        "lstm.weight_ih_l0": lstm_weight,
+        "output_proj.weight": output_projection_weight,
+        "decoder_proj.weight": decoder_projection_weight,
+        "encoder_proj.weight": encoder_projection_weight,
+        "encoder.layers.0.norm_out.weight": untouched_weight,
+    }
 
-    modified_state_dict = adjust_state_dict(state_dict)
+    adjusted = adjust_state_dict(state_dict)
 
-    torch.testing.assert_close(
-        modified_state_dict["encoder.layers.0.conv.pointwise_conv1.weight"],
-        pointwise_weight.squeeze(2),
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.layers.0.conv.pointwise_conv2.weight"],
-        second_pointwise_weight.squeeze(2),
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.layers.0.feed_forward1.linear2.weight"],
-        feed_forward_weight * 0.5,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.layers.0.feed_forward2.linear2.weight"],
-        second_feed_forward_weight * 0.5,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.layers.0.self_attn.linear_qkv.weight"],
-        torch.cat((query_weight, key_weight, value_weight)),
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.pre_encode.conv1.weight"],
-        subsampling_conv1_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.pre_encode.conv2.weight"],
-        subsampling_conv2_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.pre_encode.pointwise_conv1.weight"],
-        subsampling_pointwise1_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.pre_encode.conv3.weight"],
-        subsampling_conv3_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.pre_encode.pointwise_conv2.weight"],
-        subsampling_pointwise2_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["embedding.weight"],
-        embedding_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["lstm.weight_ih_l0"],
-        lstm_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["output_proj.weight"],
-        output_projection_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["decoder_proj.weight"],
-        decoder_projection_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder_proj.weight"],
-        encoder_projection_weight,
-    )
-    torch.testing.assert_close(
-        modified_state_dict["encoder.layers.0.norm_out.weight"],
-        untouched_weight,
-    )
-    assert not any(
-        key in modified_state_dict
-        for key in (
-            "encoder.layers.0.self_attn.linear_q.weight",
-            "encoder.layers.0.self_attn.linear_k.weight",
-            "encoder.layers.0.self_attn.linear_v.weight",
+    assert isinstance(adjusted, OrderedDict)
+    assert tuple(state_dict) == tuple(original_values)
+    assert all(state_dict[key] is value for key, value in original_items)
+    torch.testing.assert_close(state_dict, original_values, rtol=0, atol=0)
+    torch.testing.assert_close(adjusted, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("source_key", "expected_key"),
+    (
+        (
+            "decoder.prediction.dec_rnn.lstm.weight_hh_l1",
+            "lstm.weight_hh_l1",
+        ),
+        (
+            "decoder.prediction.dec_rnn.lstm.bias_ih_l1",
+            "lstm.bias_ih_l1",
+        ),
+        ("joint.joint_net.2.bias", "output_proj.bias"),
+        ("joint.pred.bias", "decoder_proj.bias"),
+        ("joint.enc.bias", "encoder_proj.bias"),
+    ),
+)
+def test_adjust_state_dict_preserves_parameter_suffixes_when_renaming(
+    source_key: str,
+    expected_key: str,
+) -> None:
+    parameter = torch.arange(4, dtype=torch.float32)
+
+    adjusted_state_dict = adjust_state_dict(OrderedDict(((source_key, parameter),)))
+
+    assert tuple(adjusted_state_dict) == (expected_key,)
+    assert adjusted_state_dict[expected_key] is parameter
+
+
+def test_adjust_state_dict_fuses_every_attention_layer() -> None:
+    state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
+    for projection, projection_index in (("v", 3), ("q", 1), ("k", 2)):
+        for layer in range(2):
+            state_dict[
+                f"encoder.layers.{layer}.self_attn.linear_{projection}.weight"
+            ] = torch.full((2, 2), layer * 10 + projection_index, dtype=torch.float32)
+
+    adjusted_state_dict = adjust_state_dict(state_dict)
+
+    assert set(adjusted_state_dict) == {
+        "encoder.layers.0.self_attn.linear_qkv.weight",
+        "encoder.layers.1.self_attn.linear_qkv.weight",
+    }
+    for layer in range(2):
+        expected = torch.cat(
+            tuple(
+                torch.full((2, 2), layer * 10 + projection_index, dtype=torch.float32)
+                for projection_index in range(1, 4)
+            )
         )
-    )
+        torch.testing.assert_close(
+            adjusted_state_dict[f"encoder.layers.{layer}.self_attn.linear_qkv.weight"],
+            expected,
+        )
 
 
+@pytest.mark.parametrize("pointwise_layer", ("pointwise_conv1", "pointwise_conv2"))
 @pytest.mark.parametrize("shape", ((4, 4), (4, 4, 2)))
 def test_adjust_state_dict_rejects_invalid_pointwise_weight_shape(
+    pointwise_layer: str,
     shape: tuple[int, ...],
 ) -> None:
     state_dict = OrderedDict(
-        (("encoder.layers.0.conv.pointwise_conv1.weight", torch.ones(shape)),)
+        {
+            f"encoder.layers.0.conv.{pointwise_layer}.weight": torch.ones(shape),
+        }
     )
 
     with pytest.raises(ValueError, match="Expected pointwise Conv1d weight"):
         adjust_state_dict(state_dict)
 
 
-def test_adjust_state_dict_rejects_alias_collision() -> None:
-    state_dict = OrderedDict(
-        (
-            ("embedding.weight", torch.ones(2, 2)),
-            ("decoder.prediction.embed.weight", torch.zeros(2, 2)),
-        )
+@pytest.mark.parametrize(
+    "reverse_order",
+    (False, True),
+    ids=("target-first", "alias-first"),
+)
+def test_adjust_state_dict_rejects_alias_collision(reverse_order: bool) -> None:
+    items = (
+        ("embedding.weight", torch.ones(2, 2)),
+        ("decoder.prediction.embed.weight", torch.zeros(2, 2)),
     )
+    state_dict = OrderedDict(reversed(items) if reverse_order else items)
 
     with pytest.raises(ValueError, match="both map to embedding.weight"):
         adjust_state_dict(state_dict)
@@ -1524,65 +1637,37 @@ def test_adjust_state_dict_rejects_split_and_fused_attention_projections() -> No
         adjust_state_dict(state_dict)
 
 
-def test_adjust_state_dict_rejects_incompatible_attention_projections() -> None:
+@pytest.mark.parametrize(
+    ("shape", "dtype", "device"),
+    (
+        pytest.param((2,), torch.float32, "cpu", id="rank"),
+        pytest.param((1, 4), torch.float32, "cpu", id="rows"),
+        pytest.param((2, 4), torch.float64, "cpu", id="dtype"),
+        pytest.param((2, 4), torch.float32, "meta", id="device"),
+    ),
+)
+def test_adjust_state_dict_rejects_incompatible_attention_projections(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: str,
+) -> None:
     state_dict = OrderedDict(
-        (
-            ("encoder.layers.0.self_attn.linear_q.weight", torch.ones(2, 2)),
-            ("encoder.layers.0.self_attn.linear_k.weight", torch.ones(2)),
-            ("encoder.layers.0.self_attn.linear_v.weight", torch.ones(2, 2)),
-        )
-    )
-
-    with pytest.raises(ValueError, match="matching rank-2"):
-        adjust_state_dict(state_dict)
-
-
-def test_adjust_state_dict_rejects_unequal_attention_projection_rows() -> None:
-    state_dict = OrderedDict(
-        (
-            ("encoder.layers.0.self_attn.linear_q.weight", torch.ones(1, 4)),
-            ("encoder.layers.0.self_attn.linear_k.weight", torch.ones(2, 4)),
-            ("encoder.layers.0.self_attn.linear_v.weight", torch.ones(9, 4)),
-        )
-    )
-
-    with pytest.raises(ValueError, match="matching rank-2"):
-        adjust_state_dict(state_dict)
-
-
-def test_adjust_state_dict_rejects_mixed_attention_projection_dtypes() -> None:
-    state_dict = OrderedDict(
-        (
-            ("encoder.layers.0.self_attn.linear_q.weight", torch.ones(2, 4)),
-            (
-                "encoder.layers.0.self_attn.linear_k.weight",
-                torch.ones(2, 4, dtype=torch.float64),
+        {
+            "encoder.layers.0.self_attn.linear_q.weight": torch.ones(2, 4),
+            "encoder.layers.0.self_attn.linear_k.weight": torch.ones(
+                shape,
+                dtype=dtype,
+                device=device,
             ),
-            ("encoder.layers.0.self_attn.linear_v.weight", torch.ones(2, 4)),
-        )
+            "encoder.layers.0.self_attn.linear_v.weight": torch.ones(2, 4),
+        }
     )
 
     with pytest.raises(ValueError, match="matching rank-2"):
         adjust_state_dict(state_dict)
 
 
-def test_adjust_state_dict_rejects_mixed_attention_projection_devices() -> None:
-    state_dict = OrderedDict(
-        (
-            ("encoder.layers.0.self_attn.linear_q.weight", torch.ones(2, 4)),
-            (
-                "encoder.layers.0.self_attn.linear_k.weight",
-                torch.ones(2, 4, device="meta"),
-            ),
-            ("encoder.layers.0.self_attn.linear_v.weight", torch.ones(2, 4)),
-        )
-    )
-
-    with pytest.raises(ValueError, match="matching rank-2"):
-        adjust_state_dict(state_dict)
-
-
-def test_adjust_state_dict_removes_attention_projection_suffix_literally() -> None:
+def test_adjust_state_dict_preserves_attention_prefix_exactly() -> None:
     state_dict = OrderedDict(
         (
             ("encoder.stage.self_attn.linear_q.weight", torch.ones(2, 2)),

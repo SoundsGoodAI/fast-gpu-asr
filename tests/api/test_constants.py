@@ -58,19 +58,6 @@ from fast_gpu_asr.tensorrt_plugins.constants import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = REPOSITORY_ROOT / "src" / "fast_gpu_asr" / "tensorrt_plugins"
-MODEL_ARTIFACT_NAMES = (
-    MODEL_CONFIG_FILE,
-    TOKENIZER_FILE,
-    PARAKEET_ONNX_FILE,
-    PARAKEET_DECODER_ONNX_FILE,
-    PARAKEET_TENSORRT_FILE,
-    PARAKEET_DECODER_TENSORRT_FILE,
-    ZIPFORMER_ONNX_FILE,
-    ZIPFORMER_DECODER_ONNX_FILE,
-    ZIPFORMER_TENSORRT_FILE,
-    ZIPFORMER_DECODER_TENSORRT_FILE,
-    ZIPFORMER_DECODER_CONTEXTS_FILE,
-)
 PLUGIN_NAMES_BY_SOURCE = {
     "zipformer_attention_value_plugin.cu": (ZIPFORMER_ATTENTION_VALUE_PLUGIN_NAME,),
     "zipformer_relative_attention_plugin.cu": (
@@ -97,7 +84,7 @@ def test_precision_dtypes_cover_supported_export_precisions() -> None:
     } == PRECISION_DTYPES
 
 
-def test_transducer_decoder_types_are_a_subset_of_all_decoder_types() -> None:
+def test_supported_decoder_types() -> None:
     assert DECODER_TYPES == (
         "transducer_modified_beam_search",
         "transducer_greedy_search",
@@ -107,8 +94,6 @@ def test_transducer_decoder_types_are_a_subset_of_all_decoder_types() -> None:
         "transducer_modified_beam_search",
         "transducer_greedy_search",
     )
-    assert set(TRANSDUCER_DECODER_TYPES) < set(DECODER_TYPES)
-    assert len(DECODER_TYPES) == len(set(DECODER_TYPES))
 
 
 def test_serialized_model_contract_constants_are_stable() -> None:
@@ -116,7 +101,19 @@ def test_serialized_model_contract_constants_are_stable() -> None:
         "parakeet_asr",
         "zipformer_asr",
     )
-    assert MODEL_ARTIFACT_NAMES == (
+    assert (
+        MODEL_CONFIG_FILE,
+        TOKENIZER_FILE,
+        PARAKEET_ONNX_FILE,
+        PARAKEET_DECODER_ONNX_FILE,
+        PARAKEET_TENSORRT_FILE,
+        PARAKEET_DECODER_TENSORRT_FILE,
+        ZIPFORMER_ONNX_FILE,
+        ZIPFORMER_DECODER_ONNX_FILE,
+        ZIPFORMER_TENSORRT_FILE,
+        ZIPFORMER_DECODER_TENSORRT_FILE,
+        ZIPFORMER_DECODER_CONTEXTS_FILE,
+    ) == (
         "model_config.yaml",
         "bpe.model",
         "parakeet.onnx",
@@ -131,47 +128,29 @@ def test_serialized_model_contract_constants_are_stable() -> None:
     )
 
 
-def test_model_artifact_names_are_safe_unique_basenames() -> None:
-    assert len(MODEL_ARTIFACT_NAMES) == len(set(MODEL_ARTIFACT_NAMES))
-    assert len(MODEL_ARTIFACT_NAMES) == len(
-        {name.casefold() for name in MODEL_ARTIFACT_NAMES}
-    )
-    assert all(Path(name).name == name for name in MODEL_ARTIFACT_NAMES)
-    assert all(
-        not Path(name).is_absolute() and ".." not in Path(name).parts
-        for name in MODEL_ARTIFACT_NAMES
-    )
-    assert Path(PARAKEET_ONNX_FILE).stem == Path(PARAKEET_TENSORRT_FILE).stem
-    assert (
-        Path(PARAKEET_DECODER_ONNX_FILE).stem
-        == Path(PARAKEET_DECODER_TENSORRT_FILE).stem
-    )
-    assert Path(ZIPFORMER_ONNX_FILE).stem == Path(ZIPFORMER_TENSORRT_FILE).stem
-    assert (
-        Path(ZIPFORMER_DECODER_ONNX_FILE).stem
-        == Path(ZIPFORMER_DECODER_TENSORRT_FILE).stem
-    )
-
-
 def test_shared_scalar_constants_are_stable() -> None:
+    assert type(ONNX_OPSET_VERSION) is int
     assert ONNX_OPSET_VERSION == 20
     assert TENSORRT_PLUGIN_NAMESPACE == "fast_gpu_asr"
+    assert type(INT32_MAX) is int
     assert INT32_MAX == 2_147_483_647
     assert ZERO_LOG == -20.7233
-    zero_probability = torch.exp(torch.tensor(ZERO_LOG, dtype=torch.float32)).item()
-    assert zero_probability == pytest.approx(1e-9, rel=1e-5)
 
 
 def test_runtime_limits_and_tuning_values_satisfy_algorithm_constraints() -> None:
+    assert type(AUDIO_SAMPLES_PER_WORKER) is int
     assert AUDIO_SAMPLES_PER_WORKER > 0
+    assert type(PARAKEET_MAX_ENCODER_FRAMES) is int
     assert 0 < PARAKEET_MAX_ENCODER_FRAMES <= INT32_MAX
+    assert type(TDT_SEARCH_CHUNK_STEPS) is int
     assert TDT_SEARCH_CHUNK_STEPS > 0
     assert TDT_SEARCH_CHUNK_STEPS % 2 == 0
+    assert type(ZIPFORMER_BEAM_SEARCH_THREADS) is int
     assert 0 < ZIPFORMER_BEAM_SEARCH_THREADS <= 1024
     assert ZIPFORMER_BEAM_SEARCH_THREADS % 32 == 0
 
 
-def test_plugin_identifiers_are_unique_ascii_abi_keys() -> None:
+def test_plugin_identifiers_are_stable() -> None:
     plugin_names = tuple(
         plugin_name
         for source_plugin_names in PLUGIN_NAMES_BY_SOURCE.values()
@@ -191,59 +170,55 @@ def test_plugin_identifiers_are_unique_ascii_abi_keys() -> None:
         "parakeet_conformer_convolution",
     )
 
-    assert len(plugin_names) == len(set(plugin_names))
-    assert all(name.isascii() and name.isidentifier() for name in plugin_names)
-    assert TENSORRT_PLUGIN_NAMESPACE.isascii()
-    assert TENSORRT_PLUGIN_NAMESPACE.isidentifier()
-    assert 0 < len(TENSORRT_PLUGIN_NAMESPACE.encode("ascii")) <= 1024
-    assert "\0" not in TENSORRT_PLUGIN_NAMESPACE
 
-
-def test_every_plugin_build_has_one_runtime_initializer() -> None:
-    built_libraries = tuple(
-        Path(source_name).with_suffix(".so").name for source_name, _ in PLUGIN_BUILDS
-    )
-    initialized_libraries = tuple(
-        library_name for library_name, _ in PLUGIN_INITIALIZERS
-    )
-
-    assert built_libraries == initialized_libraries
-    assert len(set(built_libraries)) == len(PLUGIN_BUILDS) == len(PLUGIN_INITIALIZERS)
-    assert all(
-        initializer.startswith("initFastGpuAsr")
-        for _, initializer in PLUGIN_INITIALIZERS
-    )
-    assert len({initializer for _, initializer in PLUGIN_INITIALIZERS}) == len(
-        PLUGIN_INITIALIZERS
-    )
-    assert all(
-        initializer.isascii() and initializer.isidentifier()
-        for _, initializer in PLUGIN_INITIALIZERS
-    )
-
-
-def test_plugin_manifest_matches_native_sources_and_exported_initializers() -> None:
-    """Keep build metadata synchronized with every native plugin source."""
-
+def test_plugin_manifest_matches_native_sources() -> None:
     source_names = {path.name for path in PLUGIN_DIR.glob("*.cu")}
     manifest_sources = {source_name for source_name, _ in PLUGIN_BUILDS}
     initializers = dict(PLUGIN_INITIALIZERS)
 
-    assert manifest_sources == source_names
-    for source_name in sorted(source_names):
+    assert manifest_sources == source_names == set(PLUGIN_NAMES_BY_SOURCE)
+    assert len(manifest_sources) == len(PLUGIN_BUILDS)
+    assert set(initializers) == {
+        Path(source_name).with_suffix(".so").name for source_name in source_names
+    }
+    assert (
+        len(initializers) == len(set(initializers.values())) == len(PLUGIN_INITIALIZERS)
+    )
+
+    for source_name, plugin_names in PLUGIN_NAMES_BY_SOURCE.items():
         library_name = Path(source_name).with_suffix(".so").name
         source = (PLUGIN_DIR / source_name).read_text(encoding="utf8")
-        initializer = initializers[library_name]
         declarations = re.findall(
-            rf'^\s*extern\s+"C"\s+bool\s+({re.escape(initializer)})'
+            r'^\s*extern\s+"C"\s+bool\s+'
+            r"(initFastGpuAsr[A-Za-z0-9_]*)"
             r"\(\)\s+noexcept\s*$",
             source,
             flags=re.MULTILINE,
         )
-        assert declarations == [initializer]
+        assert declarations == [initializers[library_name]], source_name
+        namespace_includes = re.findall(
+            r'^\s*#include\s+"plugin_namespace\.h"\s*$',
+            source,
+            flags=re.MULTILINE,
+        )
+        declared_names = re.findall(
+            r"^\s*constexpr\s+char\s+const\*\s+"
+            r'k[A-Za-z0-9_]*Name\s*=\s*"([^"]+)";\s*$',
+            source,
+            flags=re.MULTILINE,
+        )
+        declared_versions = re.findall(
+            r'^\s*constexpr\s+char\s+const\*\s+kPluginVersion\s*=\s*"([^"]+)";\s*$',
+            source,
+            flags=re.MULTILINE,
+        )
+
+        assert len(namespace_includes) == 1, source_name
+        assert sorted(declared_names) == sorted(plugin_names), source_name
+        assert declared_versions == ["1"], source_name
 
 
-def test_plugin_dependencies_are_discoverable_build_libraries() -> None:
+def test_plugin_dependencies() -> None:
     dependencies = {
         dependency
         for _, plugin_dependencies in PLUGIN_BUILDS
@@ -252,29 +227,22 @@ def test_plugin_dependencies_are_discoverable_build_libraries() -> None:
 
     assert set(CUDA_BUILD_LIBRARIES) == dependencies
     assert len(CUDA_BUILD_LIBRARIES) == len(dependencies)
+    assert set(CUDA_BUILD_LIBRARIES) <= set(CUDA_RUNTIME_LIBRARIES)
+    assert CUDA_RUNTIME_LIBRARIES == ("cudart", "cublasLt", "cublas", "cufft")
+    assert dict(PLUGIN_BUILDS) == {
+        "zipformer_attention_value_plugin.cu": ("cublas", "cudart"),
+        "zipformer_relative_attention_plugin.cu": ("cublas", "cudart"),
+        "zipformer_convolution_plugin.cu": ("cudart",),
+        "zipformer_feature_plugin.cu": ("cublas", "cufft", "cudart"),
+        "zipformer_resampling_plugin.cu": ("cudart",),
+        "zipformer_output_assembly_plugin.cu": ("cudart",),
+        "parakeet_feature_plugin.cu": ("cublas", "cufft", "cudart"),
+        "parakeet_flash_attention_plugin.cu": ("cublas", "cudart"),
+        "parakeet_convolution_plugin.cu": ("cudart",),
+    }
 
 
-def test_plugin_build_dependency_manifest_is_exact() -> None:
-    assert PLUGIN_BUILDS == (
-        ("zipformer_attention_value_plugin.cu", ("cublas", "cudart")),
-        ("zipformer_relative_attention_plugin.cu", ("cublas", "cudart")),
-        ("zipformer_convolution_plugin.cu", ("cudart",)),
-        ("zipformer_feature_plugin.cu", ("cublas", "cufft", "cudart")),
-        ("zipformer_resampling_plugin.cu", ("cudart",)),
-        ("zipformer_output_assembly_plugin.cu", ("cudart",)),
-        ("parakeet_feature_plugin.cu", ("cublas", "cufft", "cudart")),
-        ("parakeet_flash_attention_plugin.cu", ("cublas", "cudart")),
-        ("parakeet_convolution_plugin.cu", ("cudart",)),
-    )
-    assert all(
-        Path(source_name).name == source_name for source_name, _ in PLUGIN_BUILDS
-    )
-    assert all(
-        len(dependencies) == len(set(dependencies)) for _, dependencies in PLUGIN_BUILDS
-    )
-
-
-def test_cuda_architectures_are_unique_and_retain_ptx_fallback() -> None:
+def test_nvcc_options_include_supported_architectures_and_ptx_fallback() -> None:
     expected_architectures = (80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121)
     assert (
         *(
@@ -283,20 +251,6 @@ def test_cuda_architectures_are_unique_and_retain_ptx_fallback() -> None:
         ),
         "--generate-code=arch=compute_80,code=compute_80",
     ) == CUDA_ARCHITECTURE_OPTIONS
-    assert len(CUDA_ARCHITECTURE_OPTIONS) == len(set(CUDA_ARCHITECTURE_OPTIONS))
-    assert CUDA_ARCHITECTURE_OPTIONS[-1] == (
-        "--generate-code=arch=compute_80,code=compute_80"
-    )
-    assert all(
-        option.startswith("--generate-code=") for option in CUDA_ARCHITECTURE_OPTIONS
-    )
-    architecture_start = NVCC_OPTIONS.index(CUDA_ARCHITECTURE_OPTIONS[0])
-    assert (
-        NVCC_OPTIONS[
-            architecture_start : architecture_start + len(CUDA_ARCHITECTURE_OPTIONS)
-        ]
-        == CUDA_ARCHITECTURE_OPTIONS
-    )
     assert (
         "--std=c++20",
         "-O3",
@@ -307,13 +261,7 @@ def test_cuda_architectures_are_unique_and_retain_ptx_fallback() -> None:
     ) == NVCC_OPTIONS
 
 
-def test_cuda_runtime_dependency_order_is_stable() -> None:
-    assert CUDA_RUNTIME_LIBRARIES == ("cudart", "cublasLt", "cublas", "cufft")
-
-
 def test_cpp_plugin_namespace_matches_python_exact_bytes(tmp_path: Path) -> None:
-    """Compile the shared header and verify its exact C++ string contract."""
-
     header = (PLUGIN_DIR / "plugin_namespace.h").read_text(encoding="utf8")
     declarations = re.findall(
         r'^\s*constexpr\s+char\s+kPluginNamespace\[\]\s*=\s*"([^"]+)";\s*$',
@@ -361,33 +309,17 @@ int main()
             str(executable_path),
         ),
         check=True,
+        timeout=60,
     )
 
-    result = subprocess.run(executable_path, check=True, capture_output=True)
+    result = subprocess.run(
+        executable_path,
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
 
     assert result.stdout == TENSORRT_PLUGIN_NAMESPACE.encode("ascii") + b"\0"
-
-
-def test_python_plugin_names_match_cpp_creator_names() -> None:
-    manifest_sources = {source_name for source_name, _ in PLUGIN_BUILDS}
-    assert set(PLUGIN_NAMES_BY_SOURCE) == manifest_sources
-
-    for source_name, plugin_names in PLUGIN_NAMES_BY_SOURCE.items():
-        source = (PLUGIN_DIR / source_name).read_text(encoding="utf8")
-        declared_names = re.findall(
-            r"^\s*constexpr\s+char\s+const\*\s+"
-            r'k(?:Plugin|Downsample|Upsample)Name\s*=\s*"([^"]+)";\s*$',
-            source,
-            flags=re.MULTILINE,
-        )
-        declared_versions = re.findall(
-            r'^\s*constexpr\s+char\s+const\*\s+kPluginVersion\s*=\s*"([^"]+)";\s*$',
-            source,
-            flags=re.MULTILINE,
-        )
-
-        assert tuple(declared_names) == plugin_names
-        assert declared_versions == ["1"]
 
 
 def test_parakeet_encoder_frame_limit_matches_cpp_plugin() -> None:

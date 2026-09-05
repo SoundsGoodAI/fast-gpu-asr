@@ -74,7 +74,17 @@ class Decoder(torch.nn.Module):
         torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Predictor table with shape
             ``((vocab_size + 1) ** context_size, joiner_dim)``.
+
+        Raises
+        ------
+        ValueError
+            Raised when ``chunk_size`` is not a positive integer.
         """
+
+        if not isinstance(chunk_size, int) or chunk_size < 1:
+            raise ValueError(
+                f"chunk_size must be a positive integer, got {chunk_size}."
+            )
 
         num_values = self.vocab_size + 1
         num_contexts = num_values**self.context_size

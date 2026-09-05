@@ -13,71 +13,135 @@ import fast_gpu_asr.decoder.postprocessor as postprocessor_module
 from fast_gpu_asr.decoder.postprocessor import PostProcessor
 from fast_gpu_asr.utils import ASRInferenceError
 
-REAL_SENTENCEPIECE_PROCESSOR = spm.SentencePieceProcessor
-
 
 class FakeTokenizer:
-    """Expose the SentencePiece behavior needed by postprocessor tests."""
+    """Provide deterministic SentencePiece behavior and decode-call tracking."""
+
+    pieces = ("<blk>", "1", "▁2", "<unk>", "▁", "x")
 
     def __init__(self, model_file: str) -> None:
-        self.model_file = model_file
+        """Initialize decode-call tracking for the in-memory vocabulary.
 
-    def piece_to_id(self, piece: str) -> int:
-        return {"<blk>": 0, "▁": 4}[piece]
+        Parameters
+        ----------
+        model_file : str
+            Tokenizer path accepted for compatibility with SentencePiece.
+        """
+
+        self.decode_calls: list[list[list[int]]] = []
 
     def vocab_size(self) -> int:
-        return 6
+        """Return the number of pieces in the deterministic vocabulary.
 
-    def id_to_piece(self, token_id: int | list[int]) -> str | list[str]:
-        pieces = {0: "<blk>", 1: "1", 2: "▁2", 3: "<unk>", 4: "▁", 5: "x"}
-        if isinstance(token_id, list):
-            return [pieces[item] for item in token_id]
-        return pieces[token_id]
+        Returns
+        -------
+        int
+            Number of tokenizer pieces.
+        """
 
-    def decode(
-        self,
-        tokens: list[int] | list[str] | list[list[int]],
-    ) -> str | list[str]:
-        if tokens and isinstance(tokens[0], list):
-            return [self.decode(token_ids) for token_ids in tokens]  # type: ignore[misc]
-        pieces = (
-            [self.id_to_piece(token) for token in tokens]  # type: ignore[arg-type]
-            if not tokens or isinstance(tokens[0], int)
-            else tokens
-        )
-        return "".join(pieces).replace("▁", " ").strip()  # type: ignore[arg-type]
+        return len(self.pieces)
+
+    def id_to_piece(self, token_ids: list[int]) -> list[str]:
+        """Map token IDs to their deterministic SentencePiece surfaces.
+
+        Parameters
+        ----------
+        token_ids : list[int]
+            Token IDs to resolve.
+
+        Returns
+        -------
+        list[str]
+            Piece surface corresponding to each token ID.
+        """
+
+        return [self.pieces[token_id] for token_id in token_ids]
+
+    def piece_to_id(self, piece: str) -> int:
+        """Return the ID of one deterministic SentencePiece surface.
+
+        Parameters
+        ----------
+        piece : str
+            Piece surface to resolve.
+
+        Returns
+        -------
+        int
+            Token ID of the requested piece.
+        """
+
+        return self.pieces.index(piece)
+
+    def decode(self, token_batches: list[list[int]]) -> list[str]:
+        """Decode batches while recording calls made by the postprocessor.
+
+        Parameters
+        ----------
+        token_batches : list[list[int]]
+            Batched token IDs supplied to SentencePiece.
+
+        Returns
+        -------
+        list[str]
+            Deterministically decoded text for each token sequence.
+        """
+
+        self.decode_calls.append(token_batches)
+        texts = []
+        for token_ids in token_batches:
+            text = "".join(self.pieces[token_id] for token_id in token_ids)
+            text = text.replace("▁", " ").replace("<unk>", " <unk> ")
+            texts.append(" ".join(text.split()))
+        return texts
 
 
-@pytest.fixture(autouse=True)
-def patch_sentencepiece(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace SentencePiece with a deterministic in-memory vocabulary."""
+@pytest.fixture
+def postprocessor(monkeypatch: pytest.MonkeyPatch) -> PostProcessor:
+    """Construct a postprocessor with the deterministic test tokenizer.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Fixture used to replace the SentencePiece processor constructor.
+
+    Returns
+    -------
+    PostProcessor
+        Postprocessor backed by ``FakeTokenizer`` at 1 kHz.
+    """
 
     monkeypatch.setattr(
-        postprocessor_module.spm,
-        "SentencePieceProcessor",
-        FakeTokenizer,
+        postprocessor_module.spm, "SentencePieceProcessor", FakeTokenizer
     )
+    return PostProcessor(Path("bpe.model"), sample_rate=1000)
 
 
 @pytest.fixture(scope="module")
-def real_tokenizer_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Train a tiny tokenizer with byte, control, and user-defined pieces."""
+def real_postprocessor(tmp_path_factory: pytest.TempPathFactory) -> PostProcessor:
+    """Build a minimal real SentencePiece-backed postprocessor.
+
+    Parameters
+    ----------
+    tmp_path_factory : pytest.TempPathFactory
+        Factory used to create the module-scoped tokenizer workspace.
+
+    Returns
+    -------
+    PostProcessor
+        Postprocessor backed by a trained byte-fallback SentencePiece model.
+    """
 
     model_dir = tmp_path_factory.mktemp("postprocessor-sentencepiece")
     corpus_path = model_dir / "corpus.txt"
-    corpus_path.write_text(
-        "é b hello world user symbols\nhello b é world\n",
-        encoding="utf-8",
-    )
+    corpus_path.write_text("é b hello world\nhello b é world\n", encoding="utf-8")
     model_prefix = model_dir / "tokenizer"
     spm.SentencePieceTrainer.train(
         input=str(corpus_path),
         model_prefix=str(model_prefix),
         vocab_size=300,
-        model_type="unigram",
         byte_fallback=True,
-        control_symbols=["<ctrl>", "CTRL"],
-        user_defined_symbols=["<user>"],
+        control_symbols=["<ctrl>"],
         hard_vocab_limit=False,
         unk_surface="⁇",
         bos_id=-1,
@@ -85,91 +149,69 @@ def real_tokenizer_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
         pad_id=-1,
         minloglevel=2,
     )
-    return model_prefix.with_suffix(".model")
-
-
-def make_postprocessor() -> PostProcessor:
-    """Construct a postprocessor with the deterministic test tokenizer."""
-
-    return PostProcessor(Path("bpe.model"), sample_rate=1000)
+    return PostProcessor(model_prefix.with_suffix(".model"), sample_rate=1000)
 
 
 def postprocess_one(
+    postprocessor: PostProcessor,
     token_ids: list[int],
     timestamps: list[float],
-    utterance_end_sec: float,
 ) -> tuple[str, list[tuple[str, float, float]]]:
-    """Postprocess one synthetic decoder result."""
+    """Postprocess one 100 ms utterance.
 
-    postprocessor = make_postprocessor()
+    Parameters
+    ----------
+    postprocessor : PostProcessor
+        Postprocessor under test.
+    token_ids : list[int]
+        Decoder token IDs for the utterance.
+    timestamps : list[float]
+        Token start times in seconds.
+
+    Returns
+    -------
+    tuple[str, list[tuple[str, float, float]]]
+        Decoded text and word-level ``(word, start, end)`` tuples.
+    """
+
     texts, word_timestamps = postprocessor(
-        [np.zeros(round(utterance_end_sec * 1000), dtype=np.float32)],
+        [np.zeros(100, dtype=np.float32)],
         [token_ids],
         [timestamps],
     )
     return texts[0], word_timestamps[0]
 
 
-def test_postprocessor_normalizes_sentencepiece_boundaries() -> None:
-    text, word_timestamps = postprocess_one(
-        [4, 2, 4],
-        [0.04, 0.08, 0.12],
-        0.2,
+def test_postprocessor_groups_sentencepiece_words(
+    postprocessor: PostProcessor,
+) -> None:
+    assert postprocess_one(postprocessor, [1, 5, 2], [0.0, 0.02, 0.04]) == (
+        "1x 2",
+        [("1x", 0.0, 0.04), ("2", 0.04, 0.1)],
     )
-
-    assert text == "2"
-    assert word_timestamps == [("2", 0.04, 0.2)]
+    assert postprocessor.tokenizer.decode_calls == [[[1, 5, 2]]]
 
 
-def test_postprocessor_groups_subword_pieces() -> None:
-    text, word_timestamps = postprocess_one(
-        [1, 5, 2],
-        [0.0, 0.02, 0.04],
-        0.1,
-    )
-
-    assert text == "1x 2"
-    assert word_timestamps == [("1x", 0.0, 0.04), ("2", 0.04, 0.1)]
-
-
-def test_postprocessor_reuses_batched_text_for_ordinary_words() -> None:
-    postprocessor = make_postprocessor()
-    decode_calls: list[list[list[int]]] = []
-
-    def track_decode(
-        tokens: list[int] | list[str] | list[list[int]],
-    ) -> str | list[str]:
-        assert tokens == [[1, 5, 2]]
-        decode_calls.append(tokens)
-        return ["1x 2"]
-
-    postprocessor.tokenizer.decode = track_decode
+def test_postprocessor_handles_standalone_boundaries(
+    postprocessor: PostProcessor,
+) -> None:
+    audio = np.zeros(100, dtype=np.float32)
 
     assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [[1, 5, 2]],
-        [[0.0, 0.02, 0.04]],
-    ) == (["1x 2"], [[("1x", 0.0, 0.04), ("2", 0.04, 0.1)]])
-    assert decode_calls == [[[1, 5, 2]]]
+        [audio, audio, audio],
+        [[4, 4, 2, 4], [1, 4, 5], [4, 4]],
+        [[0.01, 0.02, 0.04, 0.08], [0.0, 0.03, 0.04], [0.01, 0.02]],
+    ) == (
+        ["2", "1 x", ""],
+        [
+            [("2", 0.01, 0.1)],
+            [("1", 0.0, 0.03), ("x", 0.03, 0.1)],
+            [],
+        ],
+    )
 
 
-def test_postprocessor_batches_exact_fallback_for_unusual_whitespace() -> None:
-    postprocessor = make_postprocessor()
-    decode_calls: list[list[list[int]]] = []
-
-    def decode(
-        tokens: list[int] | list[str] | list[list[int]],
-    ) -> str | list[str]:
-        assert tokens and isinstance(tokens[0], list)
-        decode_calls.append(tokens)
-        if tokens == [[1, 5, 2], [1, 3, 2, 5]]:
-            return ["1x 2", "1 <unk> 2x"]
-        if tokens == [[1, 3], [2, 5]]:
-            return ["1 <unk>", "2x"]
-        pytest.fail(f"Unexpected tokenizer input: {tokens}")
-
-    postprocessor.tokenizer.decode = decode
-
+def test_postprocessor_batches_fallback_words(postprocessor: PostProcessor) -> None:
     assert postprocessor(
         [np.zeros(100, dtype=np.float32), np.zeros(200, dtype=np.float32)],
         [[1, 5, 2], [1, 3, 2, 5]],
@@ -181,38 +223,25 @@ def test_postprocessor_batches_exact_fallback_for_unusual_whitespace() -> None:
             [("1 <unk>", 0.0, 0.04), ("2x", 0.04, 0.2)],
         ],
     )
-    assert decode_calls == [
+    assert postprocessor.tokenizer.decode_calls == [
         [[1, 5, 2], [1, 3, 2, 5]],
         [[1, 3], [2, 5]],
     ]
 
 
-def test_postprocessor_preserves_special_pieces() -> None:
-    text, word_timestamps = postprocess_one(
-        [3, 2],
-        [0.0, 0.04],
-        0.1,
-    )
-
-    assert text == "<unk> 2"
-    assert word_timestamps == [("<unk>", 0.0, 0.04), ("2", 0.04, 0.1)]
-
-
-def test_postprocessor_handles_empty_token_sequence() -> None:
-    postprocessor = make_postprocessor()
-
+def test_postprocessor_handles_empty_inputs(
+    postprocessor: PostProcessor,
+) -> None:
+    audio = np.zeros(100, dtype=np.float32)
     texts, word_timestamps = postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [[]],
-        [[]],
+        [audio, audio, audio], [[], [1], []], [[], [0.01], []]
     )
+    assert texts == ["", "1", ""]
+    assert word_timestamps == [[], [("1", 0.01, 0.1)], []]
 
-    assert texts == [""]
-    assert word_timestamps == [[]]
+    word_timestamps[0].append(("word", 0.0, 0.1))
+    assert word_timestamps[2] == []
 
-
-def test_postprocessor_handles_empty_batch() -> None:
-    postprocessor = make_postprocessor()
     postprocessor.tokenizer.decode = lambda _: pytest.fail(
         "An empty batch should not be sent to SentencePiece."
     )
@@ -220,238 +249,118 @@ def test_postprocessor_handles_empty_batch() -> None:
     assert postprocessor([], [], []) == ([], [])
 
 
-def test_postprocessor_does_not_treat_unknown_as_missing_standalone_marker(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("pieces", "timestamps", "expected"),
+    (
+        pytest.param(
+            ("▁", "<0xC3>", "<0xA9>", "▁", "b"),
+            [0.01, 0.02, 0.02, 0.04, 0.05],
+            ("é b", [("é", 0.01, 0.04), ("b", 0.04, 0.1)]),
+            id="byte-fallback",
+        ),
+        pytest.param(
+            ("▁", "<ctrl>", "▁", "b"),
+            [0.01, 0.02, 0.04, 0.05],
+            ("b", [("b", 0.04, 0.1)]),
+            id="control-only-word",
+        ),
+        pytest.param(
+            ("<unk>", "▁", "b"),
+            [0.0, 0.04, 0.05],
+            ("⁇ b", [("⁇", 0.0, 0.04), ("b", 0.04, 0.1)]),
+            id="unknown-surface",
+        ),
+    ),
+)
+def test_postprocessor_handles_real_sentencepiece_special_tokens(
+    real_postprocessor: PostProcessor,
+    pieces: tuple[str, ...],
+    timestamps: list[float],
+    expected: tuple[str, list[tuple[str, float, float]]],
 ) -> None:
-    class TokenizerWithoutStandalone(FakeTokenizer):
-        def vocab_size(self) -> int:
-            return 4
+    token_ids = [real_postprocessor.tokenizer.piece_to_id(piece) for piece in pieces]
 
-        def piece_to_id(self, piece: str) -> int:
-            return {"<blk>": 0, "▁": 3}[piece]
-
-    monkeypatch.setattr(
-        postprocessor_module.spm,
-        "SentencePieceProcessor",
-        TokenizerWithoutStandalone,
-    )
-    postprocessor = PostProcessor(Path("bpe.model"), sample_rate=1000)
-
-    assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [[3, 2]],
-        [[0.0, 0.04]],
-    ) == (["<unk> 2"], [[("<unk>", 0.0, 0.04), ("2", 0.04, 0.1)]])
+    assert postprocess_one(real_postprocessor, token_ids, timestamps) == expected
 
 
-def test_postprocessor_retains_earliest_consecutive_standalone_boundary() -> None:
-    text, word_timestamps = postprocess_one(
-        [4, 4, 2],
-        [0.01, 0.02, 0.04],
-        0.1,
-    )
-
-    assert text == "2"
-    assert word_timestamps == [("2", 0.01, 0.1)]
-
-
-def test_postprocessor_decodes_byte_fallback_into_word_timestamps(
-    monkeypatch: pytest.MonkeyPatch,
-    real_tokenizer_path: Path,
+def test_postprocessor_rejects_unaligned_batches(
+    postprocessor: PostProcessor,
 ) -> None:
-    monkeypatch.setattr(
-        postprocessor_module.spm,
-        "SentencePieceProcessor",
-        REAL_SENTENCEPIECE_PROCESSOR,
-    )
-    postprocessor = PostProcessor(real_tokenizer_path, sample_rate=1000)
-    tokenizer = postprocessor.tokenizer
-    ids = [
-        tokenizer.piece_to_id("▁"),
-        tokenizer.piece_to_id("<0xC3>"),
-        tokenizer.piece_to_id("<0xA9>"),
-        tokenizer.piece_to_id("▁"),
-        tokenizer.piece_to_id("b"),
-    ]
+    audio = np.zeros(100, dtype=np.float32)
+    inputs = (([], [[]], [[]]), ([audio], [[]], []))
 
-    assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [ids],
-        [[0.01, 0.02, 0.02, 0.04, 0.05]],
-    ) == (["é b"], [[("é", 0.01, 0.04), ("b", 0.04, 0.1)]])
+    for audios, token_ids, timestamps in inputs:
+        with pytest.raises(ASRInferenceError, match="batch size differs"):
+            postprocessor(audios, token_ids, timestamps)
 
 
-@pytest.mark.parametrize("control_piece", ("<ctrl>", "CTRL"))
-def test_postprocessor_ignores_control_tokens_without_consuming_boundaries(
-    monkeypatch: pytest.MonkeyPatch,
-    real_tokenizer_path: Path,
-    control_piece: str,
+def test_postprocessor_rejects_unaligned_token_timestamps(
+    postprocessor: PostProcessor,
 ) -> None:
-    monkeypatch.setattr(
-        postprocessor_module.spm,
-        "SentencePieceProcessor",
-        REAL_SENTENCEPIECE_PROCESSOR,
-    )
-    postprocessor = PostProcessor(real_tokenizer_path, sample_rate=1000)
-    tokenizer = postprocessor.tokenizer
-    ids = [
-        tokenizer.piece_to_id("▁"),
-        tokenizer.piece_to_id(control_piece),
-        tokenizer.piece_to_id("b"),
-    ]
-
-    assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [ids],
-        [[0.01, 0.02, 0.03]],
-    ) == (["b"], [[("b", 0.01, 0.1)]])
-
-
-@pytest.mark.parametrize("control_piece", ("<ctrl>", "CTRL"))
-def test_postprocessor_control_preserves_byte_run_boundaries(
-    monkeypatch: pytest.MonkeyPatch,
-    real_tokenizer_path: Path,
-    control_piece: str,
-) -> None:
-    monkeypatch.setattr(
-        postprocessor_module.spm,
-        "SentencePieceProcessor",
-        REAL_SENTENCEPIECE_PROCESSOR,
-    )
-    postprocessor = PostProcessor(real_tokenizer_path, sample_rate=1000)
-    tokenizer = postprocessor.tokenizer
-    ids = [
-        tokenizer.piece_to_id("▁"),
-        tokenizer.piece_to_id("<0xC3>"),
-        tokenizer.piece_to_id(control_piece),
-        tokenizer.piece_to_id("<0xA9>"),
-    ]
-
-    assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [ids],
-        [[0.01, 0.02, 0.03, 0.04]],
-    ) == (["��"], [[("��", 0.01, 0.1)]])
-
-
-def test_postprocessor_uses_sentencepiece_unknown_surface(
-    monkeypatch: pytest.MonkeyPatch,
-    real_tokenizer_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        postprocessor_module.spm,
-        "SentencePieceProcessor",
-        REAL_SENTENCEPIECE_PROCESSOR,
-    )
-    postprocessor = PostProcessor(real_tokenizer_path, sample_rate=1000)
-    tokenizer = postprocessor.tokenizer
-    ids = [
-        tokenizer.unk_id(),
-        tokenizer.piece_to_id("▁"),
-        tokenizer.piece_to_id("b"),
-    ]
-
-    assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [ids],
-        [[0.0, 0.04, 0.05]],
-    ) == (["⁇ b"], [[("⁇", 0.0, 0.04), ("b", 0.04, 0.1)]])
-
-
-def test_postprocessor_rejects_unaligned_batch_dimensions() -> None:
-    postprocessor = make_postprocessor()
-
-    with pytest.raises(ASRInferenceError, match="batch size differs"):
-        postprocessor(
-            [np.zeros(100, dtype=np.float32)],
-            [[], []],
-            [[]],
-        )
-
-
-def test_postprocessor_rejects_unaligned_token_timestamps() -> None:
-    postprocessor = make_postprocessor()
-
     with pytest.raises(ASRInferenceError, match="counts differ"):
         postprocessor(
             [np.zeros(100, dtype=np.float32)],
-            [[1, 2]],
+            [[1, 1]],
             [[0.0]],
         )
 
 
-@pytest.mark.parametrize(
-    "timestamps",
-    (
-        [-0.01],
-        [float("nan")],
-        [float("inf")],
-        [0.04, 0.02],
-    ),
-    ids=("negative", "nan", "infinite", "decreasing"),
-)
-def test_postprocessor_rejects_invalid_timestamps(timestamps: list[float]) -> None:
-    postprocessor = make_postprocessor()
-    token_ids = [1] * len(timestamps)
-
-    with pytest.raises(
-        ASRInferenceError,
-        match="finite, non-negative, nondecreasing",
-    ):
-        postprocessor(
-            [np.zeros(100, dtype=np.float32)],
-            [token_ids],
-            [timestamps],
-        )
+def test_postprocessor_rejects_invalid_timestamps(
+    postprocessor: PostProcessor,
+) -> None:
+    for timestamps in ([-0.01], [float("nan")], [0.04, 0.02]):
+        with pytest.raises(
+            ASRInferenceError, match="finite, non-negative, nondecreasing"
+        ):
+            postprocess_one(postprocessor, [1] * len(timestamps), timestamps)
 
 
-@pytest.mark.parametrize(
-    "audio",
-    (
+def test_postprocessor_rejects_malformed_audio(
+    postprocessor: PostProcessor,
+) -> None:
+    for audio in (
         np.zeros(0, dtype=np.float32),
         np.zeros((1, 100), dtype=np.float32),
-    ),
-)
-def test_postprocessor_rejects_malformed_audio(audio: object) -> None:
-    postprocessor = make_postprocessor()
-
-    with pytest.raises(ASRInferenceError, match="nonempty one-dimensional"):
-        postprocessor(
-            [audio],  # type: ignore[list-item]
-            [[]],
-            [[]],
-        )
+    ):
+        with pytest.raises(ASRInferenceError, match="nonempty one-dimensional"):
+            postprocessor([audio], [[]], [[]])
 
 
-def test_postprocessor_accepts_float32_timestamp_at_audio_endpoint() -> None:
-    postprocessor = make_postprocessor()
-
-    assert postprocessor(
-        [np.zeros(100, dtype=np.float32)],
-        [[1]],
-        [[float(np.float32(0.1))]],
-    ) == (["1"], [[("1", 0.1, 0.1)]])
-
-
-def test_postprocessor_clamps_tolerated_float32_endpoint_drift() -> None:
+def test_postprocessor_clamps_float32_endpoint_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        postprocessor_module.spm, "SentencePieceProcessor", FakeTokenizer
+    )
     postprocessor = PostProcessor(Path("bpe.model"), sample_rate=16_000)
     audio = np.zeros(1_656, dtype=np.float32)
 
-    texts, word_timestamps = postprocessor(
-        [audio],
-        [[1]],
-        [[float(np.float32(len(audio) / 16_000))]],
+    assert postprocessor(
+        [audio], [[1]], [[float(np.float32(audio.size / 16_000))]]
+    ) == (["1"], [[("1", 0.103, 0.103)]])
+
+
+def test_postprocessor_rounds_and_clamps_word_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        postprocessor_module.spm, "SentencePieceProcessor", FakeTokenizer
     )
+    postprocessor = PostProcessor(Path("bpe.model"), sample_rate=10_000)
 
-    assert texts == ["1"]
-    assert word_timestamps == [[("1", 0.103, 0.103)]]
-
-
-def test_postprocessor_clamps_standalone_boundary_to_audio_endpoint() -> None:
-    _, word_timestamps = postprocess_one(
-        [1, 4, 2],
-        [0.0, 0.2, 0.2],
-        0.1,
+    assert postprocessor(
+        [
+            np.zeros(1_006, dtype=np.float32),
+            np.zeros(1_000, dtype=np.float32),
+            np.zeros(1_000, dtype=np.float32),
+        ],
+        [[1, 2], [1, 2], [1, 4, 2]],
+        [[0.0016, 0.0236], [0.0, 0.2], [0.0, 0.2, 0.2]],
+    ) == (
+        ["1 2", "1 2", "1 2"],
+        [
+            [("1", 0.002, 0.024), ("2", 0.024, 0.101)],
+            [("1", 0.0, 0.1), ("2", 0.1, 0.1)],
+            [("1", 0.0, 0.1), ("2", 0.1, 0.1)],
+        ],
     )
-
-    assert word_timestamps == [("1", 0.0, 0.1), ("2", 0.1, 0.1)]

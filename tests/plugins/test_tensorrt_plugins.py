@@ -3,369 +3,347 @@
 
 """Tests for loading and registering packaged TensorRT plugins."""
 
-import re
+import ctypes
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
 import fast_gpu_asr.tensorrt_plugins as plugins_module
 
+PLUGIN_DIRECTORY = (
+    Path(__file__).resolve().parents[2] / "src" / "fast_gpu_asr" / "tensorrt_plugins"
+)
 PLUGIN_LIBRARIES = tuple(
     library_name for library_name, _ in plugins_module.PLUGIN_INITIALIZERS
 )
+PLUGIN_LOAD_CALLS = [
+    call(str(PLUGIN_DIRECTORY / name), mode=ctypes.RTLD_GLOBAL)
+    for name in PLUGIN_LIBRARIES
+]
+PLUGIN_REGISTRATION_CHECK = """
+import gc
+import sys
+from pathlib import Path
+
+import fast_gpu_asr.constants as constants
+import fast_gpu_asr.tensorrt_plugins as plugins
+import tensorrt as trt
+
+plugin_dir = Path(plugins.__file__).resolve().parent
+assert plugin_dir == Path(sys.argv[1]).resolve(), plugin_dir
+plugin_names = sorted(
+    value for name, value in vars(constants).items()
+    if name.endswith("_PLUGIN_NAME")
+)
+assert plugin_names, "No TensorRT plugin names are declared."
+plugins.load_tensorrt_plugins()
+gc.collect()
+registries = {
+    "runtime": trt.get_plugin_registry(),
+    "builder": trt.get_builder_plugin_registry(trt.EngineCapability.STANDARD),
+}
+for registry_name, registry in registries.items():
+    missing = [
+        name for name in plugin_names
+        if registry.get_creator(name, "1", constants.TENSORRT_PLUGIN_NAMESPACE) is None
+    ]
+    assert not missing, f"Missing {registry_name} TensorRT creators: {missing}."
+"""
 
 
 class FakeInitializer:
-    """Record ctypes signature assignment and registration calls."""
+    """Check the ctypes signature at registration time and count calls."""
 
-    def __init__(self, result: bool = True) -> None:
+    def __init__(self):
+        """Initialize writable ctypes metadata and registration controls."""
+
         self.argtypes = None
         self.restype = None
-        self.result = result
+        self.result = True
+        self.on_call = None
         self.calls = 0
-        self.call_signatures: list[tuple[object, object]] = []
 
-    def __call__(self) -> bool:
+    def __call__(self):
+        """Validate the configured ABI and invoke the optional registration hook.
+
+        Returns
+        -------
+        bool
+            Configured registration result after counting the call and invoking its
+            hook.
+        """
+
+        assert self.argtypes == ()
+        assert self.restype is ctypes.c_bool
         self.calls += 1
-        self.call_signatures.append((self.argtypes, self.restype))
+        if self.on_call is not None:
+            self.on_call()
         return self.result
-
-
-def bypass_runtime_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace TensorRT and CUDA dependency loading with successful no-ops."""
-
-    monkeypatch.setattr(plugins_module, "import_module", lambda _: None)
-    monkeypatch.setattr(plugins_module, "load_nvidia_dynamic_lib", lambda _: None)
-
-
-def libraries_through(library_name: str) -> list[str]:
-    """Return the ordered plugin-library prefix ending at ``library_name``."""
-
-    return list(PLUGIN_LIBRARIES[: PLUGIN_LIBRARIES.index(library_name) + 1])
 
 
 @pytest.fixture(autouse=True)
 def clear_plugin_loader_cache() -> Iterator[None]:
-    """Keep cached plugin registration isolated between tests."""
+    """Isolate successful-load caching between tests.
+
+    Yields
+    ------
+    None
+        Test execution with the successful-load cache cleared before and after.
+    """
 
     plugins_module.load_tensorrt_plugins.cache_clear()
     yield
     plugins_module.load_tensorrt_plugins.cache_clear()
 
 
-def test_load_tensorrt_plugins_registers_each_library_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    imported: list[str] = []
-    cuda_libraries: list[str] = []
-    initializers = {
-        initializer_name: FakeInitializer()
-        for _, initializer_name in plugins_module.PLUGIN_INITIALIZERS
+@pytest.fixture
+def loader(monkeypatch):
+    """Stub external loads with a separate library and initializer for each entry.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Fixture restoring loader dependencies after each test.
+
+    Returns
+    -------
+    SimpleNamespace
+        Dependency mocks, per-library fake handles, and controllable initializers.
+    """
+
+    initializers = {name: FakeInitializer() for name in PLUGIN_LIBRARIES}
+    libraries = {
+        name: SimpleNamespace(**{symbol: initializers[name]})
+        for name, symbol in plugins_module.PLUGIN_INITIALIZERS
     }
-
+    loader = SimpleNamespace(
+        import_module=Mock(return_value=None),
+        load_cuda=Mock(return_value=None),
+        cdll=Mock(side_effect=lambda path, mode: libraries[Path(path).name]),
+        libraries=libraries,
+        initializers=initializers,
+    )
+    monkeypatch.setattr(plugins_module, "import_module", loader.import_module)
+    monkeypatch.setattr(plugins_module, "load_nvidia_dynamic_lib", loader.load_cuda)
     monkeypatch.setattr(
         plugins_module,
-        "import_module",
-        lambda name: imported.append(name),
+        "ctypes",
+        SimpleNamespace(
+            CDLL=loader.cdll, RTLD_GLOBAL=ctypes.RTLD_GLOBAL, c_bool=ctypes.c_bool
+        ),
     )
-    monkeypatch.setattr(
-        plugins_module,
-        "load_nvidia_dynamic_lib",
-        lambda name: cuda_libraries.append(name),
+    return loader
+
+
+@pytest.mark.cuda
+def test_packaged_plugins_register_actual_creators_in_fresh_process() -> None:
+    assert Path(plugins_module.__file__).resolve().parent == PLUGIN_DIRECTORY
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", PLUGIN_REGISTRATION_CHECK, str(PLUGIN_DIRECTORY)],
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
-    monkeypatch.setattr(
-        plugins_module.ctypes,
-        "CDLL",
-        lambda path, mode: SimpleNamespace(**initializers),
-    )
-
-    plugins_module.load_tensorrt_plugins()
-    plugins_module.load_tensorrt_plugins()
-
-    assert imported == ["tensorrt_libs"]
-    assert cuda_libraries == list(plugins_module.CUDA_RUNTIME_LIBRARIES)
-    assert all(initializer.calls == 1 for initializer in initializers.values())
-    assert all(
-        initializer.call_signatures == [((), plugins_module.ctypes.c_bool)]
-        for initializer in initializers.values()
-    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_load_tensorrt_plugins_uses_exact_library_initializer_pairs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    load_events: list[tuple[Path, int]] = []
-    initializers: dict[str, FakeInitializer] = {}
-    expected_initializers = dict(plugins_module.PLUGIN_INITIALIZERS)
+def test_loads_dependencies_then_registers_each_library_once(loader) -> None:
+    events = []
+    loader.import_module.side_effect = lambda name: events.append(("import", name))
+    loader.load_cuda.side_effect = lambda name: events.append(("cuda", name))
 
-    def fake_cdll(path: str, mode: int) -> SimpleNamespace:
-        library_path = Path(path)
-        library_name = library_path.name
-        load_events.append((library_path, mode))
-        initializer = FakeInitializer()
-        initializers[library_name] = initializer
-        return SimpleNamespace(**{expected_initializers[library_name]: initializer})
+    def open_library(path, mode):
+        """Record a library-open event and return its isolated fake handle.
 
-    bypass_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
+        Parameters
+        ----------
+        path : str
+            Shared-library path requested by the production loader.
+        mode : int
+            ctypes loading flags supplied by the production loader.
 
-    plugins_module.load_tensorrt_plugins()
+        Returns
+        -------
+        SimpleNamespace
+            Fake library exposing the initializer requested by the production manifest.
+        """
 
-    plugin_dir = Path(plugins_module.__file__).resolve().parent
-    assert load_events == [
-        (plugin_dir / library_name, plugins_module.ctypes.RTLD_GLOBAL)
-        for library_name, _ in plugins_module.PLUGIN_INITIALIZERS
-    ]
-    assert all(initializer.calls == 1 for initializer in initializers.values())
+        name = Path(path).name
+        events.append(("open", name))
+        return loader.libraries[name]
+
+    loader.cdll.side_effect = open_library
+    for name, initializer in loader.initializers.items():
+        initializer.on_call = lambda name=name: events.append(("initialize", name))
+
+    assert plugins_module.load_tensorrt_plugins() is None
+    assert plugins_module.load_tensorrt_plugins() is None
+
+    expected = [("import", "tensorrt_libs")]
+    expected.extend(("cuda", name) for name in plugins_module.CUDA_RUNTIME_LIBRARIES)
+    for name in PLUGIN_LIBRARIES:
+        expected.extend([("open", name), ("initialize", name)])
+    assert events == expected
+    assert loader.cdll.call_args_list == PLUGIN_LOAD_CALLS
+    assert all(initializer.calls == 1 for initializer in loader.initializers.values())
 
 
-def test_failed_plugin_load_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
-    expected_initializers = dict(plugins_module.PLUGIN_INITIALIZERS)
-    imported: list[str] = []
-    cuda_libraries: list[str] = []
-    initializers: list[FakeInitializer] = []
-    attempts = 0
+def test_failed_library_load_is_retried_then_cached(loader) -> None:
+    loader.cdll.side_effect = [OSError("transient failure"), *loader.libraries.values()]
 
-    def fake_cdll(path: str, mode: int) -> SimpleNamespace:
-        nonlocal attempts
-        del mode
-        attempts += 1
-        if attempts == 1:
-            raise OSError("transient failure")
-        library_name = Path(path).name
-        initializer = FakeInitializer()
-        initializers.append(initializer)
-        return SimpleNamespace(**{expected_initializers[library_name]: initializer})
-
-    monkeypatch.setattr(
-        plugins_module,
-        "import_module",
-        lambda name: imported.append(name),
-    )
-    monkeypatch.setattr(
-        plugins_module,
-        "load_nvidia_dynamic_lib",
-        lambda name: cuda_libraries.append(name),
-    )
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
-
-    with pytest.raises(RuntimeError, match="transient failure") as exc_info:
+    with pytest.raises(RuntimeError, match="Failed to load TensorRT plugin library"):
         plugins_module.load_tensorrt_plugins()
     plugins_module.load_tensorrt_plugins()
+    plugins_module.load_tensorrt_plugins()
 
-    assert attempts == len(plugins_module.PLUGIN_INITIALIZERS) + 1
-    assert imported == ["tensorrt_libs", "tensorrt_libs"]
-    assert cuda_libraries == list(plugins_module.CUDA_RUNTIME_LIBRARIES) * 2
-    assert len(initializers) == len(plugins_module.PLUGIN_INITIALIZERS)
-    assert all(initializer.calls == 1 for initializer in initializers)
-    assert isinstance(exc_info.value.__cause__, OSError)
-
-
-def test_load_tensorrt_plugins_reports_dependency_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cuda_libraries: list[str] = []
-    plugin_opened = False
-
-    def import_tensorrt_libraries(_: str) -> None:
-        raise ModuleNotFoundError("tensorrt_libs")
-
-    def fake_cdll(*args: object, **kwargs: object) -> None:
-        nonlocal plugin_opened
-        del args, kwargs
-        plugin_opened = True
-
-    monkeypatch.setattr(
-        plugins_module,
-        "import_module",
-        import_tensorrt_libraries,
+    assert loader.cdll.call_args_list == [PLUGIN_LOAD_CALLS[0], *PLUGIN_LOAD_CALLS]
+    assert loader.import_module.call_args_list == [call("tensorrt_libs")] * 2
+    assert (
+        loader.load_cuda.call_args_list
+        == [call(name) for name in plugins_module.CUDA_RUNTIME_LIBRARIES] * 2
     )
-    monkeypatch.setattr(
-        plugins_module,
-        "load_nvidia_dynamic_lib",
-        lambda name: cuda_libraries.append(name),
-    )
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
-
-    with pytest.raises(
-        RuntimeError, match="TensorRT and CUDA runtime dependencies"
-    ) as exc_info:
-        plugins_module.load_tensorrt_plugins()
-
-    assert cuda_libraries == []
-    assert not plugin_opened
-    assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
-    assert str(exc_info.value.__cause__) == "tensorrt_libs"
-
-
-@pytest.mark.parametrize("failed_library", plugins_module.CUDA_RUNTIME_LIBRARIES)
-@pytest.mark.parametrize("error_type", (OSError, RuntimeError))
-def test_load_tensorrt_plugins_reports_each_cuda_dependency_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    failed_library: str,
-    error_type: type[OSError] | type[RuntimeError],
-) -> None:
-    attempted_libraries: list[str] = []
-    plugin_opened = False
-
-    def load_cuda_library(name: str) -> None:
-        attempted_libraries.append(name)
-        if name == failed_library:
-            raise error_type(f"missing {name}")
-
-    def open_plugin(*args: object, **kwargs: object) -> None:
-        nonlocal plugin_opened
-        del args, kwargs
-        plugin_opened = True
-
-    monkeypatch.setattr(plugins_module, "import_module", lambda _: None)
-    monkeypatch.setattr(plugins_module, "load_nvidia_dynamic_lib", load_cuda_library)
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", open_plugin)
-
-    with pytest.raises(
-        RuntimeError, match=rf"missing {re.escape(failed_library)}"
-    ) as exc_info:
-        plugins_module.load_tensorrt_plugins()
-
-    failed_index = plugins_module.CUDA_RUNTIME_LIBRARIES.index(failed_library)
-    assert attempted_libraries == list(
-        plugins_module.CUDA_RUNTIME_LIBRARIES[: failed_index + 1]
-    )
-    assert not plugin_opened
-    assert isinstance(exc_info.value.__cause__, error_type)
-
-
-@pytest.mark.parametrize("failed_library", PLUGIN_LIBRARIES)
-def test_load_tensorrt_plugins_reports_library_load_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    failed_library: str,
-) -> None:
-    expected_initializers = dict(plugins_module.PLUGIN_INITIALIZERS)
-    opened_libraries: list[str] = []
-
-    def fake_cdll(path: str, mode: int) -> SimpleNamespace:
-        del mode
-        library_name = Path(path).name
-        opened_libraries.append(library_name)
-        if library_name == failed_library:
-            raise OSError("cannot load")
-        return SimpleNamespace(
-            **{expected_initializers[library_name]: FakeInitializer()}
-        )
-
-    bypass_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
-
-    with pytest.raises(
-        RuntimeError,
-        match=rf"Failed to load TensorRT plugin library .*{re.escape(failed_library)}",
-    ) as exc_info:
-        plugins_module.load_tensorrt_plugins()
-
-    assert opened_libraries == libraries_through(failed_library)
-    assert isinstance(exc_info.value.__cause__, OSError)
-    assert str(exc_info.value.__cause__) == "cannot load"
+    assert all(initializer.calls == 1 for initializer in loader.initializers.values())
 
 
 @pytest.mark.parametrize(
-    ("failed_library", "failed_initializer"), plugins_module.PLUGIN_INITIALIZERS
+    "error_type", [ImportError, ModuleNotFoundError, OSError, RuntimeError]
 )
-def test_load_tensorrt_plugins_reports_missing_initializer(
-    monkeypatch: pytest.MonkeyPatch,
-    failed_library: str,
-    failed_initializer: str,
-) -> None:
-    expected_initializers = dict(plugins_module.PLUGIN_INITIALIZERS)
-    opened_libraries: list[str] = []
+def test_reports_dependency_import_failure(loader, error_type) -> None:
+    error = error_type("tensorrt_libs")
+    loader.import_module.side_effect = error
 
-    def fake_cdll(path: str, mode: int) -> SimpleNamespace:
-        del mode
-        library_name = Path(path).name
-        opened_libraries.append(library_name)
-        if library_name == failed_library:
-            return SimpleNamespace()
-        return SimpleNamespace(
-            **{expected_initializers[library_name]: FakeInitializer()}
-        )
-
-    bypass_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
-
-    with pytest.raises(
-        RuntimeError, match=rf"does not export {re.escape(failed_initializer)}"
-    ) as exc_info:
+    with pytest.raises(RuntimeError) as exc_info:
         plugins_module.load_tensorrt_plugins()
 
-    assert opened_libraries == libraries_through(failed_library)
-    assert isinstance(exc_info.value.__cause__, AttributeError)
-    assert failed_initializer in str(exc_info.value.__cause__)
-
-
-@pytest.mark.parametrize("failed_library", PLUGIN_LIBRARIES)
-def test_load_tensorrt_plugins_reports_registration_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    failed_library: str,
-) -> None:
-    expected_initializers = dict(plugins_module.PLUGIN_INITIALIZERS)
-    opened_libraries: list[str] = []
-    initializers: dict[str, FakeInitializer] = {}
-
-    def fake_cdll(path: str, mode: int) -> SimpleNamespace:
-        del mode
-        library_name = Path(path).name
-        opened_libraries.append(library_name)
-        initializer_name = expected_initializers[library_name]
-        initializer = FakeInitializer(library_name != failed_library)
-        initializers[library_name] = initializer
-        return SimpleNamespace(**{initializer_name: initializer})
-
-    bypass_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
-
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            rf"Failed to register TensorRT plugins from .*"
-            rf"{re.escape(failed_library)}"
-        ),
-    ) as exc_info:
-        plugins_module.load_tensorrt_plugins()
-
-    assert opened_libraries == libraries_through(failed_library)
-    assert all(initializer.calls == 1 for initializer in initializers.values())
-    assert all(
-        initializer.call_signatures == [((), plugins_module.ctypes.c_bool)]
-        for initializer in initializers.values()
+    loader.import_module.assert_called_once_with("tensorrt_libs")
+    loader.load_cuda.assert_not_called()
+    loader.cdll.assert_not_called()
+    assert str(exc_info.value) == (
+        "Failed to load the TensorRT and CUDA runtime dependencies required by "
+        "native plugins: tensorrt_libs"
     )
-    assert not initializers[failed_library].result
+    assert exc_info.value.__cause__ is error
+
+
+def test_propagates_unexpected_dependency_error(loader) -> None:
+    error = ValueError("invalid dependency request")
+    loader.import_module.side_effect = error
+
+    with pytest.raises(ValueError) as exc_info:
+        plugins_module.load_tensorrt_plugins()
+
+    assert exc_info.value is error
+    loader.import_module.assert_called_once_with("tensorrt_libs")
+    loader.load_cuda.assert_not_called()
+    loader.cdll.assert_not_called()
+
+
+@pytest.mark.parametrize("failed_library", plugins_module.CUDA_RUNTIME_LIBRARIES)
+@pytest.mark.parametrize("error_type", [ImportError, OSError, RuntimeError])
+def test_reports_each_cuda_dependency_failure(
+    loader, failed_library, error_type
+) -> None:
+    error = error_type(f"missing {failed_library}")
+    failed_index = plugins_module.CUDA_RUNTIME_LIBRARIES.index(failed_library)
+    loader.load_cuda.side_effect = [None] * failed_index + [error]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        plugins_module.load_tensorrt_plugins()
+
+    loader.import_module.assert_called_once_with("tensorrt_libs")
+    assert loader.load_cuda.call_args_list == [
+        call(name) for name in plugins_module.CUDA_RUNTIME_LIBRARIES[: failed_index + 1]
+    ]
+    loader.cdll.assert_not_called()
+    assert str(exc_info.value) == (
+        "Failed to load the TensorRT and CUDA runtime dependencies required by "
+        f"native plugins: {error}"
+    )
+    assert exc_info.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    "failed_index", range(len(PLUGIN_LIBRARIES)), ids=PLUGIN_LIBRARIES
+)
+def test_reports_library_load_failure(loader, failed_index) -> None:
+    error = OSError("cannot load")
+    loader.cdll.side_effect = list(loader.libraries.values())[:failed_index] + [error]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        plugins_module.load_tensorrt_plugins()
+
+    assert loader.cdll.call_args_list == PLUGIN_LOAD_CALLS[: failed_index + 1]
+    failed_path = PLUGIN_DIRECTORY / PLUGIN_LIBRARIES[failed_index]
+    assert str(exc_info.value) == (
+        f"Failed to load TensorRT plugin library {failed_path}: {error}"
+    )
+    assert exc_info.value.__cause__ is error
+
+
+def test_propagates_unexpected_library_loader_error(loader) -> None:
+    error = ValueError("invalid loader arguments")
+    loader.cdll.side_effect = error
+
+    with pytest.raises(ValueError) as exc_info:
+        plugins_module.load_tensorrt_plugins()
+
+    assert exc_info.value is error
+    assert loader.cdll.call_args_list == PLUGIN_LOAD_CALLS[:1]
+
+
+@pytest.mark.parametrize(
+    "failed_index", range(len(PLUGIN_LIBRARIES)), ids=PLUGIN_LIBRARIES
+)
+def test_reports_missing_initializer(loader, failed_index) -> None:
+    library, symbol = plugins_module.PLUGIN_INITIALIZERS[failed_index]
+    delattr(loader.libraries[library], symbol)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        plugins_module.load_tensorrt_plugins()
+
+    assert loader.cdll.call_args_list == PLUGIN_LOAD_CALLS[: failed_index + 1]
+    failed_path = PLUGIN_DIRECTORY / library
+    assert str(exc_info.value) == (
+        f"TensorRT plugin library {failed_path} does not export {symbol}."
+    )
+    assert isinstance(exc_info.value.__cause__, AttributeError)
+    assert symbol in str(exc_info.value.__cause__)
+
+
+@pytest.mark.parametrize(
+    "failed_index", range(len(PLUGIN_LIBRARIES)), ids=PLUGIN_LIBRARIES
+)
+def test_reports_registration_failure(loader, failed_index) -> None:
+    failed_library = PLUGIN_LIBRARIES[failed_index]
+    loader.initializers[failed_library].result = False
+
+    with pytest.raises(RuntimeError) as exc_info:
+        plugins_module.load_tensorrt_plugins()
+
+    assert loader.cdll.call_args_list == PLUGIN_LOAD_CALLS[: failed_index + 1]
+    assert [initializer.calls for initializer in loader.initializers.values()] == (
+        [1] * (failed_index + 1) + [0] * (len(PLUGIN_LIBRARIES) - failed_index - 1)
+    )
+    assert str(exc_info.value) == (
+        f"Failed to register TensorRT plugins from {PLUGIN_DIRECTORY / failed_library}."
+    )
     assert exc_info.value.__cause__ is None
 
 
-def test_registration_failure_is_not_cached(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    expected_initializers = dict(plugins_module.PLUGIN_INITIALIZERS)
-    failing_library = plugins_module.PLUGIN_INITIALIZERS[-1][0]
-    initializers: dict[str, FakeInitializer] = {}
-
-    def fake_cdll(path: str, mode: int) -> SimpleNamespace:
-        del mode
-        library_name = Path(path).name
-        initializer = initializers.setdefault(
-            library_name,
-            FakeInitializer(result=library_name != failing_library),
-        )
-        return SimpleNamespace(**{expected_initializers[library_name]: initializer})
-
-    bypass_runtime_dependencies(monkeypatch)
-    monkeypatch.setattr(plugins_module.ctypes, "CDLL", fake_cdll)
+def test_failed_registration_is_retried_then_cached(loader) -> None:
+    initializer = loader.initializers[PLUGIN_LIBRARIES[-1]]
+    initializer.result = False
 
     with pytest.raises(RuntimeError, match="Failed to register TensorRT plugins"):
         plugins_module.load_tensorrt_plugins()
-    initializers[failing_library].result = True
+    initializer.result = True
+    plugins_module.load_tensorrt_plugins()
     plugins_module.load_tensorrt_plugins()
 
-    assert initializers[failing_library].calls == 2
-    assert all(initializer.calls == 2 for initializer in initializers.values())
+    assert loader.cdll.call_args_list == PLUGIN_LOAD_CALLS * 2
+    assert all(initializer.calls == 2 for initializer in loader.initializers.values())

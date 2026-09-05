@@ -39,13 +39,13 @@ class BinaryWheel(bdist_wheel):
     }
 
     def run(self) -> None:
-        """Reject incomplete or stale native-plugin sets before building.
+        """Validate native-plugin names and file properties before building.
 
         Raises
         ------
         FileError
-            Raised when plugin artifacts do not match the build manifest or are
-            not regular, non-symlink, nonempty files.
+            Raised when plugin artifacts do not match the build manifest, are
+            not regular non-symlink files, or are empty.
         """
 
         sources = tuple(self.plugin_dir.glob("*.cu"))
@@ -103,8 +103,8 @@ class UnsupportedSourceDistribution(sdist):
         Raises
         ------
         FileError
-            Always raised because an sdist cannot carry portable TensorRT plugin
-            binaries and cannot compile them on an arbitrary installation host.
+            Always raised because source distributions are unsupported; use the
+            native wheel build pipeline.
         """
 
         raise FileError(

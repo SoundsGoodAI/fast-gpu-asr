@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 
-"""Configure hardware requirements for CUDA-dependent pytest tests.
+"""Configure hardware requirements and runtime-test CUDA stream isolation.
 
 The ``cuda`` marker requires any working CUDA device. The ``sm80`` marker is
 more restrictive and requires compute capability 8.0 or newer. Tests that the
 available hardware cannot execute are skipped during collection so the CPU test
 suite remains usable on hosts without an NVIDIA GPU.
+
+CUDA tests under ``tests/runtime`` use a fresh current stream for input setup,
+inference, and assertions. Other test categories retain their own stream setup.
 """
+
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -88,3 +94,40 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(sm80_unavailable)
         elif item.get_closest_marker("cuda") is not None and capability is None:
             item.add_marker(cuda_unavailable)
+
+
+@pytest.fixture(autouse=True)
+def runtime_cuda_stream(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Keep CUDA runtime tests on one isolated nonblocking stream.
+
+    Parameters
+    ----------
+    request : pytest.FixtureRequest
+        Test path and markers used to restrict isolation to CUDA tests under
+        ``tests/runtime``, including any nested test directories.
+
+    Yields
+    ------
+    None
+        CUDA runtime tests run on device zero with an isolated current stream.
+        CPU-only tests and other test categories leave CUDA untouched.
+
+    Notes
+    -----
+    Decoder helpers use the current stream so asynchronous input preparation
+    completes before decoding. The final wait also drains work left by expected
+    inference failures before the next test can reuse its allocations.
+    """
+
+    if request.path.is_relative_to(Path(__file__).parent / "runtime") and any(
+        request.node.get_closest_marker(name) for name in ("cuda", "sm80")
+    ):
+        import cupy as cp
+
+        with cp.cuda.Device(0), cp.cuda.Stream(non_blocking=True) as stream:
+            try:
+                yield
+            finally:
+                stream.synchronize()
+    else:
+        yield

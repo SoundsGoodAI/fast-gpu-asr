@@ -1,46 +1,72 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 
-"""Tests for transactional binary-wheel build orchestration."""
+"""Tests for wheel build orchestration and destination preservation."""
 
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
 import pytest
 
-REPOSITORY_DIR = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPOSITORY_DIR / "scripts" / "build_wheel.sh"
-COMMAND_TIMEOUT_SECONDS = 30
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "build_wheel.sh"
+RAW_WHEEL = "fast_gpu_asr-0-py3-none-linux_x86_64.whl"
+REPAIRED_WHEEL = "fast_gpu_asr-0-py3-none-manylinux_2_27_x86_64.whl"
+SOURCE_FILES = {
+    "LICENSE": "license",
+    "README.md": "readme",
+    "pyproject.toml": "metadata",
+    "setup.py": "setup",
+    "src/fast_gpu_asr/__init__.py": "package",
+    "src/fast_gpu_asr/tensorrt_plugins/plugin.cu": "source",
+    "src/fast_gpu_asr/tensorrt_plugins/plugin.h": "header",
+}
 
 
 class CommandRecord(TypedDict):
-    """One external command observed by the fake wheel toolchain."""
+    """One command observed by the fake wheel toolchain."""
 
     tool: str
     arguments: list[str]
     cwd: str
-    cwd_entries: NotRequired[list[str]]
-    cwd_files: NotRequired[list[str]]
-
-
-def write_executable(path: Path, source: str) -> None:
-    """Write one executable test command."""
-
-    path.write_text(source, encoding="utf8")
-    path.chmod(0o755)
+    source_files: NotRequired[dict[str, str]]
 
 
 @pytest.fixture
-def fake_wheel_toolchain(tmp_path: Path) -> tuple[Path, Path]:
-    """Create configurable ``uv``, ``uvx``, and ``mv`` command shims."""
+def wheel_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Copy the real build script into a repository with fake build tools.
+
+    Parameters
+    ----------
+    tmp_path : Path
+        Parent directory for the repository and executable command shims.
+    monkeypatch : pytest.MonkeyPatch
+        Prepend the shim directory to ``PATH`` and clear failure controls.
+
+    Returns
+    -------
+    Path
+        Repository path containing spaces, to exercise shell quoting. Shims
+        record commands and create opaque artifacts without compiling CUDA or
+        running auditwheel; all other shell operations run normally.
+    """
+
+    repository_dir = tmp_path / "repository with spaces"
+    scripts_dir = repository_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy2(SCRIPT_PATH, scripts_dir / SCRIPT_PATH.name)
+    for name, content in {**SOURCE_FILES, "unrelated.txt": "exclude me"}.items():
+        path = repository_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf8")
 
     bin_dir = tmp_path / "bin"
-    command_log = tmp_path / "commands.jsonl"
     bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(sys.executable)
     shim = """#!/usr/bin/env python3
 import json
 import os
@@ -51,15 +77,12 @@ tool = Path(sys.argv[0]).name
 arguments = sys.argv[1:]
 record = {"tool": tool, "arguments": arguments, "cwd": os.getcwd()}
 if tool == "uv" and arguments[:2] == ["build", "--wheel"]:
-    record["cwd_entries"] = sorted(path.name for path in Path.cwd().iterdir())
-    record["cwd_files"] = sorted(
-        str(path.relative_to(Path.cwd()))
-        for path in Path.cwd().rglob("*")
-        if path.is_file()
-    )
+    record["source_files"] = {
+        path.relative_to(Path.cwd()).as_posix(): path.read_text(encoding="utf8")
+        for path in Path.cwd().rglob("*") if path.is_file()
+    }
 with Path(os.environ["COMMAND_LOG"]).open("a", encoding="utf8") as log:
-    log.write(json.dumps(record))
-    log.write("\\n")
+    log.write(json.dumps(record) + "\\n")
 
 if tool == "uv":
     if arguments[:1] == ["run"]:
@@ -70,9 +93,16 @@ if tool == "uv":
         raise SystemExit(90)
     if os.environ.get("FAIL_STAGE") == stage:
         raise SystemExit({"plugin": 31, "wheel": 32}[stage])
-    if stage == "wheel":
+    if stage == "plugin":
+        Path("src/fast_gpu_asr/tensorrt_plugins/plugin.so").write_text(
+            "compiled plugin", encoding="utf8"
+        )
+    else:
         output_dir = Path(arguments[arguments.index("--out-dir") + 1])
         output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "directory.whl").mkdir()
+        (output_dir / "nested").mkdir()
+        (output_dir / "nested" / "ignored.whl").write_bytes(b"nested wheel")
         for index in range(int(os.environ.get("RAW_WHEEL_COUNT", "1"))):
             wheel_path = output_dir / (
                 f"fast_gpu_asr-{index}-py3-none-linux_x86_64.whl"
@@ -83,6 +113,9 @@ elif tool == "uvx":
         raise SystemExit(33)
     output_dir = Path(arguments[arguments.index("--wheel-dir") + 1])
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "directory.whl").mkdir()
+    (output_dir / "nested").mkdir()
+    (output_dir / "nested" / "ignored.whl").write_bytes(b"nested wheel")
     for index in range(int(os.environ.get("REPAIRED_WHEEL_COUNT", "1"))):
         wheel_path = output_dir / (
             f"fast_gpu_asr-{index}-py3-none-manylinux_2_27_x86_64.whl"
@@ -97,41 +130,97 @@ elif tool == "mv":
 else:
     raise SystemExit(92)
 """
-    write_executable(bin_dir / "uv", shim)
-    write_executable(bin_dir / "uvx", shim)
-    write_executable(bin_dir / "mv", shim)
-    return bin_dir, command_log
+    for tool in ("uv", "uvx", "mv"):
+        path = bin_dir / tool
+        path.write_text(shim, encoding="utf8")
+        path.chmod(0o755)
+    for variable in ("FAIL_STAGE", "RAW_WHEEL_COUNT", "REPAIRED_WHEEL_COUNT"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    return repository_dir
+
+
+@pytest.fixture
+def wheel_dir(tmp_path: Path) -> Path:
+    """Seed a destination with existing wheels and unrelated files.
+
+    Parameters
+    ----------
+    tmp_path : Path
+        Parent directory for the wheel destination.
+
+    Returns
+    -------
+    Path
+        Destination containing a replaceable wheel, a stale package wheel,
+        unrelated files, and an archived wheel that must survive cleanup.
+    """
+
+    path = tmp_path / "wheel output"
+    (path / "archive").mkdir(parents=True)
+    for name, content in {
+        REPAIRED_WHEEL: b"known-good",
+        "fast_gpu_asr-stale.whl": b"stale",
+        "unrelated.whl": b"unrelated",
+        "keep.txt": b"keep",
+        "archive/fast_gpu_asr-archived.whl": b"archived",
+    }.items():
+        (path / name).write_bytes(content)
+    return path
+
+
+def read_files(directory: Path) -> dict[str, bytes]:
+    """Snapshot file contents to detect lost or changed artifacts.
+
+    Parameters
+    ----------
+    directory : Path
+        Directory whose files are read recursively.
+
+    Returns
+    -------
+    dict[str, bytes]
+        Relative POSIX paths mapped to exact file contents.
+    """
+
+    return {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
 
 
 def run_build_wheel(
-    wheel_dir: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
-    *,
-    script_path: Path = SCRIPT_PATH,
-    script_arguments: tuple[str, ...] | None = None,
-    working_directory: Path | None = None,
+    repository_dir: Path,
+    arguments: tuple[str, ...] = (),
     **environment_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[CommandRecord]]:
-    """Run the wheel script with the fake commands and return its command log."""
+    """Run outside the temporary repository and collect shim invocations.
 
-    bin_dir, command_log = fake_wheel_toolchain
+    Parameters
+    ----------
+    repository_dir : Path
+        Repository prepared by ``wheel_project``.
+    arguments : tuple[str, ...]
+        Arguments forwarded to the shell script without splitting.
+    **environment_overrides : str
+        Shim controls for stage failures or emitted wheel counts.
+
+    Returns
+    -------
+    tuple[subprocess.CompletedProcess[str], list[CommandRecord]]
+        Exit status and output, plus command records in execution order.
+    """
+
+    command_log = repository_dir.parent / "commands.jsonl"
     command_log.unlink(missing_ok=True)
-    environment = os.environ.copy()
-    for variable in ("FAIL_STAGE", "RAW_WHEEL_COUNT", "REPAIRED_WHEEL_COUNT"):
-        environment.pop(variable, None)
-    environment.update(environment_overrides)
-    environment["COMMAND_LOG"] = str(command_log)
-    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
-    if script_arguments is None:
-        script_arguments = (str(wheel_dir),)
     result = subprocess.run(
-        (str(script_path), *script_arguments),
-        check=False,
+        (str(repository_dir / "scripts" / SCRIPT_PATH.name), *arguments),
         capture_output=True,
-        cwd=working_directory,
-        env=environment,
+        cwd=repository_dir.parent,
+        env={**os.environ, **environment_overrides, "COMMAND_LOG": str(command_log)},
         text=True,
-        timeout=COMMAND_TIMEOUT_SECONDS,
+        timeout=30,
     )
     commands = (
         [
@@ -144,90 +233,49 @@ def run_build_wheel(
     return result, commands
 
 
-def create_minimal_repository(path: Path, include_readme: bool = True) -> Path:
-    """Create the source files required by a copied wheel-build script."""
-
-    scripts_dir = path / "scripts"
-    scripts_dir.mkdir(parents=True)
-    script_path = scripts_dir / SCRIPT_PATH.name
-    shutil.copy2(SCRIPT_PATH, script_path)
-    for name in ("LICENSE", "pyproject.toml", "setup.py"):
-        (path / name).write_text(name, encoding="utf8")
-    if include_readme:
-        (path / "README.md").write_text("README", encoding="utf8")
-    (path / "src").mkdir()
-    return script_path
-
-
 def test_build_wheel_repairs_with_expected_policy_and_exclusions(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
+    wheel_project: Path, wheel_dir: Path
 ) -> None:
-    """Publish one wheel only after applying the complete repair policy."""
+    expected_files = read_files(wheel_dir)
+    expected_files[REPAIRED_WHEEL] = b"repaired wheel"
+    del expected_files["fast_gpu_asr-stale.whl"]
 
-    wheel_dir = tmp_path / "dist"
-    wheel_dir.mkdir()
-    published_wheel = wheel_dir / "fast_gpu_asr-0-py3-none-manylinux_2_27_x86_64.whl"
-    published_wheel.write_bytes(b"known-good")
-    stale_wheel = wheel_dir / "fast_gpu_asr-stale.whl"
-    stale_wheel.write_bytes(b"stale")
-    (wheel_dir / "unrelated.whl").write_bytes(b"unrelated")
-    (wheel_dir / "keep.txt").write_text("keep", encoding="utf8")
-    archive_dir = wheel_dir / "archive"
-    archive_dir.mkdir()
-    archived_wheel = archive_dir / "fast_gpu_asr-archived.whl"
-    archived_wheel.write_bytes(b"archived")
-
-    result, commands = run_build_wheel(wheel_dir, fake_wheel_toolchain)
+    result, commands = run_build_wheel(wheel_project, (str(wheel_dir),))
 
     assert result.returncode == 0, result.stderr
-    assert sorted(path.name for path in wheel_dir.glob("*.whl")) == [
-        "fast_gpu_asr-0-py3-none-manylinux_2_27_x86_64.whl",
-        "unrelated.whl",
-    ]
-    assert published_wheel.read_bytes() == b"repaired wheel"
-    assert not stale_wheel.exists()
-    assert (wheel_dir / "keep.txt").read_text(encoding="utf8") == "keep"
-    assert archived_wheel.read_bytes() == b"archived"
+    assert read_files(wheel_dir) == expected_files
     assert not list(wheel_dir.glob(".build-wheel.*"))
     assert [command["tool"] for command in commands] == ["uv", "uv", "uvx", "mv"]
-    assert commands[0]["arguments"] == [
+    plugin, build, repair, publish = commands
+    assert plugin["arguments"] == [
         "run",
         "--frozen",
         "python",
         "-m",
         "fast_gpu_asr.tensorrt_plugins.build",
     ]
-    raw_wheel_dir = Path(commands[1]["arguments"][-1])
-    assert commands[1]["arguments"] == [
-        "build",
-        "--wheel",
-        "--out-dir",
-        str(raw_wheel_dir),
-    ]
-    source_dir = Path(commands[1]["cwd"])
-    assert source_dir == raw_wheel_dir.parent / "source"
-    assert commands[1]["cwd_entries"] == [
-        "LICENSE",
-        "README.md",
-        "pyproject.toml",
-        "setup.py",
-        "src",
-    ]
-    assert {
-        "src/fast_gpu_asr/__init__.py",
-        "src/fast_gpu_asr/tensorrt_plugins/constants.py",
-    } <= set(commands[1]["cwd_files"])
-    repair_arguments = commands[2]["arguments"]
-    assert repair_arguments[:3] == ["--from", "auditwheel", "auditwheel"]
-    assert repair_arguments[3:6] == [
+    raw_dir = Path(build["arguments"][-1])
+    build_dir = raw_dir.parent
+    repaired_dir = Path(repair["arguments"][7])
+    assert build_dir.parent == wheel_dir
+    assert build_dir.name.startswith(".build-wheel.")
+    assert build["arguments"] == ["build", "--wheel", "--out-dir", str(raw_dir)]
+    assert Path(build["cwd"]) == build_dir / "source"
+    assert build["source_files"] == {
+        **SOURCE_FILES,
+        "src/fast_gpu_asr/tensorrt_plugins/plugin.so": "compiled plugin",
+    }
+    assert repaired_dir.parent == build_dir
+    assert repaired_dir != raw_dir
+    assert repair["arguments"] == [
+        "--from",
+        "auditwheel",
+        "auditwheel",
         "repair",
         "--plat",
         "manylinux_2_27_x86_64",
-    ]
-    assert repair_arguments[6] == "--wheel-dir"
-    assert Path(repair_arguments[7]).parent == raw_wheel_dir.parent
-    assert repair_arguments[8:-1] == [
+        "--wheel-dir",
+        str(repaired_dir),
         "--exclude",
         "libnvinfer.so.11",
         "--exclude",
@@ -238,20 +286,16 @@ def test_build_wheel_repairs_with_expected_policy_and_exclusions(
         "libcublasLt.so.13",
         "--exclude",
         "libcufft.so.12",
+        str(raw_dir / RAW_WHEEL),
     ]
-    assert Path(repair_arguments[-1]).parent == raw_wheel_dir
-    assert Path(repair_arguments[-1]).name == (
-        "fast_gpu_asr-0-py3-none-linux_x86_64.whl"
-    )
-    assert commands[0]["cwd"] == str(REPOSITORY_DIR)
-    assert commands[2]["cwd"] == str(REPOSITORY_DIR)
-    repaired_wheel_dir = Path(repair_arguments[7])
-    assert commands[3]["arguments"] == [
+    assert publish["arguments"] == [
         "--",
-        str(repaired_wheel_dir / published_wheel.name),
-        str(published_wheel),
+        str(repaired_dir / REPAIRED_WHEEL),
+        str(wheel_dir / REPAIRED_WHEEL),
     ]
-    assert commands[3]["cwd"] == str(REPOSITORY_DIR)
+    assert [command["cwd"] for command in (plugin, repair, publish)] == [
+        str(wheel_project)
+    ] * 3
 
 
 @pytest.mark.parametrize(
@@ -260,207 +304,107 @@ def test_build_wheel_repairs_with_expected_policy_and_exclusions(
         ("plugin", 31, ["uv"]),
         ("wheel", 32, ["uv", "uv"]),
         ("repair", 33, ["uv", "uv", "uvx"]),
+        ("publish", 34, ["uv", "uv", "uvx", "mv"]),
     ),
 )
 def test_build_wheel_preserves_destination_when_command_fails(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
+    wheel_project: Path,
+    wheel_dir: Path,
     stage: str,
     exit_code: int,
     expected_tools: list[str],
 ) -> None:
-    """Keep a known-good artifact when any fallible build stage fails."""
-
-    wheel_dir = tmp_path / "dist"
-    wheel_dir.mkdir()
-    old_wheel = wheel_dir / "fast_gpu_asr-known-good.whl"
-    old_wheel.write_bytes(b"known-good")
+    original_files = read_files(wheel_dir)
 
     result, commands = run_build_wheel(
-        wheel_dir, fake_wheel_toolchain, FAIL_STAGE=stage
+        wheel_project, (str(wheel_dir),), FAIL_STAGE=stage
     )
 
-    assert result.returncode == exit_code
+    assert result.returncode == exit_code, result.stderr
     assert [command["tool"] for command in commands] == expected_tools
-    assert old_wheel.read_bytes() == b"known-good"
-    assert [path.name for path in wheel_dir.glob("*.whl")] == [old_wheel.name]
-    assert not list(wheel_dir.glob(".build-wheel.*"))
-
-
-def test_build_wheel_preserves_destination_when_publish_fails(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
-) -> None:
-    """Keep existing package and unrelated wheels when atomic publication fails."""
-
-    wheel_dir = tmp_path / "dist"
-    wheel_dir.mkdir()
-    old_wheel = wheel_dir / "fast_gpu_asr-known-good.whl"
-    unrelated_wheel = wheel_dir / "another_project.whl"
-    old_wheel.write_bytes(b"known-good")
-    unrelated_wheel.write_bytes(b"unrelated")
-
-    result, commands = run_build_wheel(
-        wheel_dir, fake_wheel_toolchain, FAIL_STAGE="publish"
-    )
-
-    assert result.returncode == 34
-    assert [command["tool"] for command in commands] == ["uv", "uv", "uvx", "mv"]
-    assert old_wheel.read_bytes() == b"known-good"
-    assert unrelated_wheel.read_bytes() == b"unrelated"
-    assert sorted(path.name for path in wheel_dir.glob("*.whl")) == [
-        unrelated_wheel.name,
-        old_wheel.name,
-    ]
+    assert read_files(wheel_dir) == original_files
     assert not list(wheel_dir.glob(".build-wheel.*"))
 
 
 @pytest.mark.parametrize(
-    ("variable", "count", "message", "expected_tools"),
-    (
-        (
-            "RAW_WHEEL_COUNT",
-            "0",
-            "Expected exactly one raw wheel, found 0.",
-            ["uv", "uv"],
-        ),
-        (
-            "RAW_WHEEL_COUNT",
-            "2",
-            "Expected exactly one raw wheel, found 2.",
-            ["uv", "uv"],
-        ),
-        (
-            "REPAIRED_WHEEL_COUNT",
-            "0",
-            "Expected exactly one repaired wheel, found 0.",
-            ["uv", "uv", "uvx"],
-        ),
-        (
-            "REPAIRED_WHEEL_COUNT",
-            "2",
-            "Expected exactly one repaired wheel, found 2.",
-            ["uv", "uv", "uvx"],
-        ),
-    ),
+    ("stage", "expected_tools"),
+    (("raw", ["uv", "uv"]), ("repaired", ["uv", "uv", "uvx"])),
 )
-def test_build_wheel_rejects_ambiguous_artifact_count(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
-    variable: str,
-    count: str,
-    message: str,
+@pytest.mark.parametrize("count", (0, 2))
+def test_build_wheel_rejects_invalid_artifact_count(
+    wheel_project: Path,
+    wheel_dir: Path,
+    stage: str,
     expected_tools: list[str],
+    count: int,
 ) -> None:
-    """Reject missing or ambiguous artifacts without replacing the destination."""
-
-    wheel_dir = tmp_path / "dist"
-    wheel_dir.mkdir()
-    old_wheel = wheel_dir / "fast_gpu_asr-known-good.whl"
-    old_wheel.write_bytes(b"known-good")
+    original_files = read_files(wheel_dir)
 
     result, commands = run_build_wheel(
-        wheel_dir, fake_wheel_toolchain, **{variable: count}
+        wheel_project, (str(wheel_dir),), **{f"{stage.upper()}_WHEEL_COUNT": str(count)}
     )
 
     assert result.returncode == 1
-    assert result.stderr == message + "\n"
+    assert result.stderr == f"Expected exactly one {stage} wheel, found {count}.\n"
     assert [command["tool"] for command in commands] == expected_tools
-    assert old_wheel.read_bytes() == b"known-good"
-    assert [path.name for path in wheel_dir.glob("*.whl")] == [old_wheel.name]
+    assert read_files(wheel_dir) == original_files
     assert not list(wheel_dir.glob(".build-wheel.*"))
 
 
-def test_build_wheel_uses_default_output_directory(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
+@pytest.mark.parametrize(
+    "arguments", ((), ("wheel output",)), ids=("default", "relative")
+)
+def test_build_wheel_resolves_output_directory(
+    wheel_project: Path, arguments: tuple[str, ...]
 ) -> None:
-    """Publish to the repository's ``dist`` directory when no path is given."""
-
-    repository_dir = tmp_path / "repository"
-    script_path = create_minimal_repository(repository_dir)
-    wheel_dir = repository_dir / "dist"
-
-    result, commands = run_build_wheel(
-        wheel_dir,
-        fake_wheel_toolchain,
-        script_path=script_path,
-        script_arguments=(),
-        working_directory=tmp_path,
+    destination = (
+        wheel_project.parent / arguments[0] if arguments else wheel_project / "dist"
     )
 
-    assert result.returncode == 0, result.stderr
-    assert [path.name for path in wheel_dir.glob("*.whl")] == [
-        "fast_gpu_asr-0-py3-none-manylinux_2_27_x86_64.whl"
-    ]
-    assert commands[0]["cwd"] == str(repository_dir)
-    assert not list(wheel_dir.glob(".build-wheel.*"))
-
-
-def test_build_wheel_resolves_relative_output_from_caller_directory(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
-) -> None:
-    """Resolve a relative output path from the caller and create it safely."""
-
-    caller_dir = tmp_path / "caller"
-    caller_dir.mkdir()
-    wheel_dir = caller_dir / "wheel output"
-
-    result, _ = run_build_wheel(
-        wheel_dir,
-        fake_wheel_toolchain,
-        script_arguments=(wheel_dir.name,),
-        working_directory=caller_dir,
-    )
+    result, commands = run_build_wheel(wheel_project, arguments)
 
     assert result.returncode == 0, result.stderr
-    assert [path.name for path in wheel_dir.glob("*.whl")] == [
-        "fast_gpu_asr-0-py3-none-manylinux_2_27_x86_64.whl"
-    ]
-    assert not list(wheel_dir.glob(".build-wheel.*"))
+    assert read_files(destination) == {REPAIRED_WHEEL: b"repaired wheel"}
+    assert commands[0]["cwd"] == str(wheel_project)
+    assert not list(destination.glob(".build-wheel.*"))
+
+
+def test_build_wheel_rejects_output_path_that_is_a_file(wheel_project: Path) -> None:
+    destination = wheel_project.parent / "dist"
+    destination.write_bytes(b"keep")
+
+    result, commands = run_build_wheel(wheel_project, (str(destination),))
+
+    assert result.returncode != 0
+    assert commands == []
+    assert destination.read_bytes() == b"keep"
 
 
 def test_build_wheel_preserves_destination_when_source_copy_fails(
-    tmp_path: Path,
-    fake_wheel_toolchain: tuple[Path, Path],
+    wheel_project: Path, wheel_dir: Path
 ) -> None:
-    """Clean temporary files without replacing a wheel after a copy failure."""
+    (wheel_project / "README.md").unlink()
+    original_files = read_files(wheel_dir)
 
-    repository_dir = tmp_path / "repository"
-    script_path = create_minimal_repository(repository_dir, include_readme=False)
-    wheel_dir = repository_dir / "dist"
-    wheel_dir.mkdir()
-    old_wheel = wheel_dir / "fast_gpu_asr-known-good.whl"
-    old_wheel.write_bytes(b"known-good")
-
-    result, commands = run_build_wheel(
-        wheel_dir,
-        fake_wheel_toolchain,
-        script_path=script_path,
-        script_arguments=(),
-    )
+    result, commands = run_build_wheel(wheel_project, (str(wheel_dir),))
 
     assert result.returncode != 0
     assert "README.md" in result.stderr
     assert [command["tool"] for command in commands] == ["uv"]
-    assert old_wheel.read_bytes() == b"known-good"
-    assert [path.name for path in wheel_dir.glob("*.whl")] == [old_wheel.name]
+    assert read_files(wheel_dir) == original_files
     assert not list(wheel_dir.glob(".build-wheel.*"))
 
 
 @pytest.mark.parametrize("arguments", (("",), ("one", "two")))
-def test_build_wheel_rejects_invalid_arguments(arguments: tuple[str, ...]) -> None:
-    """Reject empty or ambiguous output arguments before touching the filesystem."""
+def test_build_wheel_rejects_invalid_arguments(
+    wheel_project: Path, arguments: tuple[str, ...]
+) -> None:
+    original_files = read_files(wheel_project.parent)
 
-    result = subprocess.run(
-        (str(SCRIPT_PATH), *arguments),
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=COMMAND_TIMEOUT_SECONDS,
-    )
+    result, commands = run_build_wheel(wheel_project, arguments)
 
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr == "Usage: build_wheel.sh [wheel-directory]\n"
+    assert commands == []
+    assert read_files(wheel_project.parent) == original_files

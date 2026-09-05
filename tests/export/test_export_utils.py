@@ -5,6 +5,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import onnx
 import pytest
@@ -17,210 +18,199 @@ from fast_gpu_asr.export.export_utils import (
     remove_onnx_artifacts,
 )
 
-PROFILE_SHAPES = ((1, 1), (1, 2), (1, 3))
-SERIALIZED_ENGINE = b"serialized engine"
-
-
-class FakeTensorRTInput:
-    """One fake TensorRT network input."""
-
-    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
-        self.name = name
-        self.shape = shape
-
-
-class FakeTensorRTProfile:
-    """Record optimization-profile shape requests."""
-
-    def __init__(self) -> None:
-        self.shapes: list[
-            tuple[
-                str,
-                tuple[int, ...],
-                tuple[int, ...],
-                tuple[int, ...],
-            ]
-        ] = []
-        self.accept_shapes = True
-
-    def set_shape(
-        self,
-        name: str,
-        min_shape: tuple[int, ...],
-        opt_shape: tuple[int, ...],
-        max_shape: tuple[int, ...],
-    ) -> bool:
-        self.shapes.append((name, min_shape, opt_shape, max_shape))
-        return self.accept_shapes
-
-
-class FakeTensorRTConfig:
-    """Record builder configuration without loading TensorRT."""
-
-    def __init__(self) -> None:
-        self.engine_capability: int | None = None
-        self.tactic_sources: int | None = None
-        self.accept_tactic_sources = True
-        self.flags: list[int] = []
-        self.preview_features: list[tuple[int, bool]] = []
-        self.builder_optimization_level: int | None = None
-        self.profiles: list[FakeTensorRTProfile] = []
-
-    def set_tactic_sources(self, sources: int) -> bool:
-        self.tactic_sources = sources
-        return self.accept_tactic_sources
-
-    def set_flag(self, flag: int) -> None:
-        self.flags.append(flag)
-
-    def set_preview_feature(self, feature: int, enabled: bool) -> None:
-        self.preview_features.append((feature, enabled))
-
-    def add_optimization_profile(self, profile: FakeTensorRTProfile) -> int:
-        self.profiles.append(profile)
-        return len(self.profiles) - 1
+PROFILE_SHAPES = ((8, 1), (8, 2), (8, 3))
 
 
 @pytest.fixture
-def fake_tensorrt_builder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> SimpleNamespace:
-    """Replace TensorRT's parser and builder with observable CPU fakes."""
+def fake_tensorrt(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Record builder calls without invoking TensorRT or requiring a GPU.
 
-    state = SimpleNamespace(
-        inputs=[],
-        parse_result=True,
-        parse_errors=["parser error"],
-        plugin_result=True,
-        serialized_engine=SERIALIZED_ENGINE,
-        network_flags=None,
-        loaded_plugins=0,
-        events=[],
-    )
-    state.network = SimpleNamespace(
-        num_inputs=0,
-        get_input=lambda index: state.inputs[index],
-    )
-    state.profile = FakeTensorRTProfile()
-    state.config = FakeTensorRTConfig()
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Restores patched TensorRT bindings and plugin loading after the test.
 
-    class FakeLogger:
-        INFO = 1
+    Returns
+    -------
+    SimpleNamespace
+        Configurable builder, parser, profile, and plugin-loader mocks, plus
+        a shared call trace for asserting export operation order.
+    """
 
-        def __init__(self, severity: int) -> None:
-            self.severity = severity
-
-    class FakeParser:
-        def __init__(self, network: object, logger: FakeLogger) -> None:
-            state.parser_args = (network, logger)
-
-        @property
-        def num_errors(self) -> int:
-            return len(state.parse_errors)
-
-        def parse_from_file(self, path: str) -> bool:
-            state.events.append("parse")
-            state.parsed_path = path
-            return state.parse_result
-
-        def get_error(self, index: int) -> str:
-            return state.parse_errors[index]
-
-    class FakeBuilder:
-        def __init__(self, logger: FakeLogger) -> None:
-            state.logger = logger
-
-        def create_network(self, flags: int) -> object:
-            state.network_flags = flags
-            state.network.num_inputs = len(state.inputs)
-            return state.network
-
-        def create_builder_config(self) -> FakeTensorRTConfig:
-            return state.config
-
-        def create_optimization_profile(self) -> FakeTensorRTProfile:
-            return state.profile
-
-        def build_serialized_network(
-            self,
-            network: object,
-            config: FakeTensorRTConfig,
-        ) -> bytes | None:
-            state.events.append("build")
-            state.built = (network, config)
-            return state.serialized_engine
-
-    def initialize_standard_plugins(logger: FakeLogger, namespace: str) -> bool:
-        state.events.append("standard_plugins")
-        state.standard_plugin_args = (logger, namespace)
-        return state.plugin_result
-
-    fake_trt = SimpleNamespace(
-        Builder=FakeBuilder,
+    network = Mock(num_inputs=1)
+    network.get_input.return_value = SimpleNamespace(name="audio", shape=(8, -1))
+    profile = Mock()
+    profile.set_shape.return_value = None
+    config = Mock()
+    config.set_tactic_sources.return_value = True
+    config.add_optimization_profile.return_value = 0
+    parser = Mock(num_errors=2)
+    parser.parse_from_file.return_value = True
+    parser.get_error.side_effect = ["first", "second"].__getitem__
+    builder = Mock()
+    builder.create_network.return_value = network
+    builder.create_builder_config.return_value = config
+    builder.create_optimization_profile.return_value = profile
+    builder.build_serialized_network.return_value = b"serialized engine"
+    load_plugins = Mock(return_value=None)
+    trt = SimpleNamespace(
+        Builder=Mock(return_value=builder),
         BuilderFlag=SimpleNamespace(TF32=10, SPARSE_WEIGHTS=11, FP16=12, BF16=13),
         EngineCapability=SimpleNamespace(STANDARD=20),
-        Logger=FakeLogger,
+        Logger=Mock(INFO=1),
         NetworkDefinitionCreationFlag=SimpleNamespace(PREFER_AOT_PYTHON_PLUGINS=2),
-        OnnxParser=FakeParser,
+        OnnxParser=Mock(return_value=parser),
         PreviewFeature=SimpleNamespace(ALIASED_PLUGIN_IO_10_03=30),
         TacticSource=SimpleNamespace(__members__={"A": 0, "B": 2}),
-        init_libnvinfer_plugins=initialize_standard_plugins,
+        init_libnvinfer_plugins=Mock(return_value=True),
     )
-    monkeypatch.setattr(export_utils, "trt", fake_trt)
-
-    def load_plugins() -> None:
-        state.loaded_plugins += 1
-        state.events.append("custom_plugins")
-
+    pipeline = Mock()
+    for name, operation in (
+        ("initialize", trt.init_libnvinfer_plugins),
+        ("load_plugins", load_plugins),
+        ("parse", parser.parse_from_file),
+        ("set_shape", profile.set_shape),
+        ("add_profile", config.add_optimization_profile),
+        ("build", builder.build_serialized_network),
+    ):
+        pipeline.attach_mock(operation, name)
+    monkeypatch.setattr(export_utils, "trt", trt)
     monkeypatch.setattr(export_utils, "load_tensorrt_plugins", load_plugins)
-    return state
+    return SimpleNamespace(
+        trt=trt,
+        network=network,
+        profile=profile,
+        config=config,
+        parser=parser,
+        builder=builder,
+        load_plugins=load_plugins,
+        pipeline=pipeline,
+    )
 
 
-def write_external_onnx(path: Path, *locations: str) -> None:
-    """Write a minimal ONNX graph referencing the requested external tensors."""
+@pytest.fixture
+def build_paths(tmp_path: Path) -> tuple[Path, Path]:
+    """Create an ONNX source and a prior engine for artifact-lifecycle checks.
 
-    tensors = []
-    for index, location in enumerate(locations):
-        tensor = TensorProto(
+    Parameters
+    ----------
+    tmp_path : Path
+        Per-test temporary directory.
+
+    Returns
+    -------
+    tuple[Path, Path]
+        ONNX source and existing engine paths with distinct sentinel contents.
+    """
+
+    onnx_path, engine_path = tmp_path / "model.onnx", tmp_path / "model.trt"
+    onnx_path.write_bytes(b"onnx graph")
+    engine_path.write_bytes(b"stale engine")
+    return onnx_path, engine_path
+
+
+def assert_build_artifacts_unchanged(paths: tuple[Path, Path]) -> None:
+    """Check that a failed build preserved both its input and the prior engine.
+
+    Parameters
+    ----------
+    paths : tuple[Path, Path]
+        Source and engine paths created by ``build_paths``.
+    """
+
+    assert paths[0].read_bytes() == b"onnx graph"
+    assert paths[1].read_bytes() == b"stale engine"
+
+
+def write_onnx(path: Path, locations=(), metadata=()) -> None:
+    """Write external initializers with location and optional offset/length metadata.
+
+    Parameters
+    ----------
+    path : Path
+        Destination ONNX graph path; parent directories must already exist.
+    locations : iterable[str]
+        External-data locations, one per initializer. No data files are created.
+    metadata : iterable[tuple[str, str]]
+        Extra external-data entries shared by all initializers, such as byte
+        offsets and lengths. These are metadata, not additional file paths.
+    """
+
+    tensors = [
+        TensorProto(
             name=f"weight_{index}",
             data_type=TensorProto.FLOAT,
             dims=[1],
+            data_location=TensorProto.EXTERNAL,
+            external_data=[
+                onnx.StringStringEntryProto(key=key, value=value)
+                for key, value in (("location", location), *metadata)
+            ],
         )
-        tensor.data_location = TensorProto.EXTERNAL
-        external_entry = tensor.external_data.add()
-        external_entry.key = "location"
-        external_entry.value = location
-        tensors.append(tensor)
+        for index, location in enumerate(locations)
+    ]
     graph = helper.make_graph((), "external", (), (), initializer=tensors)
     onnx.save_model(helper.make_model(graph), path)
 
 
-def test_remove_onnx_artifacts_removes_graph_and_nested_external_data(
-    tmp_path: Path,
-) -> None:
-    """Delete the graph and every nested external-data file it references."""
-
+def test_remove_onnx_artifacts_removes_only_referenced_data(tmp_path: Path) -> None:
     onnx_path = tmp_path / "model.onnx"
-    external_paths = (
-        tmp_path / "weights" / "model.data",
-        tmp_path / "weights" / "scales.data",
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    external_paths = [weights / "model.data", weights / "scales.data"]
+    keep_paths = [weights / "keep.data", tmp_path / "0", tmp_path / "4"]
+    for path in external_paths:
+        path.write_bytes(b"weights")
+    for path in keep_paths:
+        path.write_bytes(b"keep")
+    write_onnx(
+        onnx_path,
+        ("weights/model.data", "weights/scales.data", "weights/model.data"),
+        (("offset", "0"), ("length", "4")),
     )
-    external_paths[0].parent.mkdir()
-    for external_path in external_paths:
-        external_path.write_bytes(b"weights")
-    write_external_onnx(onnx_path, "weights/model.data", "weights/scales.data")
 
     remove_onnx_artifacts(onnx_path)
 
     assert not onnx_path.exists()
-    assert all(not external_path.exists() for external_path in external_paths)
+    assert all(not path.exists() for path in external_paths)
+    assert all(path.read_bytes() == b"keep" for path in keep_paths)
 
 
-def test_remove_onnx_artifacts_tolerates_missing_external_data(tmp_path: Path) -> None:
-    """Remove a valid graph when an external-data artifact is already absent."""
-
+def test_remove_onnx_artifacts_removes_attribute_external_data(tmp_path: Path) -> None:
     onnx_path = tmp_path / "model.onnx"
-    write_external_onnx(onnx_path, "missing.data")
+    external_path = tmp_path / "constant.data"
+    external_path.write_bytes(b"constant")
+    tensor = TensorProto(
+        name="constant",
+        data_type=TensorProto.FLOAT,
+        dims=[1],
+        data_location=TensorProto.EXTERNAL,
+        external_data=[
+            onnx.StringStringEntryProto(key="location", value="constant.data")
+        ],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Constant", (), ("output",), value=tensor)],
+        "attribute-external",
+        (),
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+    )
+    onnx.save_model(helper.make_model(graph), onnx_path)
+
+    remove_onnx_artifacts(onnx_path)
+
+    assert not onnx_path.exists()
+    assert not external_path.exists()
+
+
+@pytest.mark.parametrize(
+    "locations", ((), ("missing.data",)), ids=("no-external-data", "missing")
+)
+def test_remove_onnx_artifacts_without_external_files(
+    tmp_path: Path, locations
+) -> None:
+    onnx_path = tmp_path / "model.onnx"
+    write_onnx(onnx_path, locations)
 
     remove_onnx_artifacts(onnx_path)
 
@@ -228,8 +218,6 @@ def test_remove_onnx_artifacts_tolerates_missing_external_data(tmp_path: Path) -
 
 
 def test_remove_onnx_artifacts_removes_malformed_graph(tmp_path: Path) -> None:
-    """Remove the graph in a finally block while preserving parse diagnostics."""
-
     onnx_path = tmp_path / "model.onnx"
     onnx_path.write_bytes(b"not an ONNX graph")
 
@@ -240,236 +228,406 @@ def test_remove_onnx_artifacts_removes_malformed_graph(tmp_path: Path) -> None:
 
 
 def test_remove_onnx_artifacts_reports_missing_graph(tmp_path: Path) -> None:
-    """Do not silently treat an absent ONNX graph as a successful cleanup."""
-
     with pytest.raises(FileNotFoundError):
         remove_onnx_artifacts(tmp_path / "missing.onnx")
 
 
+@pytest.mark.parametrize("location", ("", "../outside.data"), ids=("empty", "parent"))
+def test_remove_onnx_artifacts_rejects_unsafe_location(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    outside_path = tmp_path / "outside.data"
+    outside_path.write_bytes(b"keep")
+    onnx_path = model_dir / "model.onnx"
+    write_onnx(onnx_path, (location,))
+
+    with pytest.raises(ValueError, match="Unsafe ONNX external-data location"):
+        remove_onnx_artifacts(onnx_path)
+
+    assert outside_path.read_bytes() == b"keep"
+    assert not onnx_path.exists()
+
+
+@pytest.mark.parametrize("inside", (False, True), ids=("outside", "inside"))
+def test_remove_onnx_artifacts_rejects_absolute_location(
+    tmp_path: Path,
+    inside: bool,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    external_path = (model_dir if inside else tmp_path) / "weights.data"
+    external_path.write_bytes(b"keep")
+    onnx_path = model_dir / "model.onnx"
+    write_onnx(onnx_path, (str(external_path),))
+
+    with pytest.raises(ValueError, match="Unsafe ONNX external-data location"):
+        remove_onnx_artifacts(onnx_path)
+
+    assert external_path.read_bytes() == b"keep"
+    assert not onnx_path.exists()
+
+
+@pytest.mark.parametrize("symlink_kind", ("parent", "file"))
+def test_remove_onnx_artifacts_rejects_symlink_escape(
+    tmp_path: Path,
+    symlink_kind: str,
+) -> None:
+    model_dir, outside_dir = tmp_path / "model", tmp_path / "outside"
+    model_dir.mkdir()
+    outside_dir.mkdir()
+    outside_path = outside_dir / "weights.data"
+    outside_path.write_bytes(b"keep")
+    if symlink_kind == "parent":
+        (model_dir / "weights").symlink_to(outside_dir, target_is_directory=True)
+        location = "weights/weights.data"
+    else:
+        (model_dir / "weights.data").symlink_to(outside_path)
+        location = "weights.data"
+    onnx_path = model_dir / "model.onnx"
+    write_onnx(onnx_path, (location,))
+
+    with pytest.raises(ValueError, match="Unsafe ONNX external-data location"):
+        remove_onnx_artifacts(onnx_path)
+
+    assert outside_path.read_bytes() == b"keep"
+    assert not onnx_path.exists()
+
+
+def test_remove_onnx_artifacts_removes_graph_when_external_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    external_directory = tmp_path / "weights"
+    external_directory.mkdir()
+    onnx_path = tmp_path / "model.onnx"
+    write_onnx(onnx_path, (external_directory.name,))
+
+    with pytest.raises(IsADirectoryError):
+        remove_onnx_artifacts(onnx_path)
+
+    assert external_directory.is_dir()
+    assert not onnx_path.exists()
+
+
 def test_build_tensorrt_engine_configures_dynamic_network(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
 ) -> None:
-    """Apply every builder policy and serialize one accepted dynamic profile."""
-
-    fake_tensorrt_builder.inputs[:] = [
-        FakeTensorRTInput("audio", (-1, -1)),
-        FakeTensorRTInput("lengths", (8,)),
+    fake = fake_tensorrt
+    inputs = [
+        SimpleNamespace(name="audio", shape=(8, -1)),
+        SimpleNamespace(name="features", shape=(8, -1, 80)),
+        SimpleNamespace(name="lengths", shape=(8,)),
     ]
-    profiles = {"audio": ((1, 1600), (8, 16_000), (8, 640_000))}
-    onnx_path = tmp_path / "encoder.onnx"
-    engine_path = tmp_path / "encoder.trt"
+    fake.network.num_inputs = len(inputs)
+    fake.network.get_input.side_effect = inputs.__getitem__
+    profiles = {
+        "audio": PROFILE_SHAPES,
+        "features": ((8, 1, 80), (8, 10, 80), (8, 100, 80)),
+    }
 
-    build_tensorrt_engine(onnx_path, engine_path, profiles, 5)
+    def serialize(network, config):
+        """Check builder policies before serialization can observe them.
 
-    config = fake_tensorrt_builder.config
-    assert fake_tensorrt_builder.loaded_plugins == 1
-    assert fake_tensorrt_builder.events == [
-        "standard_plugins",
-        "custom_plugins",
-        "parse",
-        "build",
+        Parameters
+        ----------
+        network : Mock
+            Parsed network passed to the fake builder.
+        config : Mock
+            Configuration that must already contain all requested policies.
+
+        Returns
+        -------
+        bytes
+            Sentinel serialized engine contents.
+        """
+
+        assert network is fake.network
+        assert config is fake.config
+        assert config.engine_capability == 20
+        config.set_tactic_sources.assert_called_once_with((1 << 0) | (1 << 2))
+        config.set_flag.assert_has_calls(
+            [call(flag) for flag in (10, 11, 12, 13)], any_order=True
+        )
+        assert config.set_flag.call_count == 4
+        config.set_preview_feature.assert_called_once_with(30, True)
+        assert config.builder_optimization_level == 5
+        return b"serialized engine"
+
+    fake.builder.build_serialized_network.side_effect = serialize
+
+    build_tensorrt_engine(*build_paths, profiles, 5)
+
+    fake.trt.Logger.assert_called_once_with(1)
+    fake.trt.Builder.assert_called_once_with(fake.trt.Logger.return_value)
+    fake.trt.OnnxParser.assert_called_once_with(
+        fake.network, fake.trt.Logger.return_value
+    )
+    fake.builder.create_network.assert_called_once_with(1 << 2)
+    fake.builder.create_optimization_profile.assert_called_once_with()
+    assert fake.pipeline.mock_calls == [
+        call.initialize(fake.trt.Logger.return_value, ""),
+        call.load_plugins(),
+        call.parse(str(build_paths[0])),
+        *(call.set_shape(name, *shapes) for name, shapes in profiles.items()),
+        call.add_profile(fake.profile),
+        call.build(fake.network, fake.config),
     ]
-    assert fake_tensorrt_builder.standard_plugin_args == (
-        fake_tensorrt_builder.logger,
-        "",
-    )
-    assert fake_tensorrt_builder.parser_args == (
-        fake_tensorrt_builder.network,
-        fake_tensorrt_builder.logger,
-    )
-    assert fake_tensorrt_builder.parsed_path == str(onnx_path)
-    assert fake_tensorrt_builder.built == (
-        fake_tensorrt_builder.network,
-        config,
-    )
-    assert fake_tensorrt_builder.network_flags == 1 << 2
-    assert config.engine_capability == 20
-    assert config.tactic_sources == (1 << 0) | (1 << 2)
-    assert config.flags == [10, 11, 12, 13]
-    assert config.preview_features == [(30, True)]
-    assert config.builder_optimization_level == 5
-    assert config.profiles == [fake_tensorrt_builder.profile]
-    assert fake_tensorrt_builder.profile.shapes == [
-        ("audio", (1, 1600), (8, 16_000), (8, 640_000))
-    ]
-    assert engine_path.read_bytes() == SERIALIZED_ENGINE
+    assert build_paths[0].read_bytes() == b"onnx graph"
+    assert build_paths[1].read_bytes() == b"serialized engine"
 
 
+@pytest.mark.parametrize("optimization_level", (0, 3))
 def test_build_tensorrt_engine_accepts_fully_static_network(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+    optimization_level: int,
 ) -> None:
-    """Avoid adding a meaningless optimization profile to a static graph."""
+    fake = fake_tensorrt
+    fake.network.get_input.return_value.shape = (8, 3)
 
-    fake_tensorrt_builder.inputs[:] = [FakeTensorRTInput("tokens", (6, 2))]
-    engine_path = tmp_path / "decoder.trt"
-    engine_path.write_bytes(b"stale engine")
+    build_tensorrt_engine(*build_paths, {}, optimization_level)
 
-    build_tensorrt_engine(
-        tmp_path / "decoder.onnx",
-        engine_path,
-        {},
-        3,
-    )
-
-    assert fake_tensorrt_builder.config.profiles == []
-    assert fake_tensorrt_builder.profile.shapes == []
-    assert engine_path.read_bytes() == SERIALIZED_ENGINE
+    assert fake.config.builder_optimization_level == optimization_level
+    fake.builder.create_optimization_profile.assert_not_called()
+    fake.config.add_optimization_profile.assert_not_called()
+    assert build_paths[0].read_bytes() == b"onnx graph"
+    assert build_paths[1].read_bytes() == b"serialized engine"
 
 
-@pytest.mark.parametrize("missing_flag", ("FP16", "BF16"), ids=("fp16", "bf16"))
+@pytest.mark.parametrize("missing_flag", ("FP16", "BF16"))
 def test_build_tensorrt_engine_uses_available_precision_flags(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
     missing_flag: str,
 ) -> None:
-    """Remain compatible with TensorRT releases lacking one precision flag."""
+    fake = fake_tensorrt
+    flags = vars(fake.trt.BuilderFlag).copy()
+    flags.pop(missing_flag)
+    delattr(fake.trt.BuilderFlag, missing_flag)
 
-    delattr(export_utils.trt.BuilderFlag, missing_flag)
+    build_tensorrt_engine(*build_paths, {"audio": PROFILE_SHAPES}, 3)
 
-    build_tensorrt_engine(
-        tmp_path / "decoder.onnx",
-        tmp_path / "decoder.trt",
-        {},
-        3,
+    fake.config.set_flag.assert_has_calls(
+        [call(flag) for flag in flags.values()], any_order=True
     )
+    assert fake.config.set_flag.call_count == len(flags)
 
-    expected_flags = {
-        name: value
-        for name, value in {
-            "TF32": 10,
-            "SPARSE_WEIGHTS": 11,
-            "FP16": 12,
-            "BF16": 13,
-        }.items()
-        if name != missing_flag
-    }
-    assert fake_tensorrt_builder.config.flags == list(expected_flags.values())
+
+@pytest.mark.parametrize("optimization_level", (-1, 6, 1.5))
+def test_build_tensorrt_engine_rejects_invalid_optimization_level_before_setup(
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+    optimization_level: float | int,
+) -> None:
+    with pytest.raises(ValueError, match="integer from 0 through 5"):
+        build_tensorrt_engine(*build_paths, {}, optimization_level)
+
+    fake_tensorrt.trt.Logger.assert_not_called()
+    assert fake_tensorrt.pipeline.mock_calls == []
+    assert_build_artifacts_unchanged(build_paths)
 
 
 def test_build_tensorrt_engine_requires_plugin_initialization(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
 ) -> None:
-    """Fail before parsing when TensorRT cannot initialize plugin creators."""
-
-    fake_tensorrt_builder.plugin_result = False
+    fake_tensorrt.trt.init_libnvinfer_plugins.return_value = False
 
     with pytest.raises(RuntimeError, match="initialize TensorRT plugins"):
-        build_tensorrt_engine(
-            tmp_path / "model.onnx",
-            tmp_path / "model.trt",
-            {},
-            5,
-        )
+        build_tensorrt_engine(*build_paths, {}, 5)
 
-    assert fake_tensorrt_builder.loaded_plugins == 0
-    assert fake_tensorrt_builder.events == ["standard_plugins"]
-    assert not (tmp_path / "model.trt").exists()
+    fake_tensorrt.load_plugins.assert_not_called()
+    fake_tensorrt.parser.parse_from_file.assert_not_called()
+    fake_tensorrt.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
+
+
+def test_build_tensorrt_engine_propagates_custom_plugin_failure_before_parse(
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+) -> None:
+    fake_tensorrt.load_plugins.side_effect = RuntimeError("custom plugin failed")
+
+    with pytest.raises(RuntimeError, match="custom plugin failed"):
+        build_tensorrt_engine(*build_paths, {}, 5)
+
+    fake_tensorrt.parser.parse_from_file.assert_not_called()
+    fake_tensorrt.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
 
 
 def test_build_tensorrt_engine_reports_every_parser_error(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
 ) -> None:
-    """Preserve all TensorRT ONNX diagnostics when parsing fails."""
+    fake_tensorrt.parser.parse_from_file.return_value = False
 
-    fake_tensorrt_builder.parse_result = False
-    fake_tensorrt_builder.parse_errors[:] = ["first", "second"]
+    with pytest.raises(RuntimeError) as error:
+        build_tensorrt_engine(*build_paths, {}, 5)
 
-    with pytest.raises(RuntimeError, match="first\nsecond"):
-        build_tensorrt_engine(
-            tmp_path / "model.onnx",
-            tmp_path / "model.trt",
-            {},
-            5,
-        )
-
-    assert fake_tensorrt_builder.events == [
-        "standard_plugins",
-        "custom_plugins",
-        "parse",
-    ]
-    assert not (tmp_path / "model.trt").exists()
+    assert str(error.value) == f"Failed to parse {build_paths[0]}:\nfirst\nsecond"
+    fake_tensorrt.builder.create_builder_config.assert_not_called()
+    fake_tensorrt.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
 
 
 @pytest.mark.parametrize(
-    ("inputs", "profiles"),
+    ("input_shape", "profiles"),
     (
-        ((("audio", (-1, -1)),), {}),
-        (
-            (("audio", (-1, -1)),),
-            {"audio": PROFILE_SHAPES, "extra": PROFILE_SHAPES},
-        ),
-        ((("tokens", (6, 2)),), {"tokens": PROFILE_SHAPES}),
+        ((8, -1), {}),
+        ((8, -1), {"audio": PROFILE_SHAPES, "extra": PROFILE_SHAPES}),
+        ((8, -1), {"other": PROFILE_SHAPES}),
+        ((8, 3), {"audio": PROFILE_SHAPES}),
     ),
-    ids=("missing", "extra", "static"),
+    ids=("missing", "extra", "wrong-name", "static"),
 )
 def test_build_tensorrt_engine_requires_exact_dynamic_profile_names(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
-    inputs: tuple[tuple[str, tuple[int, ...]], ...],
-    profiles: dict[
-        str,
-        tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
-    ],
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+    input_shape,
+    profiles,
 ) -> None:
-    """Reject missing, extra, and static-input profile entries."""
-
-    fake_tensorrt_builder.inputs[:] = [
-        FakeTensorRTInput(name, shape) for name, shape in inputs
-    ]
+    fake = fake_tensorrt
+    fake.network.get_input.return_value.shape = input_shape
 
     with pytest.raises(ValueError, match="Expected TensorRT profiles"):
-        build_tensorrt_engine(
-            tmp_path / "model.onnx",
-            tmp_path / "model.trt",
-            profiles,
-            5,
-        )
+        build_tensorrt_engine(*build_paths, profiles, 5)
 
-    assert fake_tensorrt_builder.config.profiles == []
-    assert not (tmp_path / "model.trt").exists()
+    fake.builder.create_optimization_profile.assert_not_called()
+    fake.config.add_optimization_profile.assert_not_called()
+    fake.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
 
 
-@pytest.mark.parametrize(
-    (
-        "accept_tactic_sources",
-        "accept_profile_shapes",
-        "serialized_engine",
-        "exception_type",
-        "message",
-    ),
-    (
-        (False, True, SERIALIZED_ENGINE, RuntimeError, "rejected tactic source mask"),
-        (True, False, SERIALIZED_ENGINE, ValueError, "Invalid TensorRT profile"),
-        (True, True, None, RuntimeError, "Failed to build TensorRT engine"),
-    ),
-    ids=("tactic-sources", "profile-shape", "serialization"),
-)
-def test_build_tensorrt_engine_rejects_builder_failures(
-    tmp_path: Path,
-    fake_tensorrt_builder: SimpleNamespace,
-    accept_tactic_sources: bool,
-    accept_profile_shapes: bool,
-    serialized_engine: bytes | None,
-    exception_type: type[Exception],
-    message: str,
+def test_build_tensorrt_engine_rejects_optimization_profile(
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
 ) -> None:
-    """Surface each failure reported by TensorRT's builder interfaces."""
+    fake = fake_tensorrt
+    fake.config.add_optimization_profile.return_value = -1
 
-    fake_tensorrt_builder.inputs[:] = [FakeTensorRTInput("audio", (-1, -1))]
-    fake_tensorrt_builder.config.accept_tactic_sources = accept_tactic_sources
-    fake_tensorrt_builder.profile.accept_shapes = accept_profile_shapes
-    fake_tensorrt_builder.serialized_engine = serialized_engine
+    with pytest.raises(ValueError, match="rejected optimization profile"):
+        build_tensorrt_engine(*build_paths, {"audio": PROFILE_SHAPES}, 5)
 
-    with pytest.raises(exception_type, match=message):
-        build_tensorrt_engine(
-            tmp_path / "model.onnx",
-            tmp_path / "model.trt",
-            {"audio": PROFILE_SHAPES},
-            5,
-        )
+    fake.profile.set_shape.assert_called_once_with("audio", *PROFILE_SHAPES)
+    fake.config.add_optimization_profile.assert_called_once_with(fake.profile)
+    fake.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
 
-    assert not (tmp_path / "model.trt").exists()
+
+def test_build_tensorrt_engine_rejects_tactic_source_mask(
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+) -> None:
+    fake = fake_tensorrt
+    fake.config.set_tactic_sources.return_value = False
+
+    with pytest.raises(RuntimeError, match="rejected tactic source mask"):
+        build_tensorrt_engine(*build_paths, {"audio": PROFILE_SHAPES}, 5)
+
+    fake.builder.create_optimization_profile.assert_not_called()
+    fake.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
+
+
+def test_build_tensorrt_engine_reports_invalid_profile_shape(
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+) -> None:
+    fake = fake_tensorrt
+    profile_error = ValueError("inconsistent dimensions")
+    fake.profile.set_shape.side_effect = profile_error
+
+    with pytest.raises(ValueError) as error:
+        build_tensorrt_engine(*build_paths, {"audio": PROFILE_SHAPES}, 5)
+
+    assert str(error.value) == (
+        "Invalid TensorRT profile for audio: "
+        f"{PROFILE_SHAPES[0]}, {PROFILE_SHAPES[1]}, {PROFILE_SHAPES[2]}."
+    )
+    assert error.value.__cause__ is profile_error
+    fake.profile.set_shape.assert_called_once_with("audio", *PROFILE_SHAPES)
+    fake.config.add_optimization_profile.assert_not_called()
+    fake.builder.build_serialized_network.assert_not_called()
+    assert_build_artifacts_unchanged(build_paths)
+
+
+def test_build_tensorrt_engine_preserves_existing_engine_when_build_fails(
+    build_paths,
+    fake_tensorrt: SimpleNamespace,
+) -> None:
+    fake = fake_tensorrt
+    fake.builder.build_serialized_network.return_value = None
+
+    with pytest.raises(RuntimeError, match="Failed to build TensorRT engine"):
+        build_tensorrt_engine(*build_paths, {"audio": PROFILE_SHAPES}, 5)
+
+    fake.builder.build_serialized_network.assert_called_once_with(
+        fake.network, fake.config
+    )
+    assert_build_artifacts_unchanged(build_paths)
+
+
+@pytest.mark.sm80
+@pytest.mark.parametrize("dynamic", (False, True), ids=("static", "dynamic"))
+@pytest.mark.parametrize(
+    ("onnx_dtype", "dtype"),
+    (
+        (TensorProto.FLOAT, "float32"),
+        (TensorProto.FLOAT16, "float16"),
+        (TensorProto.BFLOAT16, "bfloat16"),
+    ),
+    ids=("fp32", "fp16", "bf16"),
+)
+def test_build_tensorrt_engine_executes_real_network(
+    tmp_path: Path, dynamic: bool, onnx_dtype: int, dtype: str
+) -> None:
+    import cupy as cp
+    import tensorrt as trt
+
+    shape = (2, "samples" if dynamic else 3)
+    graph = helper.make_graph(
+        [helper.make_node("Add", ["audio", "audio"], ["output"])],
+        "double-audio",
+        [helper.make_tensor_value_info("audio", onnx_dtype, shape)],
+        [helper.make_tensor_value_info("output", onnx_dtype, shape)],
+    )
+    onnx_path, engine_path = tmp_path / "model.onnx", tmp_path / "model.trt"
+    onnx.save_model(
+        helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]),
+        onnx_path,
+    )
+    profiles = {"audio": ((2, 1), (2, 3), (2, 5))} if dynamic else {}
+
+    with cp.cuda.Device(0), cp.cuda.Stream(non_blocking=True) as stream:
+        build_tensorrt_engine(onnx_path, engine_path, profiles, 5)
+        runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+        engine = runtime.deserialize_cuda_engine(engine_path.read_bytes())
+        assert engine is not None
+        assert engine.num_optimization_profiles == 1
+        context = engine.create_execution_context()
+        assert context is not None
+        if dynamic:
+            assert (
+                tuple(
+                    tuple(dimensions)
+                    for dimensions in engine.get_tensor_profile_shape("audio", 0)
+                )
+                == profiles["audio"]
+            )
+
+        for samples in (1, 3, 5, 4, 1) if dynamic else (3,):
+            audio = cp.arange(2 * samples, dtype=cp.float32).reshape(2, samples)
+            expected = (audio * 2).astype(dtype)
+            audio = audio.astype(dtype)
+            assert context.set_input_shape("audio", audio.shape)
+            assert tuple(context.get_tensor_shape("output")) == audio.shape
+            output = cp.empty_like(audio)
+            assert context.set_tensor_address("audio", audio.data.ptr)
+            assert context.set_tensor_address("output", output.data.ptr)
+            assert context.execute_async_v3(stream.ptr)
+            stream.synchronize()
+            cp.testing.assert_array_equal(output, expected)

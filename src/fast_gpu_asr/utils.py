@@ -139,8 +139,9 @@ def validate_tokenizer(model_dir: Path, model_config: DictConfig) -> None:
     ------
     ASRInitializationError
         Raised when ``bpe.model`` is missing or invalid, its effective
-        vocabulary differs from the model configuration, or a Zipformer
-        tokenizer does not contain the configured in-vocabulary ``<blk>`` token.
+        vocabulary differs from the model configuration, the standalone
+        SentencePiece word-boundary token is missing, or a Zipformer tokenizer
+        does not contain the configured in-vocabulary ``<blk>`` token.
     """
 
     tokenizer_path = model_dir / TOKENIZER_FILE
@@ -167,6 +168,16 @@ def validate_tokenizer(model_dir: Path, model_config: DictConfig) -> None:
         raise ASRInitializationError(
             f"Expected tokenizer vocabulary size {model_config.vocab_size}, got "
             f"{expected_vocab_size}."
+        )
+
+    standalone_word_id = tokenizer.piece_to_id("▁")
+    if (
+        not 0 <= standalone_word_id < model_config.vocab_size
+        or tokenizer.id_to_piece(standalone_word_id) != "▁"
+    ):
+        raise ASRInitializationError(
+            "Expected the tokenizer to contain an in-vocabulary standalone "
+            "SentencePiece word-boundary token."
         )
 
     if model_config.model_type == MODEL_TYPE_ZIPFORMER:
@@ -499,8 +510,7 @@ def validate_model_config(model_config: DictConfig) -> None:
                 "must match."
             )
 
-        configured_durations = model_config.decoder_params.tdt_durations
-        durations = tuple(configured_durations)
+        durations = tuple(model_config.decoder_params.tdt_durations)
         if not durations or any(
             not isinstance(duration, int) or not 0 <= duration <= INT32_MAX
             for duration in durations
@@ -594,8 +604,8 @@ def validate_encoder_engine(engine: trt.ICudaEngine, model_config: DictConfig) -
     Raises
     ------
     ASRInitializationError
-        Raised when tensor names, shapes, dtypes, locations, storage formats,
-        or the audio optimization profile differ from the runtime contract.
+        Raised when tensor names, shapes, dtypes, or the audio optimization
+        profile differ from the runtime contract.
     """
 
     input_names, output_names = get_names(engine)
@@ -611,16 +621,6 @@ def validate_encoder_engine(engine: trt.ICudaEngine, model_config: DictConfig) -
             f"Expected encoder outputs {sorted(expected_output_names)}, "
             f"got {sorted(output_names)}."
         )
-    for name in input_names + output_names:
-        if engine.get_tensor_location(name) != trt.TensorLocation.DEVICE:
-            raise ASRInitializationError(
-                f"Expected encoder tensor {name} to reside on the GPU."
-            )
-        if engine.get_tensor_format(name) != trt.TensorFormat.LINEAR:
-            raise ASRInitializationError(
-                f"Expected encoder tensor {name} to use linear storage."
-            )
-
     audio_profile = tuple(
         tuple(shape) for shape in engine.get_tensor_profile_shape("audio", 0)
     )

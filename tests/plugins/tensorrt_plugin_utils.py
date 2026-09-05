@@ -8,24 +8,23 @@ from __future__ import annotations
 import ctypes
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+import cupy as cp
 import pytest
+import tensorrt_libs
+from cuda import pathfinder as cuda_pathfinder
 
 from fast_gpu_asr.tensorrt_plugins.constants import (
     CUDA_ARCHITECTURE_OPTIONS,
     NVCC_OPTIONS,
 )
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
 
 def compile_and_load_plugin(
     tmp_path_factory: pytest.TempPathFactory,
     source_name: str,
     initializer_name: str,
-    cuda_libraries: Sequence[str],
+    cuda_libraries: tuple[str, ...],
 ) -> ctypes.CDLL:
     """Compile, load, and initialize one plugin for the active CUDA device.
 
@@ -43,13 +42,13 @@ def compile_and_load_plugin(
         Plugin source filename in ``src/fast_gpu_asr/tensorrt_plugins``.
     initializer_name : str
         Exported registration function called after loading the library.
-    cuda_libraries : Sequence[str]
+    cuda_libraries : tuple[str, ...]
         CUDA libraries required by the plugin, such as ``cudart`` or ``cublas``.
 
     Returns
     -------
     ctypes.CDLL
-        Process-lifetime handle for the initialized plugin library.
+        Loaded library handle; retain it while TensorRT uses its creators or engines.
 
     Raises
     ------
@@ -57,33 +56,32 @@ def compile_and_load_plugin(
         Raised when the requested source, TensorRT library, or compiler output
         is missing.
     RuntimeError
-        Raised when CUDA headers are unavailable, the active compute capability
-        is malformed, compiler output is empty, or registration fails.
+        Raised when the CUDA compiler or headers are unavailable, the active
+        compute capability is malformed, compiler output is empty, or
+        registration fails.
     ValueError
         Raised when ``source_name`` is not a filename relative to the plugin
         source directory.
     """
 
-    source_dir = (
+    if Path(source_name).name != source_name:
+        raise ValueError(f"Plugin source must be a filename: {source_name}")
+
+    source_path = (
         Path(__file__).resolve().parents[2]
         / "src"
         / "fast_gpu_asr"
         / "tensorrt_plugins"
+        / source_name
     )
-    if Path(source_name).name != source_name:
-        raise ValueError(f"Plugin source must be a filename: {source_name}")
-    source_path = source_dir / source_name
     if not source_path.is_file():
         raise FileNotFoundError(f"Plugin source not found: {source_path}")
 
-    cuda_pathfinder = pytest.importorskip("cuda.pathfinder")
-    cp = pytest.importorskip("cupy")
-    pytest.importorskip("tensorrt")
-    tensorrt_libs = pytest.importorskip("tensorrt_libs")
-
     nvcc = cuda_pathfinder.find_nvidia_binary_utility("nvcc")
     if nvcc is None:
-        pytest.skip("nvcc is required to compile the native plugin test library.")
+        raise RuntimeError(
+            "nvcc is required to compile the native plugin test library."
+        )
 
     tensorrt_library_path = (
         Path(tensorrt_libs.__file__).resolve().parent / "libnvinfer.so.11"
@@ -97,9 +95,11 @@ def compile_and_load_plugin(
         include_dir = cuda_pathfinder.find_nvidia_header_directory(name)
         if include_dir is None:
             raise RuntimeError(f"CUDA headers for {name} were not found.")
-        include_path = Path(include_dir)
-        if include_path not in cuda_include_dirs:
-            cuda_include_dirs.append(include_path)
+
+        include_dir = Path(include_dir)
+        if include_dir not in cuda_include_dirs:
+            cuda_include_dirs.append(include_dir)
+
         library_path = Path(cuda_pathfinder.load_nvidia_dynamic_lib(name).abs_path)
         if not library_path.is_file():
             raise FileNotFoundError(f"CUDA library not found: {library_path}")
