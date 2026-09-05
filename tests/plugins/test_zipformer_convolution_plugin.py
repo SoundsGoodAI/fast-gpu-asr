@@ -16,7 +16,7 @@ from tensorrt_plugin_utils import compile_and_load_plugin
 
 from fast_gpu_asr.constants import TENSORRT_PLUGIN_NAMESPACE
 
-pytestmark = [pytest.mark.cuda, pytest.mark.sm80]
+pytestmark = pytest.mark.cuda
 
 PLUGIN_NAME = "zipformer_convolution"
 PLUGIN_VERSION = "1"
@@ -61,38 +61,70 @@ class EngineCase:
 ENGINE_CASES = (
     EngineCase("fp32", trt.float32, cp.float32, CHANNELS, KERNEL_SIZE, FP32_TOLERANCE),
     EngineCase("fp16", trt.float16, cp.float16, CHANNELS, KERNEL_SIZE, FP16_TOLERANCE),
-    EngineCase(
-        "bf16",
-        trt.bfloat16,
-        cp.dtype("bfloat16"),
-        CHANNELS,
-        KERNEL_SIZE,
-        BF16_TOLERANCE,
+    pytest.param(
+        EngineCase(
+            "bf16",
+            trt.bfloat16,
+            cp.dtype("bfloat16"),
+            CHANNELS,
+            KERNEL_SIZE,
+            BF16_TOLERANCE,
+        ),
+        marks=pytest.mark.sm80,
+        id="bf16",
     ),
 )
 ADDITIONAL_LAYOUT_CASES = (
     EngineCase("fp32-k15", trt.float32, cp.float32, 12, 15, FP32_TOLERANCE),
     EngineCase("fp16-k15", trt.float16, cp.float16, 24, 15, FP16_TOLERANCE),
-    EngineCase("bf16-k15", trt.bfloat16, cp.dtype("bfloat16"), 24, 15, BF16_TOLERANCE),
+    pytest.param(
+        EngineCase(
+            "bf16-k15", trt.bfloat16, cp.dtype("bfloat16"), 24, 15, BF16_TOLERANCE
+        ),
+        marks=pytest.mark.sm80,
+        id="bf16-k15",
+    ),
     EngineCase(
         "fp16-four-channel-boundary", trt.float16, cp.float16, 4, 15, FP16_TOLERANCE
     ),
-    EngineCase(
-        "bf16-four-channel-boundary",
-        trt.bfloat16,
-        cp.dtype("bfloat16"),
-        4,
-        15,
-        BF16_TOLERANCE,
+    pytest.param(
+        EngineCase(
+            "bf16-four-channel-boundary",
+            trt.bfloat16,
+            cp.dtype("bfloat16"),
+            4,
+            15,
+            BF16_TOLERANCE,
+        ),
+        marks=pytest.mark.sm80,
+        id="bf16-four-channel-boundary",
     ),
     EngineCase("fp16-pair-fallback", trt.float16, cp.float16, 6, 15, FP16_TOLERANCE),
-    EngineCase(
-        "bf16-pair-fallback", trt.bfloat16, cp.dtype("bfloat16"), 6, 15, BF16_TOLERANCE
+    pytest.param(
+        EngineCase(
+            "bf16-pair-fallback",
+            trt.bfloat16,
+            cp.dtype("bfloat16"),
+            6,
+            15,
+            BF16_TOLERANCE,
+        ),
+        marks=pytest.mark.sm80,
+        id="bf16-pair-fallback",
     ),
     EngineCase("fp32-vector-boundary", trt.float32, cp.float32, 4, 1, FP32_TOLERANCE),
     EngineCase("fp16-vector-boundary", trt.float16, cp.float16, 2, 1, FP16_TOLERANCE),
-    EngineCase(
-        "bf16-vector-boundary", trt.bfloat16, cp.dtype("bfloat16"), 2, 1, BF16_TOLERANCE
+    pytest.param(
+        EngineCase(
+            "bf16-vector-boundary",
+            trt.bfloat16,
+            cp.dtype("bfloat16"),
+            2,
+            1,
+            BF16_TOLERANCE,
+        ),
+        marks=pytest.mark.sm80,
+        id="bf16-vector-boundary",
     ),
 )
 INPUT_NAMES = ("x", "valid_lengths", "weight", "bias")

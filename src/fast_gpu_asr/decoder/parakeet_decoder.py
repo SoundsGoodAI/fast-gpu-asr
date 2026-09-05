@@ -316,6 +316,12 @@ class ParakeetModifiedBeamSearchDecoder:
         RuntimeWarning
             Warned when CUDA graph capture fails and subsequent decoder calls
             fall back to ordinary TensorRT and CUDA execution.
+
+        Notes
+        -----
+        Inputs must be ready on ``stream``. The method waits for its host outputs
+        before returning. Calls on one instance must be serialized because its
+        execution context, search state, and buffers are reused.
         """
 
         if encoder_output.ndim != 3:

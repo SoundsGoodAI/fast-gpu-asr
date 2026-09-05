@@ -30,9 +30,8 @@ LOCAL_ACTION_DIRECTORY = REPOSITORY_ROOT / ".github" / "actions"
 PYPROJECT_PATH = REPOSITORY_ROOT / "pyproject.toml"
 PLUGIN_DIRECTORY = REPOSITORY_ROOT / "src" / "fast_gpu_asr" / "tensorrt_plugins"
 STANDARD_SELF_HOSTED_LABELS = {"self-hosted", "linux", "x64"}
-SAFE_SELF_HOSTED_PULL_REQUEST_CONDITION = (
-    "github.event_name != 'pull_request' || "
-    "github.event.pull_request.head.repo.full_name == github.repository"
+MANUAL_GPU_CONDITION = (
+    "github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests"
 )
 YAML_BOOLEAN_TAG = "tag:yaml.org,2002:bool"
 
@@ -352,19 +351,19 @@ def test_workflow_yaml_loader_does_not_change_pyyaml_defaults(tmp_path: Path) ->
 def test_actionlint_runner_labels_match_gpu_workflow() -> None:
     actionlint_config = load_yaml_mapping(ACTIONLINT_CONFIG_PATH)
     workflow = load_yaml_mapping(WORKFLOW_PATH)
-    runner_labels = workflow["jobs"]["gpu-tests"]["runs-on"]
-    assert isinstance(runner_labels, list)
-    assert len(runner_labels) == len(set(runner_labels))
-    assert set(runner_labels) >= STANDARD_SELF_HOSTED_LABELS | {"gpu"}
-
-    configured_labels = actionlint_config["self-hosted-runner"]["labels"]
-    assert isinstance(configured_labels, list)
-    assert all(isinstance(label, str) for label in runner_labels + configured_labels)
-    assert len(configured_labels) == len(set(configured_labels))
-    assert set(configured_labels) == set(runner_labels) - STANDARD_SELF_HOSTED_LABELS
+    assert workflow["jobs"]["gpu-tests"]["runs-on"] == "gpu-t4"
+    assert actionlint_config["self-hosted-runner"]["labels"] == ["gpu-t4"]
 
 
-def test_ci_protects_the_self_hosted_runner_and_checkout_credentials() -> None:
+def test_gpu_ci_requires_explicit_manual_opt_in() -> None:
+    workflow = load_yaml_mapping(WORKFLOW_PATH)
+    assert workflow_events(workflow) == {"push", "pull_request", "workflow_dispatch"}
+    gpu_input = workflow["on"]["workflow_dispatch"]["inputs"]["run_gpu_tests"]
+    assert gpu_input["type"] == "boolean"
+    assert gpu_input["default"] is False
+
+
+def test_ci_protects_gpu_runs_and_checkout_credentials() -> None:
     workflow_paths = repository_workflow_paths()
     assert WORKFLOW_PATH in workflow_paths
     ci_workflow = load_yaml_mapping(WORKFLOW_PATH)
@@ -373,11 +372,11 @@ def test_ci_protects_the_self_hosted_runner_and_checkout_credentials() -> None:
     assert ci_workflow.get("permissions") == {"contents": "read"}
     actionlint_config = load_yaml_mapping(ACTIONLINT_CONFIG_PATH)
     configured_labels = actionlint_config["self-hosted-runner"]["labels"]
-    self_hosted_label_names = {
+    restricted_label_names = {
         label.casefold() for label in STANDARD_SELF_HOSTED_LABELS
     } | {label.casefold() for label in configured_labels}
 
-    self_hosted_jobs = []
+    restricted_jobs = []
     checkout_steps = []
     for workflow_path in workflow_paths:
         workflow = load_yaml_mapping(workflow_path)
@@ -401,16 +400,14 @@ def test_ci_protects_the_self_hosted_runner_and_checkout_credentials() -> None:
                 runner_labels = [runner] if isinstance(runner, str) else runner
 
             if isinstance(runner, list) or any(
-                "${{" in label or label.casefold() in self_hosted_label_names
+                "${{" in label or label.casefold() in restricted_label_names
                 for label in runner_labels
             ):
-                self_hosted_jobs.append((workflow_path, job_name))
+                restricted_jobs.append((workflow_path, job_name))
                 assert job.get("continue-on-error") in (None, False)
                 timeout = job.get("timeout-minutes")
                 assert type(timeout) is int and 0 < timeout <= 60
-                assert " ".join(job["if"].split()) == (
-                    SAFE_SELF_HOSTED_PULL_REQUEST_CONDITION
-                )
+                assert " ".join(job["if"].split()) == MANUAL_GPU_CONDITION
 
             checkout_steps.extend(
                 step
@@ -418,7 +415,7 @@ def test_ci_protects_the_self_hosted_runner_and_checkout_credentials() -> None:
                 if is_checkout_action_reference(step.get("uses", ""))
             )
 
-    assert (WORKFLOW_PATH, "gpu-tests") in self_hosted_jobs
+    assert (WORKFLOW_PATH, "gpu-tests") in restricted_jobs
     assert checkout_steps
     for step in checkout_steps:
         assert step["with"]["persist-credentials"] is False
@@ -593,17 +590,101 @@ def test_gpu_ci_verifies_every_native_plugin_library() -> None:
     assert contains_runtime_error_raise(ast.walk(creator_loop))
 
 
+@pytest.mark.parametrize(
+    ("driver_version", "accepted"),
+    (
+        ("535.183.01", False),
+        ("579.99", False),
+        ("580.65.06", True),
+        ("590.48", True),
+        (None, False),
+    ),
+)
+def test_gpu_ci_driver_preflight(driver_version: str | None, accepted: bool) -> None:
+    gpu_job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["gpu-tests"]
+    step = get_named_step(gpu_job, "Verify NVIDIA driver")
+    assert_mandatory_step(step)
+    script = """nvidia-smi() {
+        [[ -n "$DRIVER_VERSION" ]] || return 1
+        if (( $# == 0 )); then return 0; fi
+        [[ "$*" == "--query-gpu=driver_version --format=csv,noheader" ]] || return 64
+        printf '%s\\n' "$DRIVER_VERSION"
+    }
+    """ + step["run"]
+    result = subprocess.run(
+        ("bash", "-euo", "pipefail", "-c", script),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "DRIVER_VERSION": driver_version or ""},
+    )
+    assert (result.returncode == 0) is accepted, result.stderr
+    if not accepted and driver_version is not None:
+        assert f"this image has {driver_version}" in result.stderr
+
+
+@pytest.mark.parametrize("version", ("11.2.1.2", "11.3.0.4"))
+def test_gpu_ci_selects_headers_from_installed_tensorrt(
+    tmp_path: Path, version: str
+) -> None:
+    gpu_job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["gpu-tests"]
+    step = get_named_step(gpu_job, "Install native build prerequisites")
+    assert_mandatory_step(step)
+    assert "env" not in step
+    metadata_query = (
+        'from importlib.metadata import version; print(version("tensorrt-cu13"))'
+    )
+    script = r"""
+    sudo() { [[ "$*" == apt-get* ]]; }
+    uv() {
+        [[ "$1 $2 $3 $4" == "run --frozen python -c" ]] || return 64
+        [[ "$5" == "$METADATA_QUERY" ]] || return 64
+        printf '%s\n' "$TENSORRT_VERSION"
+    }
+    curl() { printf '%s\n' "$@"; }
+    tar() { printf '%s\n' "$@"; }
+    """ + step["run"]
+    github_env = tmp_path / "github-env"
+    result = subprocess.run(
+        ("bash", "-euo", "pipefail", "-c", script),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(tmp_path),
+            "GITHUB_ENV": str(github_env),
+            "CPATH": "/existing/includes",
+            "TENSORRT_VERSION": version,
+            "METADATA_QUERY": metadata_query,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    release = ".".join(version.split(".")[:2])
+    assert (
+        f"https://codeload.github.com/NVIDIA/TensorRT/tar.gz/refs/tags/v{release}"
+        in result.stdout.splitlines()
+    )
+    assert "--strip-components=2" in result.stdout.splitlines()
+    assert f"TensorRT-{release}/include" in result.stdout.splitlines()
+    assert github_env.read_text() == (
+        f"CPATH={tmp_path}/tensorrt-headers:/existing/includes\n"
+    )
+
+
 def test_gpu_ci_runs_complete_suite_and_cleans_runner() -> None:
     workflow = load_yaml_mapping(WORKFLOW_PATH)
     gpu_job = workflow["jobs"]["gpu-tests"]
     ordered_stages = (
+        "Verify NVIDIA driver",
         "Install CUDA, export, and test dependencies",
+        "Install native build prerequisites",
         "Configure Python CUDA toolchain",
         "Verify GPU and TensorRT development headers",
         "Rebuild native plugins",
         "Inspect plugin linkage",
         "Run complete GPU test suite",
-        "Require every GPU test to run",
+        "Require all supported GPU tests to run",
         "Build platform wheel",
         "Verify and smoke-test installed wheel",
         "Upload wheel",
@@ -669,36 +750,76 @@ def test_gpu_ci_runs_complete_suite_and_cleans_runner() -> None:
         "${UV_CACHE_DIR}",
         "${UV_PROJECT_ENVIRONMENT}",
         "${RUNNER_TEMP}/wheel-site",
+        "${RUNNER_TEMP}/tensorrt-headers",
+        "${RUNNER_TEMP}/tensorrt-headers.tar.gz",
         "dist",
     } <= set(shlex.split(recursive_removal)[2:])
     assert "rm -f src/fast_gpu_asr/tensorrt_plugins/*.so" in cleanup_commands
 
 
 @pytest.mark.parametrize(
-    ("report", "error"),
+    ("capability", "report", "error"),
     (
         (
+            "90",
             '<testsuites><testsuite skipped="0"/><testsuite skipped="0"/></testsuites>',
             None,
         ),
         (
+            "90",
             '<testsuites><testsuite skipped="0"/><testsuite skipped="2"/></testsuites>',
             "2 skipped",
         ),
-        ('<testsuite skipped="1"/>', "1 skipped"),
-        (None, "FileNotFoundError"),
+        ("75", '<testsuite skipped="1"/>', "1 skipped"),
+        ("75", '<testsuite skipped="0"/>', None),
+        (
+            "75",
+            '<testsuite skipped="1"><testcase><skipped message="'
+            "A working SM80 or newer CUDA device is required."
+            '"/></testcase></testsuite>',
+            None,
+        ),
+        (
+            "80",
+            '<testsuite skipped="1"><testcase><skipped message="'
+            "A working SM80 or newer CUDA device is required."
+            '"/></testcase></testsuite>',
+            "1 skipped",
+        ),
+        (
+            "75",
+            '<testsuite skipped="1"><testcase><skipped message="missing nvcc"/>'
+            "</testcase></testsuite>",
+            "1 skipped",
+        ),
+        (
+            "75",
+            '<testsuites><testsuite skipped="1"><testcase><skipped message="'
+            "A working SM80 or newer CUDA device is required."
+            '"/></testcase></testsuite><testsuite skipped="1"><testcase>'
+            '<skipped message="missing nvcc"/></testcase></testsuite></testsuites>',
+            "2 skipped, 1 expected",
+        ),
+        ("74", '<testsuite skipped="0"/>', "requires SM75"),
+        ("90", None, "FileNotFoundError"),
     ),
 )
-def test_gpu_ci_rejects_skipped_or_missing_reports(
-    tmp_path: Path, report: str | None, error: str | None
+def test_gpu_ci_validates_test_reports(
+    tmp_path: Path, capability: str, report: str | None, error: str | None
 ) -> None:
     gpu_job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["gpu-tests"]
-    step = get_named_step(gpu_job, "Require every GPU test to run")
+    step = get_named_step(gpu_job, "Require all supported GPU tests to run")
     assert_mandatory_step(step)
     if report is not None:
         (tmp_path / "gpu-test-results.xml").write_text(report, encoding="utf8")
+    script = (
+        "import sys\nfrom types import SimpleNamespace\n"
+        "sys.modules['cupy'] = SimpleNamespace(cuda=SimpleNamespace("
+        f"Device=lambda: SimpleNamespace(compute_capability='{capability}')))\n"
+        + get_python_heredoc(step["run"])
+    )
     result = subprocess.run(
-        (sys.executable, "-I", "-c", get_python_heredoc(step["run"])),
+        (sys.executable, "-I", "-c", script),
         capture_output=True,
         text=True,
         timeout=10,

@@ -233,6 +233,80 @@ int main()
     )
 
 
+def test_cublas_tactics_support_turing(tmp_path: Path) -> None:
+    compile_and_run(
+        tmp_path,
+        (
+            r"""
+#include "cublas_tactics.h"
+#include <algorithm>
+#include <cassert>
+
+using namespace fastgpuasr_tensorrt;
+using nvinfer1::DataType;
+
+int deviceMajor = 7;
+cudaError_t deviceStatus = cudaSuccess;
+cudaError_t attributeStatus = cudaSuccess;
+
+extern "C" cudaError_t CUDARTAPI cudaGetDevice(int* device)
+{
+    *device = 3;
+    return deviceStatus;
+}
+
+extern "C" cudaError_t CUDARTAPI cudaDeviceGetAttribute(
+    int* value, cudaDeviceAttr attribute, int device)
+{
+    assert(device == 3 && attribute == cudaDevAttrComputeCapabilityMajor);
+    *value = deviceMajor;
+    return attributeStatus;
+}
+
+int main()
+{
+    for (int major : {7, 8, 9, 12})
+    {
+        deviceMajor = major;
+        bool const ampere = deviceSupportsAmpereCompute();
+        assert(ampere == (major >= 8));
+        for (DataType type : {DataType::kFLOAT, DataType::kHALF, DataType::kBF16})
+        {
+            int const count = type == DataType::kFLOAT ? (ampere ? 4 : 2)
+                : type == DataType::kHALF || ampere ? 1 : 0;
+            auto const tactics = getCublasComputeTactics(type, ampere);
+            assert(getCublasComputeTacticCount(type, ampere) == count);
+            assert(static_cast<int>(tactics.size()) == count);
+            for (int i = 0; i < count; ++i)
+            {
+                assert(tactics[i] == i + 1);
+            }
+            for (int requested : {-1, 0, 1, 2, 3, 4, 5})
+            {
+                std::array<int32_t, 6> guarded{91, 92, 93, 94, 95, 96};
+                auto expected = guarded;
+                bool const accepted = count > 0 && requested == count;
+                if (accepted)
+                {
+                    std::copy(tactics.begin(), tactics.end(), expected.begin() + 1);
+                }
+                assert(writeCublasComputeTactics(
+                    guarded.data() + 1, requested, type, ampere) == !accepted);
+                assert(guarded == expected);
+            }
+        }
+    }
+    deviceStatus = cudaErrorInvalidDevice;
+    assert(!deviceSupportsAmpereCompute());
+    deviceStatus = cudaSuccess;
+    attributeStatus = cudaErrorInvalidValue;
+    assert(!deviceSupportsAmpereCompute());
+}
+""",
+        ),
+    )
+
+
 def test_cublas_tactics_header_links_across_translation_units(tmp_path: Path) -> None:
     compile_and_run(
         tmp_path,

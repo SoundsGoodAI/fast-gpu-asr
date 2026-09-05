@@ -1,3 +1,4 @@
+# actionlint also uses this setting for custom GitHub-hosted runner labels.
 self-hosted-runner:
   labels:
-    - gpu
+    - gpu-t4

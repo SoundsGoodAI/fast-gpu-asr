@@ -1,0 +1,77 @@
+Fast GPU ASR
+Copyright 2026 SoundsGoodAI
+
+This package includes modified model implementations based on the projects below.
+SoundsGoodAI modifications include fixed-batch layouts, waveform feature extraction,
+TensorRT export, native inference plugins, and custom decoder implementations.
+Upstream attribution does not imply endorsement of this package.
+
+Icefall
+-------
+https://github.com/k2-fsa/icefall
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+The modules under src/fast_gpu_asr/export/model/zipformer adapt the following
+files from egs/librispeech/ASR/zipformer:
+
+- zipformer.py: Copyright 2022-2023 Xiaomi Corp.
+  Authors: Daniel Povey, Zengwei Yao.
+  Used by zipformer.py and attention.py in this package.
+- subsampling.py: Copyright 2023 Xiaomi Corp.
+  Authors: Daniel Povey, Zengwei Yao.
+  Used by subsampling.py in this package.
+- scaling.py: Copyright 2022-2023 Xiaomi Corp. Author: Daniel Povey.
+  Used by activation.py and inference components in this package.
+- decoder.py and joiner.py: Copyright 2021 Xiaomi Corp. Author: Fangjun Kuang.
+  Used by decoder.py in this package.
+
+NVIDIA NeMo
+-----------
+https://github.com/NVIDIA/NeMo
+Licensed under the Apache License, Version 2.0; see LICENSE, except for the
+feature-preprocessing attribution reproduced below.
+
+The modules under src/fast_gpu_asr/export/model/parakeet adapt the following
+files from nemo/collections/asr:
+
+- modules/conformer_encoder.py, parts/submodules/conformer_modules.py,
+  and parts/submodules/subsampling.py:
+  Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+  Used by parakeet.py in this package.
+- parts/submodules/multi_head_attention.py and modules/rnnt.py:
+  Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+  Copyright 2017 Johns Hopkins University (Shinji Watanabe).
+  These upstream files include code adapted from https://github.com/espnet/espnet.
+  Used by attention.py and decoder.py in this package.
+- parts/preprocessing/features.py:
+  Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+  Copyright (c) 2018 Ryan Leary.
+  Used as the reference for features.py in this package. The upstream file
+  includes code adapted from https://github.com/ryanleary/patter and carries
+  the following MIT notice:
+
+Copyright (c) 2018 Ryan Leary
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+External assets
+---------------
+Model checkpoints, tokenizers, and datasets are not included in this package.
+Their licenses are separate from the license of this software. Installed
+dependencies, including CUDA and TensorRT, retain their own license terms.

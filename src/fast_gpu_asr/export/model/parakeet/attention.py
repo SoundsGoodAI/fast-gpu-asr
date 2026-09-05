@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2017 Johns Hopkins University (Shinji Watanabe)
+# Modified from NeMo for batched TensorRT export; see NOTICE and LICENSE.
 """Relative-position attention modules used by NVIDIA Parakeet TDT models."""
 
 import torch

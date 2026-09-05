@@ -243,7 +243,7 @@ def test_plugin_dependencies() -> None:
 
 
 def test_nvcc_options_include_supported_architectures_and_ptx_fallback() -> None:
-    expected_architectures = (80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121)
+    expected_architectures = (75, 80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121)
     assert (
         *(
             f"--generate-code=arch=compute_{architecture},code=sm_{architecture}"

@@ -587,17 +587,18 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return static_cast<int32_t>(kMelProjectionTactics.size());
+        return deviceSupportsAmpereCompute()
+            ? static_cast<int32_t>(kMelProjectionTactics.size()) : 1;
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
         if (tactics == nullptr
-            || nbTactics != static_cast<int32_t>(kMelProjectionTactics.size()))
+            || nbTactics != getNbTactics())
         {
             return 1;
         }
-        std::copy(kMelProjectionTactics.begin(), kMelProjectionTactics.end(), tactics);
+        std::copy_n(kMelProjectionTactics.begin(), nbTactics, tactics);
         return 0;
     }
 

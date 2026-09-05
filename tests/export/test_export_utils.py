@@ -571,14 +571,14 @@ def test_build_tensorrt_engine_preserves_existing_engine_when_build_fails(
     assert_build_artifacts_unchanged(build_paths)
 
 
-@pytest.mark.sm80
+@pytest.mark.cuda
 @pytest.mark.parametrize("dynamic", (False, True), ids=("static", "dynamic"))
 @pytest.mark.parametrize(
     ("onnx_dtype", "dtype"),
     (
         (TensorProto.FLOAT, "float32"),
         (TensorProto.FLOAT16, "float16"),
-        (TensorProto.BFLOAT16, "bfloat16"),
+        pytest.param(TensorProto.BFLOAT16, "bfloat16", marks=pytest.mark.sm80),
     ),
     ids=("fp32", "fp16", "bf16"),
 )

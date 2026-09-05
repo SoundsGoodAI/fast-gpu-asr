@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+# Modified from NeMo for batched TensorRT export; see NOTICE and LICENSE.
 """Fast Conformer encoder used by NVIDIA Parakeet TDT models."""
 
 import torch

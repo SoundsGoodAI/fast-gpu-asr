@@ -18,7 +18,7 @@ from tensorrt_plugin_utils import compile_and_load_plugin
 
 from fast_gpu_asr.constants import TENSORRT_PLUGIN_NAMESPACE
 
-pytestmark = pytest.mark.sm80
+pytestmark = pytest.mark.cuda
 
 
 PLUGIN_NAME = "parakeet_flash_attention"
@@ -100,7 +100,11 @@ ENGINE_CASES = (
     # TensorRT may select TF32 or another reduced-mantissa FP32 cuBLAS tactic.
     EngineCase("fp32", trt.float32, cp.float32, torch.float32, 3e-4),
     EngineCase("fp16", trt.float16, cp.float16, torch.float16, 5e-3),
-    EngineCase("bf16", trt.bfloat16, cp.dtype("bfloat16"), torch.bfloat16, 3e-2),
+    pytest.param(
+        EngineCase("bf16", trt.bfloat16, cp.dtype("bfloat16"), torch.bfloat16, 3e-2),
+        marks=pytest.mark.sm80,
+        id="bf16",
+    ),
 )
 ALTERNATE_ENGINE_CASE = EngineCase(
     "fp32-h3-d5-scale075",
@@ -149,6 +153,7 @@ SCORE_PROMOTION_CASES = (
             scale=8.0,
         ),
         np.float32(3e-3),
+        marks=pytest.mark.sm80,
         id="bf16",
     ),
 )

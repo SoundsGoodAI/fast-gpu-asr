@@ -462,17 +462,19 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return getCublasComputeTacticCount(mInputType)
+        return getCublasComputeTacticCount(mInputType, deviceSupportsAmpereCompute())
             + static_cast<int32_t>(mSupportsNarrowHeadTactic);
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        int32_t const cublasTactics = getCublasComputeTacticCount(mInputType);
+        bool const ampereCompute = deviceSupportsAmpereCompute();
+        int32_t const cublasTactics = getCublasComputeTacticCount(mInputType, ampereCompute);
         if (tactics == nullptr
             || nbTactics != cublasTactics
                 + static_cast<int32_t>(mSupportsNarrowHeadTactic)
-            || writeCublasComputeTactics(tactics, cublasTactics, mInputType) != 0)
+            || writeCublasComputeTactics(
+                tactics, cublasTactics, mInputType, ampereCompute) != 0)
         {
             return 1;
         }

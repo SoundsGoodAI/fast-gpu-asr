@@ -9,6 +9,7 @@ description = "Batched TensorRT inference for Zipformer and Parakeet ASR models.
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "SoundsGoodAI" }]
 keywords = [
     "asr",

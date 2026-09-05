@@ -183,7 +183,7 @@ class Encoder:
         -------
         tuple[cp.ndarray, cp.ndarray]
             CUDA encoder embeddings and valid encoder lengths for the actual
-            input utterances.
+            input utterances. Both arrays are views of reusable internal buffers.
 
         Raises
         ------
@@ -196,6 +196,14 @@ class Encoder:
         RuntimeWarning
             Warned when CUDA graph capture fails and subsequent encoder calls
             fall back to ordinary TensorRT execution.
+
+        Notes
+        -----
+        Execution is asynchronous on ``stream``. Consume the outputs on that
+        stream, or explicitly wait for it before using another stream or reading
+        results on the host. A later call may overwrite the returned views; copy
+        them before that call if they must be retained. Calls on one instance must
+        be serialized, as they are by :class:`fast_gpu_asr.ASR`.
         """
 
         batch_size = len(audios)

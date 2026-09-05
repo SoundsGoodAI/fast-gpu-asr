@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright 2023 Xiaomi Corp. (Daniel Povey, Zengwei Yao)
+# Modified from Icefall for batched TensorRT export; see NOTICE and LICENSE.
 """Offline Zipformer subsampling and normalization modules."""
 
 import torch

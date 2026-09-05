@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright 2021 Xiaomi Corp. (Fangjun Kuang)
+# Modified from Icefall for batched TensorRT export; see NOTICE and LICENSE.
 """Stateless Zipformer transducer predictor and joiner modules."""
 
 import torch

@@ -15,9 +15,7 @@ import pytest
 
 import fast_gpu_asr.tensorrt_plugins as plugins_module
 
-PLUGIN_DIRECTORY = (
-    Path(__file__).resolve().parents[2] / "src" / "fast_gpu_asr" / "tensorrt_plugins"
-)
+PLUGIN_DIRECTORY = Path(plugins_module.__file__).resolve().parent
 PLUGIN_LIBRARIES = tuple(
     library_name for library_name, _ in plugins_module.PLUGIN_INITIALIZERS
 )
@@ -29,6 +27,8 @@ PLUGIN_REGISTRATION_CHECK = """
 import gc
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[1]))
 
 import fast_gpu_asr.constants as constants
 import fast_gpu_asr.tensorrt_plugins as plugins
@@ -142,7 +142,6 @@ def loader(monkeypatch):
 
 @pytest.mark.cuda
 def test_packaged_plugins_register_actual_creators_in_fresh_process() -> None:
-    assert Path(plugins_module.__file__).resolve().parent == PLUGIN_DIRECTORY
     result = subprocess.run(
         [sys.executable, "-I", "-c", PLUGIN_REGISTRATION_CHECK, str(PLUGIN_DIRECTORY)],
         capture_output=True,

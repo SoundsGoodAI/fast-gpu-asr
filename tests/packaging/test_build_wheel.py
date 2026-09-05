@@ -18,6 +18,7 @@ RAW_WHEEL = "fast_gpu_asr-0-py3-none-linux_x86_64.whl"
 REPAIRED_WHEEL = "fast_gpu_asr-0-py3-none-manylinux_2_27_x86_64.whl"
 SOURCE_FILES = {
     "LICENSE": "license",
+    "NOTICE": "upstream notices",
     "README.md": "readme",
     "pyproject.toml": "metadata",
     "setup.py": "setup",

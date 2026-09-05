@@ -4,6 +4,7 @@
 """Constants shared by TensorRT plugin building and loading."""
 
 CUDA_ARCHITECTURE_OPTIONS = (
+    "--generate-code=arch=compute_75,code=sm_75",
     "--generate-code=arch=compute_80,code=sm_80",
     "--generate-code=arch=compute_86,code=sm_86",
     "--generate-code=arch=compute_87,code=sm_87",

@@ -31,9 +31,15 @@ Fast GPU ASR currently supports Linux x86-64, Python 3.12 through 3.14, CUDA 13,
 and TensorRT 11.2.1.2 or newer within the TensorRT 11 release family. CUDA is a
 mandatory runtime dependency.
 
-The packaged plugins contain native code for `sm_80`, `sm_86`, `sm_87`, `sm_88`,
+The packaged plugins contain native code for `sm_75`, `sm_80`, `sm_86`, `sm_87`, `sm_88`,
 `sm_89`, `sm_90`, `sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121`, plus a
 `compute_80` PTX fallback. A sufficiently recent NVIDIA driver is still required.
+
+NVIDIA T4 (Turing, `sm_75`) targets FP32 and FP16 inference. BF16 requires Ampere
+or newer; T4 engine builds omit BF16 and TF32 cuBLAS compute tactics. Use smaller
+batch sizes and duration profiles to fit its 16 GB of VRAM. Native T4 code has
+been cross-compiled, but execution and performance still need validation on T4
+hardware. Current GPU regression tests run on H100.
 
 Building the native plugins from a repository checkout additionally requires:
 

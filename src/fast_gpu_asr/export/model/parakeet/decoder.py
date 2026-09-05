@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2017 Johns Hopkins University (Shinji Watanabe)
+# Modified from NeMo for batched TensorRT export; see NOTICE and LICENSE.
 """TDT decoder and joiner modules used by Parakeet."""
 
 import torch

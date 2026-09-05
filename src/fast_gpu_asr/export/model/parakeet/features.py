@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018 Ryan Leary
+# Adapted for batched TensorRT export; see the upstream notices in NOTICE.
 """Export-friendly log-mel extraction for NVIDIA Parakeet TDT models."""
 
 import torch

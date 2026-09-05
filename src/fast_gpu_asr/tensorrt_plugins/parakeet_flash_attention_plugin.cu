@@ -874,12 +874,13 @@ public:
 
     int32_t getNbTactics() noexcept override
     {
-        return getCublasComputeTacticCount(mInputType);
+        return getCublasComputeTacticCount(mInputType, deviceSupportsAmpereCompute());
     }
 
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override
     {
-        return writeCublasComputeTactics(tactics, nbTactics, mInputType);
+        return writeCublasComputeTactics(
+            tactics, nbTactics, mInputType, deviceSupportsAmpereCompute());
     }
 
     int32_t setTactic(int32_t tactic) noexcept override

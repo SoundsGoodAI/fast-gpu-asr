@@ -196,7 +196,15 @@ struct LowPrecisionOps<__nv_bfloat16>
     static __device__ __forceinline__ Pair fma(
         Pair input, Pair weight, Pair value)
     {
+        // BF16 engines require SM80; keep this specialization compilable for SM75.
+#if __CUDA_ARCH__ >= 800
         return __hfma2(input, weight, value);
+#else
+        float2 const x = __bfloat1622float2(input);
+        float2 const w = __bfloat1622float2(weight);
+        float2 const v = __bfloat1622float2(value);
+        return __floats2bfloat162_rn(fmaf(x.x, w.x, v.x), fmaf(x.y, w.y, v.y));
+#endif
     }
 
     static __device__ __forceinline__ float2 toFloat(Pair value)

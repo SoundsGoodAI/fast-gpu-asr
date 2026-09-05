@@ -24,7 +24,7 @@ trap 'rm -rf "${build_dir}"' EXIT
 
 cd "${repository_dir}"
 uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
-cp -a LICENSE README.md pyproject.toml setup.py src "${source_dir}/"
+cp -a LICENSE NOTICE README.md pyproject.toml setup.py src "${source_dir}/"
 
 cd "${source_dir}"
 uv build --wheel --out-dir "${raw_wheel_dir}"

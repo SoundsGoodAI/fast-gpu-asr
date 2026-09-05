@@ -164,7 +164,7 @@ def create_wheel_test_project(tmp_path: Path) -> Path:
 
     project_dir = tmp_path / "project"
     project_dir.mkdir()
-    for name in ("LICENSE", "README.md", "pyproject.toml", "setup.py"):
+    for name in ("LICENSE", "NOTICE", "README.md", "pyproject.toml", "setup.py"):
         shutil.copy2(REPOSITORY_DIR / name, project_dir / name)
     source_dir = project_dir / "src"
     source_dir.mkdir()
@@ -330,10 +330,15 @@ def test_real_wheel_contains_validated_artifacts_and_binary_metadata(
         entry_points.read_string(
             archive.read(f"{dist_info}/entry_points.txt").decode("utf8")
         )
-        assert (
-            archive.read(f"{dist_info}/licenses/LICENSE")
-            == (project_dir / "LICENSE").read_bytes()
-        )
+        assert set(project_metadata.get_all("License-File", [])) == {
+            "LICENSE",
+            "NOTICE",
+        }
+        for name in ("LICENSE", "NOTICE"):
+            assert (
+                archive.read(f"{dist_info}/licenses/{name}")
+                == (project_dir / name).read_bytes()
+            )
 
     distribution_name, version, build_tag, tags = parse_wheel_filename(wheel_path.name)
     assert distribution_name == canonicalize_name(project["name"])

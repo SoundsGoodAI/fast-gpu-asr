@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_gpu_tests:
+        description: >-
+          Run GPU tests and build the wheel
+          (billed separately on the GitHub-hosted T4 runner)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -77,15 +84,23 @@ jobs:
   gpu-tests:
     name: CUDA 13 plugins and wheel
     needs: [quality, python-tests]
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, gpu]
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests
+    runs-on: gpu-t4
     timeout-minutes: 60
     concurrency:
       group: fast-gpu-asr-gpu-ci
       cancel-in-progress: false
     steps:
+      - name: Verify NVIDIA driver
+        shell: bash
+        run: |
+          nvidia-smi
+          driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader)"
+          if (( ${driver_version%%.*} < 580 )); then
+            printf 'CUDA 13 requires NVIDIA driver 580 or newer; this image has %s.\n' \
+              "${driver_version}" >&2
+            exit 1
+          fi
       - name: Configure temporary paths
         run: |
           {
@@ -104,6 +119,27 @@ jobs:
           version: "0.11.21"
       - name: Install CUDA, export, and test dependencies
         run: uv sync --frozen --extra dev
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++ binutils patchelf
+          # uv sync --frozen installs the exact TensorRT version from uv.lock.
+          tensorrt_version="$(
+            uv run --frozen python -c \
+              'from importlib.metadata import version; print(version("tensorrt-cu13"))'
+          )"
+          IFS=. read -r major minor _ <<< "${tensorrt_version}"
+          headers_release="${major}.${minor}"
+          archive="${RUNNER_TEMP}/tensorrt-headers.tar.gz"
+          headers_dir="${RUNNER_TEMP}/tensorrt-headers"
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o "${archive}" \
+            "https://codeload.github.com/NVIDIA/TensorRT/tar.gz/refs/tags/v${headers_release}"
+          mkdir -p "${headers_dir}"
+          tar -xzf "${archive}" -C "${headers_dir}" --strip-components=2 \
+            "TensorRT-${headers_release}/include"
+          printf 'CPATH=%s:%s\n' "${headers_dir}" "${CPATH:-}" >> "${GITHUB_ENV}"
       - name: Configure Python CUDA toolchain
         shell: bash
         run: |
@@ -163,13 +199,17 @@ jobs:
         run: |
           nvidia-smi
           nvcc --version
-          tensorrt_major="$(
+          tensorrt_version="$(
             uv run --frozen python -c \
-              'import tensorrt; print(tensorrt.__version__.split(".")[0])'
+              'import tensorrt; print(tensorrt.__version__)'
           )"
+          IFS=. read -r major minor patch build <<< "${tensorrt_version}"
           cat > "${RUNNER_TEMP}/check_tensorrt.cpp" <<CPP
-          #include <NvInferVersion.h>
-          static_assert(NV_TENSORRT_MAJOR == ${tensorrt_major});
+          #include <NvInfer.h>
+          static_assert(NV_TENSORRT_MAJOR == ${major});
+          static_assert(NV_TENSORRT_MINOR == ${minor});
+          static_assert(NV_TENSORRT_PATCH == ${patch});
+          static_assert(NV_TENSORRT_BUILD == ${build});
           int main() { return 0; }
           CPP
           c++ --std=c++20 -fsyntax-only "${RUNNER_TEMP}/check_tensorrt.cpp"
@@ -192,21 +232,31 @@ jobs:
         run: >-
           uv run --frozen pytest -q
           --junitxml="${RUNNER_TEMP}/gpu-test-results.xml"
-      - name: Require every GPU test to run
+      - name: Require all supported GPU tests to run
         run: |
           uv run --frozen python - <<'PY'
           import os
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
+          import cupy as cp
+
+          capability = int(cp.cuda.Device().compute_capability)
+          if capability < 75:
+              raise RuntimeError("GPU CI requires SM75 or newer.")
           report = Path(os.environ["RUNNER_TEMP"]) / "gpu-test-results.xml"
           root = ET.parse(report).getroot()
           skipped = sum(
               int(suite.attrib.get("skipped", 0))
               for suite in root.iter("testsuite")
           )
-          if skipped:
-              raise RuntimeError(f"Expected every GPU test to run, but {skipped} skipped.")
+          expected_skips = sum(
+              capability < 80
+              and case.get("message") == "A working SM80 or newer CUDA device is required."
+              for case in root.iter("skipped")
+          )
+          if skipped != expected_skips:
+              raise RuntimeError(f"GPU tests: {skipped} skipped, {expected_skips} expected.")
           PY
       - name: Build platform wheel
         run: |
@@ -343,5 +393,7 @@ jobs:
             "${UV_CACHE_DIR}" \
             "${UV_PROJECT_ENVIRONMENT}" \
             "${RUNNER_TEMP}/wheel-site" \
+            "${RUNNER_TEMP}/tensorrt-headers" \
+            "${RUNNER_TEMP}/tensorrt-headers.tar.gz" \
             dist
           rm -f src/fast_gpu_asr/tensorrt_plugins/*.so

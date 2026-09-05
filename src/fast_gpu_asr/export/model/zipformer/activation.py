@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
+# Copyright 2022-2023 Xiaomi Corp. (Daniel Povey)
+# Modified from Icefall for TensorRT export; see NOTICE and LICENSE.
 """Swoosh activation modules used by the offline Zipformer encoder."""
 
 import torch
