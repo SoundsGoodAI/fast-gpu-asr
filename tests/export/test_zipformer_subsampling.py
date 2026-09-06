@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 
-"""CPU contract tests for Zipformer convolutional subsampling."""
+"""Contract and TensorRT tests for Zipformer convolutional subsampling."""
 
 from pathlib import Path
 
+import cupy as cp
 import numpy as np
 import onnx
 import pytest
@@ -12,7 +13,9 @@ import torch
 from onnx.reference import ReferenceEvaluator
 
 from fast_gpu_asr.constants import ONNX_OPSET_VERSION, ZERO_LOG
+from fast_gpu_asr.export.export_utils import build_tensorrt_engine
 from fast_gpu_asr.export.model.zipformer.subsampling import BiasNorm, Conv2dSubsampling
+from fast_gpu_asr.utils import get_engine
 
 DTYPE_TOLERANCES = {torch.float32: 1e-6, torch.float16: 1e-3, torch.bfloat16: 1e-2}
 
@@ -504,3 +507,53 @@ def test_bias_norm_handles_extreme_magnitudes(dtype: torch.dtype, value: float) 
 
     expected = torch.full_like(inputs, 0.0 if value == 0 else 1.0)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        torch.float32,
+        torch.float16,
+        pytest.param(torch.bfloat16, marks=pytest.mark.sm80),
+    ),
+    ids=str,
+)
+def test_bias_norm_tensorrt_matches_eager(tmp_path: Path, dtype: torch.dtype) -> None:
+    module = BiasNorm(12).eval().to(dtype)
+    module.scale.fill_(1.25)
+    module.bias.copy_(torch.linspace(-0.5, 0.5, 12).to(dtype))
+    module.bias[0] = 0.0
+
+    inputs = make_random_tensor((2, 3, 12), seed=20, dtype=dtype)
+    onnx_path, engine_path = tmp_path / "norm.onnx", tmp_path / "norm.trt"
+    torch.onnx.export(
+        module,
+        (inputs,),
+        onnx_path,
+        input_names=("x",),
+        output_names=("y",),
+        dynamo=True,
+        external_data=False,
+        opset_version=ONNX_OPSET_VERSION,
+    )
+
+    build_tensorrt_engine(onnx_path, engine_path, {}, 5)
+    context = get_engine(engine_path).create_execution_context()
+    gpu_dtype = {torch.float32: "float32", torch.float16: "float16"}.get(
+        dtype, "bfloat16"
+    )
+    with cp.cuda.Stream(non_blocking=True) as stream:
+        output = cp.empty(inputs.shape, dtype=gpu_dtype)
+        assert context.set_tensor_address("y", output.data.ptr)
+        for value in (inputs, torch.zeros_like(inputs), module.bias.expand_as(inputs)):
+            gpu_input = cp.asarray(value.float().numpy(), dtype=gpu_dtype)
+            assert context.set_tensor_address("x", gpu_input.data.ptr)
+            assert context.execute_async_v3(stream.ptr)
+
+            np.testing.assert_allclose(
+                cp.asnumpy(output.astype(cp.float32)),
+                module(value).float().numpy(),
+                rtol=DTYPE_TOLERANCES[dtype],
+                atol=DTYPE_TOLERANCES[dtype],
+            )

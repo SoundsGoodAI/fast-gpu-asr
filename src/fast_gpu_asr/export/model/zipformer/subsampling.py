@@ -181,5 +181,7 @@ class BiasNorm(torch.nn.Module):
         x = x.to(torch.float32)
         centered = x - self.bias.to(torch.float32)
         rms = torch.sqrt(torch.mean(centered * centered, dim=2, keepdim=True))
-        rms = torch.clamp(rms, min=torch.finfo(torch.float32).tiny)
+        # TensorRT 11.2 fails to compile float32.tiny ("stof"). This floor is
+        # below the smallest positive FP32 square root, so only zero RMS is clamped.
+        rms = torch.clamp(rms, min=1e-30)
         return (x * self.scale.to(torch.float32) / rms).to(output_dtype)
