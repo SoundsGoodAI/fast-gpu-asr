@@ -121,14 +121,14 @@ def scoring_run(
             predictions = [
                 {"id": identifier, "pred_text": text, "word_timestamps": []}
                 for identifier, text in (
+                    ("a", "Hello world"),
                     ("b", f"  {name} pass {index}!  "),
                     ("c", ""),
-                    ("a", "Hello world"),
                 )
             ]
             write_lines(folder / f"{name}.jsonl", predictions)
             for batch_index, (ids, seconds) in enumerate(
-                ((["b", "c"], 2), (["a"], 4 * dataset_index)), 1
+                ((["a", "b"], 4 * dataset_index + 1), (["c"], 1)), 1
             ):
                 records.append(
                     {
@@ -290,9 +290,9 @@ def test_main_scores_all_passes_and_preserves_evidence(
                     "time": None,
                 }
                 for identifier, text, seconds in (
+                    ("a", "Hello world", 4 * dataset_index),
                     ("b", f"  {name} pass {index}!  ", 1),
                     ("c", "", 1),
-                    ("a", "Hello world", 4 * dataset_index),
                 )
             ]
         assert (run.directory / f"pass-{index}/scorer.log").read_text() == (
@@ -310,9 +310,10 @@ def test_main_scores_all_passes_and_preserves_evidence(
         assert result[key] == json.loads(
             (run.directory / f"{filename}.json").read_text(encoding="utf-8")
         )
-    assert json.loads(
+    collection = json.loads(
         (run.directory / "collection.json").read_text(encoding="utf-8")
-    )["evidence"] == result["evidence"]
+    )
+    assert collection["evidence"] == result["evidence"]
     assert not list(run.directory.rglob("*.tmp"))
     assert all(
         not Path(call.args[0]).exists() for call in run.implementation.call_args_list
@@ -692,9 +693,8 @@ def test_old_scorer_revision_does_not_bypass_campaign_validation(
     if valid_digest:
         score.main()
         run.loader.assert_called_once_with(run.directory.parent / "scorer")
-        assert json.loads(
-            (run.directory / "result.json").read_text(encoding="utf-8")
-        )["status"] == "complete"
+        result = json.loads((run.directory / "result.json").read_text(encoding="utf-8"))
+        assert result["status"] == "complete"
     else:
         with pytest.raises(ValueError, match="fingerprint mismatch"):
             score.main()

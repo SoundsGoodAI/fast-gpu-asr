@@ -426,12 +426,12 @@ def test_main_loads_normalized_audio_in_batch_order(
 
     batches = [c.args[0] for c in model.call_args_list]
     assert [[len(audio) for audio in batch] for batch in batches] == [
-        [1599, 1600],
-        [1599, 1600],
+        [1600],
+        [1600],
         [3200],
-        [4800],
-        [4800],
-    ] + [[1599, 1600], [4800], [3200]] * 3
+        [4800, 1599],
+        [4800, 1599],
+    ] + [[4800, 1599], [1600], [3200]] * 3
     for batch in batches:
         for audio in batch:
             assert audio.ndim == 1 and audio.dtype == np.float32
@@ -447,11 +447,11 @@ def test_main_loads_normalized_audio_in_batch_order(
     assert json.loads(
         (collection_run.directory / "warmup.json").read_text(encoding="utf-8")
     ) == [
-        {"dataset": "first", "ids": ["a", "b"]},
-        {"dataset": "first", "ids": ["a", "b"]},
+        {"dataset": "first", "ids": ["b"]},
+        {"dataset": "first", "ids": ["b"]},
         {"dataset": "second", "ids": ["a"]},
-        {"dataset": "first", "ids": ["later"]},
-        {"dataset": "first", "ids": ["later"]},
+        {"dataset": "first", "ids": ["later", "a"]},
+        {"dataset": "first", "ids": ["later", "a"]},
     ]
 
 
@@ -497,7 +497,7 @@ def test_main_rejects_changed_audio_before_inference(
         audio_path.write_bytes(b"changed")
     with pytest.raises(ValueError, match="Audio changed"):
         collect.main()
-    assert model.call_count == (5 if after_warmup else 0)
+    assert model.call_count == (5 if after_warmup else 3)
     assert (collection_run.directory / "warmup.json").exists() == after_warmup
     assert not (collection_run.directory / "collection.json").exists()
 
@@ -511,13 +511,13 @@ def test_main_records_batches_transcripts_and_totals(
     write_json(output / "run.json", {**collection_run.spec, "batch_size": capacity})
     expected = {
         1: [
+            ("first", ["later"]),
             ("first", ["a"]),
             ("first", ["b"]),
-            ("first", ["later"]),
             ("second", ["a"]),
         ],
-        2: [("first", ["a", "b"]), ("first", ["later"]), ("second", ["a"])],
-        256: [("first", ["a", "b", "later"]), ("second", ["a"])],
+        2: [("first", ["later", "a"]), ("first", ["b"]), ("second", ["a"])],
+        256: [("first", ["later", "a", "b"]), ("second", ["a"])],
     }[capacity]
     collect.main()
 
@@ -530,7 +530,7 @@ def test_main_records_batches_transcripts_and_totals(
         ]
         assert [(r["dataset"], r["ids"]) for r in records] == expected
         assert [r["audio_seconds"] for r in records] == pytest.approx(
-            {1: [0.1, 0.1, 0.3, 0.2], 2: [0.2, 0.3, 0.2], 256: [0.5, 0.2]}[capacity]
+            {1: [0.3, 0.1, 0.1, 0.2], 2: [0.4, 0.1, 0.2], 256: [0.5, 0.2]}[capacity]
         )
         assert [r["inference_seconds"] for r in records] == [1.0] * len(expected)
         assert json.loads(
@@ -542,7 +542,7 @@ def test_main_records_batches_transcripts_and_totals(
                 "rtfx": 0.7 / len(expected),
             }
         )
-        for name, ids in (("first", ["a", "b", "later"]), ("second", ["a"])):
+        for name, ids in (("first", ["later", "a", "b"]), ("second", ["a"])):
             assert [
                 json.loads(line)
                 for line in (directory / f"{name}.jsonl").read_text().splitlines()

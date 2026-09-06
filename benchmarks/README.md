@@ -164,8 +164,11 @@ and batch capacity must not be substituted after a failure. Checkpoint filenames
 must match the frozen campaign; checkpoint and sidecar hashes are verified before
 the matrix starts and after every export, before collection can begin.
 
-Each dataset is sorted by audio duration (`frames / rate`) with stable ID tie-breaking.
-Its final partial batch is included; datasets never share a batch. Warm-up is
+Each dataset is sorted by descending audio duration (`frames / rate`), with
+ascending utterance IDs breaking ties, before batches are formed. Its final
+partial batch contains the shortest clips and is included; datasets never share
+a batch. Freeze a new campaign for this ordering; ascending-order campaigns
+require their original benchmark code for scoring and reporting. Warm-up is
 five untimed real batches selected at duration quantiles across the suite. Then
 the campaign's measured passes run, without additional hidden warm-up calls.
 

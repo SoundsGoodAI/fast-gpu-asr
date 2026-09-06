@@ -164,7 +164,7 @@ def rows() -> list[dict[str, JSONValue]]:
     Returns
     -------
     list[dict[str, JSONValue]]
-        Three rows expected to sort as a, b, c, lasting one, one, and two seconds.
+        Three rows expected to sort as c, a, b, lasting two, one, and one seconds.
     """
 
     return [
@@ -209,9 +209,9 @@ def evidence(
             "inference_seconds": elapsed,
         }
         for name, ids, audio, elapsed in (
-            ("first", ["a", "b"], 2.0, 0.25),
-            ("first", ["c"], 2.0, 0.75),
-            ("second", ["d", "a"], 3.5, 2.0),
+            ("first", ["c", "a"], 3.0, 0.25),
+            ("first", ["b"], 1.0, 0.75),
+            ("second", ["a", "d"], 3.5, 2.0),
         )
     ]
     return campaign, records
@@ -441,12 +441,14 @@ def test_load_campaign_requires_protocol_and_datasets_objects(
         common.load_campaign(path)
 
 
-@pytest.mark.parametrize("change", ("protocol", "missing", "extra", "order"))
+@pytest.mark.parametrize("change", ("protocol", "sort", "missing", "extra", "order"))
 def test_load_campaign_rejects_incompatible_suite_even_with_valid_digest(
     tmp_path: Path, campaign: dict[str, JSONValue], change: str
 ) -> None:
     if change == "protocol":
         campaign["protocol"]["audio_seconds"][2] = 60
+    elif change == "sort":
+        campaign["protocol"]["sort"] = "duration, utterance ID; within dataset"
     elif change == "missing":
         del campaign["datasets"][common.DATASETS[-1]]
     elif change == "extra":
@@ -622,15 +624,15 @@ def test_read_audio_rejects_invalid_payload_or_rate(
 
 @pytest.mark.parametrize(
     "capacity,expected",
-    ((1, [["a"], ["b"], ["c"]]), (2, [["a", "b"], ["c"]]), (256, [["a", "b", "c"]])),
+    ((1, [["c"], ["a"], ["b"]]), (2, [["c", "a"], ["b"]]), (256, [["c", "a", "b"]])),
 )
-def test_batches_sort_by_duration_then_id_without_changing_rows(
+def test_batches_sort_by_descending_duration_then_id_without_changing_rows(
     rows: list[dict[str, JSONValue]], capacity: int, expected: list[list[str]]
 ) -> None:
     before = deepcopy(rows)
     result = common.batches(rows, capacity)
     assert [[row["id"] for row in batch] for batch in result] == expected
-    assert [row for batch in result for row in batch] == [rows[2], rows[1], rows[0]]
+    assert [row for batch in result for row in batch] == [rows[0], rows[2], rows[1]]
     assert rows == before
     assert common.batches([], capacity) == []
 
@@ -676,12 +678,12 @@ def test_pass_totals_reject_incomplete_or_reordered_batches(
     "key,value,message",
     (
         ("dataset", "second", "utterance mismatch"),
-        ("ids", ["b", "a"], "utterance mismatch"),
+        ("ids", ["a", "c"], "utterance mismatch"),
         ("ids", ["a", "a"], "utterance mismatch"),
         ("ids", ["a"], "utterance mismatch"),
         ("ids", ["a", "b", "c"], "utterance mismatch"),
         ("audio_seconds", 4.0, "Audio duration"),
-        ("audio_seconds", 2.0 + 1e-10, "Audio duration"),
+        ("audio_seconds", 3.0 + 1e-10, "Audio duration"),
         ("audio_seconds", float("nan"), "Audio duration"),
         ("inference_seconds", 0.0, "Invalid inference time"),
         ("inference_seconds", -0.5, "Invalid inference time"),

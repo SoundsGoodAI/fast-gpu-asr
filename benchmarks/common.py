@@ -60,7 +60,7 @@ PROTOCOL = {
     "warmups": 5,
     "passes": 1,
     "timing": "synchronized full ASR call",
-    "sort": "duration, utterance ID; within dataset",
+    "sort": "duration descending, utterance ID ascending; within dataset",
     "math": "exporter defaults, including TF32 and eligible reduced-math tactics",
 }
 
@@ -311,7 +311,7 @@ def read_audio(
 def batches(
     rows: list[dict[str, JSONValue]], capacity: int
 ) -> list[list[dict[str, JSONValue]]]:
-    """Sort one dataset by duration then ID, retaining the final partial batch.
+    """Sort longest first, then by ascending ID, retaining the partial batch.
 
     Parameters
     ----------
@@ -335,7 +335,7 @@ def batches(
     if capacity not in BATCHES:
         raise ValueError(f"Unsupported batch capacity: {capacity}")
 
-    ordered = sorted(rows, key=lambda r: (r["frames"] / r["rate"], r["id"]))
+    ordered = sorted(rows, key=lambda r: (-r["frames"] / r["rate"], r["id"]))
     return [ordered[i : i + capacity] for i in range(0, len(ordered), capacity)]
 
 

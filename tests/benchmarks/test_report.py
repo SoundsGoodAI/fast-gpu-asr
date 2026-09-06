@@ -85,7 +85,7 @@ def write_run(
     directory : Path
         New run directory receiving metadata and scored passes.
     batch : int
-        Capacity for duration-sorted rows, including partial batches.
+        Capacity for longest-first rows, including partial batches.
     precision : str
         Precision recorded in the run specification.
     speed : float
@@ -143,7 +143,7 @@ def write_run(
         folder.mkdir()
         records, datasets = [], {}
         for i, (name, rows) in enumerate(campaign["datasets"].items(), 1):
-            rows = sorted(rows, key=lambda r: (r["frames"] / r["rate"], r["id"]))
+            rows = sorted(rows, key=lambda r: (-r["frames"] / r["rate"], r["id"]))
             seconds = elapsed = 0
             for j, offset in enumerate(range(0, len(rows), batch), 1):
                 group = rows[offset : offset + batch]
@@ -691,10 +691,10 @@ def test_validate_requires_exact_evidence_inventory(campaign, run_dir, extra):
     "ids,hypothesis,message",
     (
         ([], "", "Incomplete or reordered transcripts"),
-        (["1", "2"], "", "Incomplete or reordered transcripts"),
-        (["1", "2", "0", "extra"], "", "Incomplete or reordered transcripts"),
-        (["0", "2", "1"], "", "Incomplete or reordered transcripts"),
-        (["1", "2", "0"], None, "Hypotheses must be strings"),
+        (["0", "2"], "", "Incomplete or reordered transcripts"),
+        (["0", "2", "1", "extra"], "", "Incomplete or reordered transcripts"),
+        (["1", "2", "0"], "", "Incomplete or reordered transcripts"),
+        (["0", "2", "1"], None, "Hypotheses must be strings"),
     ),
 )
 def test_validate_rejects_invalid_transcripts(
