@@ -413,7 +413,7 @@ def test_ci_protects_gpu_runs_and_checkout_credentials() -> None:
                 restricted_jobs.append((workflow_path, job_name))
                 assert job.get("continue-on-error") in (None, False)
                 timeout = job.get("timeout-minutes")
-                assert type(timeout) is int and 0 < timeout <= 60
+                assert isinstance(timeout, int) and 0 < timeout <= 60
                 assert " ".join(job["if"].split()) == MANUAL_GPU_CONDITION
 
             checkout_steps.extend(
@@ -432,7 +432,7 @@ def test_ci_quality_job_enforces_repository_checks() -> None:
     quality_job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["quality"]
     assert re.fullmatch(r"ubuntu-(?:latest|\d{2}\.\d{2})", quality_job["runs-on"])
     timeout = quality_job.get("timeout-minutes")
-    assert type(timeout) is int and 0 < timeout <= 20
+    assert isinstance(timeout, int) and 0 < timeout <= 20
 
     expected_steps = {
         "Check lockfile": "uv lock --check",
@@ -1001,7 +1001,7 @@ def test_ci_runs_hosted_tests_for_every_supported_python() -> None:
 
     assert re.fullmatch(r"ubuntu-(?:latest|\d{2}\.\d{2})", python_job["runs-on"])
     timeout = python_job.get("timeout-minutes")
-    assert type(timeout) is int and 0 < timeout <= 30
+    assert isinstance(timeout, int) and 0 < timeout <= 30
     for name, expected_script in {
         "Install development environment": "uv sync --frozen --extra dev",
         "Compile Python sources": (

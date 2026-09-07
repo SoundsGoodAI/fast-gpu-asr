@@ -49,9 +49,16 @@ ZIPFORMER_UPSAMPLE_BYPASS_PLUGIN_NAME = "zipformer_upsample_bypass"
 # Runtime limits and tuning values.
 # Amortize thread scheduling over roughly 64 MB of float32 waveform data.
 AUDIO_SAMPLES_PER_WORKER = 16_000_000
+# CUDA allows 48 KiB per block by default; larger allocations require explicit opt-in.
+CUDA_DEFAULT_SHARED_MEMORY_BYTES = 48 * 1024
 INT32_MAX = (1 << 31) - 1
 PARAKEET_MAX_ENCODER_FRAMES = 512
+TDT_BEAM_SEARCH_THREADS = 256
 # Keep this even so each graph replay restores canonical ping-pong buffer roles.
-TDT_SEARCH_CHUNK_STEPS = 8
+TDT_BEAM_SEARCH_CHUNK_STEPS = 8
+# Power-of-two entries holding exact, verified node pairs; 2 KiB per utterance.
+TDT_HISTORY_CACHE_SIZE = 256
+TDT_PREPARE_INPUTS_THREADS = 256
+TDT_SELECT_TOKENS_THREADS = 512
 ZIPFORMER_BEAM_SEARCH_THREADS = 512
 ZERO_LOG = -20.7233

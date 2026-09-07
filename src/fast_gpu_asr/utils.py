@@ -6,6 +6,8 @@ from math import prod
 from pathlib import Path
 from pickle import UnpicklingError
 
+import cupy as cp
+import numpy as np
 import sentencepiece as spm
 import tensorrt as trt
 import torch
@@ -13,13 +15,17 @@ from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
 from .constants import (
+    CUDA_DEFAULT_SHARED_MEMORY_BYTES,
     DECODER_TYPES,
     INT32_MAX,
     MODEL_TYPE_PARAKEET,
     MODEL_TYPE_ZIPFORMER,
     PARAKEET_DECODER_TENSORRT_FILE,
     PARAKEET_TENSORRT_FILE,
+    TDT_BEAM_SEARCH_THREADS,
+    TDT_SELECT_TOKENS_THREADS,
     TOKENIZER_FILE,
+    ZIPFORMER_BEAM_SEARCH_THREADS,
     ZIPFORMER_DECODER_CONTEXTS_FILE,
     ZIPFORMER_DECODER_TENSORRT_FILE,
     ZIPFORMER_TENSORRT_FILE,
@@ -727,7 +733,13 @@ def validate_decoder_engine(
     ------
     ASRInitializationError
         Raised when decoder capacity, tensor names, shapes, or dtypes differ
-        from the configured Zipformer or Parakeet runtime contract.
+        from the configured runtime contract, or a search kernel exceeds
+        the selected GPU's shared-memory limit.
+
+    Notes
+    -----
+    Shared-memory limits are checked on the current CUDA device.
+    Export and inference must select their target device before validation.
     """
 
     if not isinstance(batch_size, int) or not 1 <= batch_size <= INT32_MAX:
@@ -843,6 +855,43 @@ def validate_decoder_engine(
                 f"Expected decoder tensor {name} dtype {trt.int32}, "
                 f"got {engine.get_tensor_dtype(name)}."
             )
+
+    beam = model_config.decoder_params.beam
+    if model_config.model_type == MODEL_TYPE_PARAKEET:
+        model_name = "Parakeet"
+        durations = model_config.decoder_params.tdt_durations
+        candidate_count = beam * (
+            len(durations) * beam + sum(duration > 0 for duration in durations)
+        )
+        bucket_count = 1 << ((candidate_count - 1) // 2).bit_length()
+        shared_memory_bytes = bucket_count * np.dtype(np.int32).itemsize + (
+            candidate_count + TDT_BEAM_SEARCH_THREADS // 32 + beam
+        ) * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
+        token_selection_bytes = model_config.vocab_size * np.dtype(np.float32).itemsize
+        token_selection_bytes += (TDT_SELECT_TOKENS_THREADS // 32) * (
+            np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
+        )
+    else:
+        model_name = "Zipformer"
+        shared_memory_bytes = ZIPFORMER_BEAM_SEARCH_THREADS // 32 * (
+            np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
+        ) + beam * (
+            (model_config.vocab_size + 2) * np.dtype(np.float32).itemsize
+            + (model_config.decoder_params.context_size + 3)
+            * np.dtype(np.int32).itemsize
+        )
+
+    shared_memory_requirements = [("beam search", shared_memory_bytes)]
+    if model_config.model_type == MODEL_TYPE_PARAKEET:
+        shared_memory_requirements.append(("token selection", token_selection_bytes))
+    for kernel_name, required in shared_memory_requirements:
+        if required > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
+            limit = cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
+            if required > limit:
+                raise ASRInitializationError(
+                    f"{model_name} {kernel_name} requires {required} bytes of "
+                    f"shared memory per block, but this GPU supports {limit}."
+                )
 
 
 def validate_zipformer_context_lookup(

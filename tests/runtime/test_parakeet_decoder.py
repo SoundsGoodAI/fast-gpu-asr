@@ -15,9 +15,18 @@ import numpy as np
 import pytest
 import tensorrt as trt
 
-from fast_gpu_asr.constants import INT32_MAX, TDT_SEARCH_CHUNK_STEPS
+from fast_gpu_asr.constants import (
+    CUDA_DEFAULT_SHARED_MEMORY_BYTES,
+    INT32_MAX,
+    TDT_BEAM_SEARCH_CHUNK_STEPS,
+    TDT_BEAM_SEARCH_THREADS,
+    TDT_HISTORY_CACHE_SIZE,
+    TDT_PREPARE_INPUTS_THREADS,
+    TDT_SELECT_TOKENS_THREADS,
+)
 from fast_gpu_asr.decoder import parakeet_decoder
 from fast_gpu_asr.decoder.gpu_kernels import (
+    HISTORY_HELPERS_SOURCE,
     TDT_BEAM_SEARCH_KERNEL,
     TDT_FINALIZE_KERNEL,
     TDT_PREPARE_INPUTS_KERNEL,
@@ -63,7 +72,7 @@ def expected_token_selection_shared_memory_bytes(vocab_size: int, threads: int) 
 def expected_beam_search_shared_memory_bytes(
     beam: int, duration_count: int, positive_duration_count: int, threads: int
 ) -> int:
-    """Return storage for expanded candidates, reductions, and selected pairs.
+    """Return storage for candidates, bucket links, reductions, and selected pairs.
 
     Parameters
     ----------
@@ -83,21 +92,22 @@ def expected_beam_search_shared_memory_bytes(
     """
 
     candidate_count = beam * (duration_count * beam + positive_duration_count)
-    return (
-        candidate_count * np.dtype(np.float32).itemsize
-        + threads // 32 * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
-        + beam * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
-    )
+    bucket_count = 1 << ((candidate_count - 1) // 2).bit_length()
+
+    return bucket_count * np.dtype(np.int32).itemsize + (
+        candidate_count + threads // 32 + beam
+    ) * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
 
 
 @pytest.mark.cuda
-def test_parakeet_token_selection_scans_full_vocabulary() -> None:
+def test_parakeet_token_selection_scans_full_vocabulary_and_excludes_blank() -> None:
     beam = 2
-    threads = 512
+    threads = TDT_SELECT_TOKENS_THREADS
     vocab_size = threads + 7
     token_log_probs = cp.full((1, vocab_size + 1), -10.0, dtype=np.float32)
     token_log_probs[0, threads + 5] = 0.75
     token_log_probs[0, threads + 6] = 1.25
+    token_log_probs[0, vocab_size] = 100.0
     top_token_scores = cp.empty((1, beam), dtype=np.float32)
     top_token_indexes = cp.empty((1, beam), dtype=np.int32)
     shared_memory_bytes = expected_token_selection_shared_memory_bytes(
@@ -125,35 +135,7 @@ def test_parakeet_token_selection_scans_full_vocabulary() -> None:
 
 
 @pytest.mark.cuda
-def test_parakeet_token_selection_excludes_blank_column() -> None:
-    vocab_size = 3
-    beam = 2
-    threads = 256
-    top_token_scores = cp.empty((1, beam), dtype=np.float32)
-    top_token_indexes = cp.empty((1, beam), dtype=np.int32)
-
-    TDT_SELECT_TOKENS_KERNEL(
-        (1,),
-        (threads,),
-        (
-            cp.array([[0.25, 0.5, -1.0, 100.0]], dtype=np.float32),
-            cp.array([0.0], dtype=np.float32),
-            cp.array([0], dtype=np.int32),
-            cp.array([1], dtype=np.int32),
-            top_token_scores,
-            top_token_indexes,
-            np.int32(vocab_size),
-            np.int32(beam),
-        ),
-        shared_mem=expected_token_selection_shared_memory_bytes(vocab_size, threads),
-    )
-
-    np.testing.assert_allclose(top_token_scores.get(), [[0.5, 0.25]])
-    np.testing.assert_array_equal(top_token_indexes.get(), [[1, 0]])
-
-
-@pytest.mark.cuda
-@pytest.mark.parametrize("invalid_score", (-np.inf, np.nan))
+@pytest.mark.parametrize("invalid_score", (-np.inf, np.inf, np.nan))
 def test_parakeet_token_selection_keeps_nonfinite_indexes_in_bounds(
     invalid_score: float,
 ) -> None:
@@ -207,16 +189,31 @@ def test_parakeet_token_selection_keeps_nonfinite_indexes_in_bounds(
         ),
     ),
 )
+@pytest.mark.parametrize("unaligned_buffer", (None, "encoder_output", "encoder_input"))
 def test_parakeet_prepare_inputs_converts_precision(
     encoder_dtype: np.dtype,
     encoder_dtype_code: np.int32,
     decoder_dtype: np.dtype,
     decoder_dtype_code: np.int32,
+    unaligned_buffer: str | None,
 ) -> None:
     encoder_output = (
         cp.arange(16, dtype=cp.float32).reshape(1, 2, 8).astype(encoder_dtype)
     )
     encoder_input = cp.full((2, 8), -1.0, dtype=decoder_dtype)
+    if unaligned_buffer is not None:
+        original = (
+            encoder_output if unaligned_buffer == "encoder_output" else encoder_input
+        )
+        view = cp.empty(original.size + 1, dtype=original.dtype)[1:].reshape(
+            original.shape
+        )
+        view[...] = original
+        assert view.flags.c_contiguous and view.data.ptr % 16 != 0
+        if unaligned_buffer == "encoder_output":
+            encoder_output = view
+        else:
+            encoder_input = view
     targets = cp.full((2, 1), -1, dtype=cp.int32)
     TDT_PREPARE_INPUTS_KERNEL(
         (2,),
@@ -308,9 +305,9 @@ def make_fake_parakeet_decoder(
     }
     decoder.state_dtype = decoder.kernel_dtype_map[state_dtype]
     decoder.encoder_input_dtype = np.int32(0)
-    decoder.prepare_inputs_threads = 256
-    decoder.token_selection_threads = 512
-    decoder.beam_search_threads = 256
+    decoder.prepare_inputs_threads = TDT_PREPARE_INPUTS_THREADS
+    decoder.token_selection_threads = TDT_SELECT_TOKENS_THREADS
+    decoder.beam_search_threads = TDT_BEAM_SEARCH_THREADS
     decoder.stream = cp.cuda.get_current_stream()
     decoder.beam_search_shared_memory_bytes = expected_beam_search_shared_memory_bytes(
         beam,
@@ -375,6 +372,9 @@ def make_fake_parakeet_decoder(
     decoder.hypothesis_hashes = cp.empty(search_shape, dtype=np.uint64)
     decoder.next_hashes = cp.empty(search_shape, dtype=np.uint64)
     decoder.node_counts = cp.empty(batch_size, dtype=np.int32)
+    decoder.history_cache = cp.empty(
+        (batch_size, TDT_HISTORY_CACHE_SIZE), dtype=np.uint64
+    )
     decoder.node_parents = None
     decoder.node_tokens = None
     decoder.node_timestamps = None
@@ -500,15 +500,6 @@ def install_static_decoder_context(
 
     token_scores_array = cp.array(token_scores, dtype=np.float32)
     duration_scores_array = cp.array(duration_scores, dtype=np.float32)
-    if token_scores_array.ndim == 1:
-        token_scores_array = cp.broadcast_to(
-            token_scores_array, (decoder.decoder_capacity, token_scores_array.size)
-        )
-    if duration_scores_array.ndim == 1:
-        duration_scores_array = cp.broadcast_to(
-            duration_scores_array,
-            (decoder.decoder_capacity, duration_scores_array.size),
-        )
 
     def execute(_call: int) -> bool:
         """Write fixed scores and preserve recurrent state for one step.
@@ -594,30 +585,12 @@ def test_parakeet_decoder_propagates_non_capture_driver_errors(
 ) -> None:
     decoder = make_fake_parakeet_decoder()
 
-    class FakeDriverError(RuntimeError):
-        """Expose a CUDA driver status through a deterministic test error."""
-
-        def __init__(self, status: int) -> None:
-            """Initialize the error from one CUDA driver status.
-
-            Parameters
-            ----------
-            status : int
-                CUDA driver error code exposed through ``status``.
-            """
-
-            super().__init__(f"CUDA driver error {status}")
-            self.status = status
-
-    failure = FakeDriverError(901)
+    failure = cp.cuda.driver.CUDADriverError(901)
     failing_kernel = Mock(side_effect=failure)
-    monkeypatch.setattr(
-        parakeet_decoder.cp.cuda.driver, "CUDADriverError", FakeDriverError
-    )
     monkeypatch.setattr(parakeet_decoder, "TDT_SELECT_TOKENS_KERNEL", failing_kernel)
     install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [-2.0, 0.0])
 
-    with pytest.raises(FakeDriverError) as error:
+    with pytest.raises(cp.cuda.driver.CUDADriverError) as error:
         decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
     decoder.stream.synchronize()
 
@@ -663,90 +636,73 @@ def test_parakeet_decoder_restores_buffers_after_execution_failure() -> None:
 
 
 @pytest.mark.cuda
-def test_parakeet_decoder_restores_buffers_after_captured_binding_failure() -> None:
+def test_parakeet_decoder_restores_buffers_after_captured_binding_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     decoder = make_fake_parakeet_decoder()
     decoder.cuda_graph_supported = True
     decoder.max_symbols_per_timestep = 20
     original_buffers = get_parakeet_search_buffers(decoder)
+    context = install_static_decoder_context(decoder, [-10.0, 0.0, -10.0], [0.0, -10.0])
+    bind = context.set_tensor_address
+    capture_bindings = []
 
-    class RejectingContext:
-        """Reject one recurrent-state binding during CUDA graph capture."""
+    def reject_captured_binding(name: str, address: int) -> bool:
+        """Reject the first recurrent state only during graph capture.
 
-        def __init__(self) -> None:
-            """Initialize captured binding history."""
+        Parameters
+        ----------
+        name : str
+            Recurrent-state input name, recorded by the underlying context.
+        address : int
+            Device pointer validated by the underlying context.
 
-            self.capture_bindings: list[str] = []
+        Returns
+        -------
+        bool
+            False for input_states_1 during capture; otherwise the underlying
+            binding result. Both capture-time bindings are recorded.
+        """
 
-        def set_tensor_address(self, name: str, address: int) -> bool:
-            """Record capture-time bindings and reject the first state input.
+        bound = bind(name, address)
+        if cp.cuda.runtime.streamIsCapturing(decoder.stream.ptr):
+            capture_bindings.append(name)
+            return name != "input_states_1"
+        return bound
 
-            Parameters
-            ----------
-            name : str
-                Recurrent-state tensor name being rebound.
-            address : int
-                CUDA device address assigned to the tensor.
-
-            Returns
-            -------
-            bool
-                ``False`` for ``input_states_1`` during capture, otherwise ``True``.
-            """
-
-            assert name in {"input_states_1", "input_states_2"}
-            assert address > 0
-            if cp.cuda.runtime.streamIsCapturing(decoder.stream.ptr):
-                self.capture_bindings.append(name)
-                return name != "input_states_1"
-            return True
-
-        def execute_async_v3(self, stream_ptr: int) -> bool:
-            """Populate deterministic decoder outputs on the expected stream.
-
-            Parameters
-            ----------
-            stream_ptr : int
-                CUDA stream pointer supplied by the decoder.
-
-            Returns
-            -------
-            bool
-                Always ``True`` after writing scores and recurrent states.
-            """
-
-            assert stream_ptr == decoder.stream.ptr
-            decoder.token_log_probs.fill(-10.0)
-            decoder.token_log_probs[:, 1] = 0.0
-            decoder.duration_log_probs.fill(-10.0)
-            decoder.duration_log_probs[:, 0] = 0.0
-            decoder.output_state_1[...] = decoder.state_1
-            decoder.output_state_2[...] = decoder.state_2
-            return True
-
-    context = RejectingContext()
-    decoder.decoder = context
+    monkeypatch.setattr(context, "set_tensor_address", reject_captured_binding)
     with pytest.raises(ASRInferenceError, match="recurrent-state input"):
         decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
     decoder.stream.synchronize()
 
-    assert context.capture_bindings == ["input_states_1", "input_states_2"]
+    assert capture_bindings == ["input_states_1", "input_states_2"]
     for name, original_buffer in original_buffers.items():
         assert getattr(decoder, name) is original_buffer
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("invalid_score", (-np.inf, np.nan))
+@pytest.mark.parametrize("invalid_score", (-np.inf, np.inf, np.nan))
 def test_parakeet_decoder_handles_nonfinite_search_scores(invalid_score: float) -> None:
     decoder = make_fake_parakeet_decoder(beam=2)
-    install_static_decoder_context(
-        decoder, [[invalid_score] * 3] * 2, [[invalid_score] * 2] * 2
-    )
+    install_static_decoder_context(decoder, [invalid_score] * 3, [invalid_score] * 2)
     token_ids, timestamps = decoder(
         cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
     )
 
     assert token_ids == [[]]
     assert timestamps == [[]]
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("invalid_score", (-np.inf, np.inf, np.nan))
+def test_parakeet_decoder_preserves_finite_candidates(invalid_score: float) -> None:
+    decoder = make_fake_parakeet_decoder()
+    install_static_decoder_context(decoder, [invalid_score, 0.0, -8.0], [-8.0, 0.0])
+
+    assert decoder(
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
+    ) == ([[1]], [[0.0]])
+    np.testing.assert_array_equal(decoder.completed_scores.get(), [0.0])
 
 
 @pytest.mark.cuda
@@ -820,6 +776,7 @@ def test_parakeet_decoder_does_not_leak_history_across_calls() -> None:
             Always ``True`` after writing deterministic scores and states.
         """
 
+        np.testing.assert_array_equal(decoder.history_cache.get(), 0)
         decoder.token_log_probs.fill(-10.0)
         decoder.token_log_probs[:, 1 if emit_token else decoder.blank_id] = 0.0
         decoder.duration_log_probs.fill(-10.0)
@@ -831,15 +788,14 @@ def test_parakeet_decoder_does_not_leak_history_across_calls() -> None:
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
     encoder_output = cp.zeros((1, 1, 3), dtype=np.float32)
     output_lengths = cp.ones(1, dtype=np.int32)
-
-    first_token_ids, first_timestamps = decoder(encoder_output, output_lengths)
+    decoder.history_cache.fill(np.iinfo(np.uint64).max)
+    first = decoder(encoder_output, output_lengths)
     emit_token = False
-    second_token_ids, second_timestamps = decoder(encoder_output, output_lengths)
+    decoder.history_cache.fill(np.iinfo(np.uint64).max)
+    second = decoder(encoder_output, output_lengths)
 
-    assert first_token_ids == [[1]]
-    np.testing.assert_allclose(first_timestamps, [[0.0]])
-    assert second_token_ids == [[]]
-    assert second_timestamps == [[]]
+    assert first == ([[1]], [[0.0]])
+    assert second == ([[]], [[]])
 
 
 @pytest.mark.cuda
@@ -874,7 +830,7 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
 
     assert token_ids == [[1, 1]]
     np.testing.assert_allclose(timestamps, [[0.0, 0.16]])
-    assert len(encoder_inputs) == TDT_SEARCH_CHUNK_STEPS
+    assert len(encoder_inputs) == TDT_BEAM_SEARCH_CHUNK_STEPS
     np.testing.assert_array_equal(encoder_inputs[0][0], encoder_output[0, 0].get())
     np.testing.assert_array_equal(encoder_inputs[1][0], encoder_output[0, 2].get())
 
@@ -882,9 +838,7 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
 @pytest.mark.cuda
 def test_parakeet_decoder_clamps_runtime_output_lengths() -> None:
     decoder = make_fake_parakeet_decoder(batch_size=2)
-    install_static_decoder_context(
-        decoder, [[-10.0, 0.0, -2.0]] * 2, [[-10.0, 0.0]] * 2
-    )
+    install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [-10.0, 0.0])
     token_ids, timestamps = decoder(
         cp.zeros((2, 2, 3), dtype=np.float32), cp.array([-1, 10], dtype=np.int32)
     )
@@ -897,11 +851,9 @@ def test_parakeet_decoder_clamps_runtime_output_lengths() -> None:
 @pytest.mark.cuda
 def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
     decoder = make_fake_parakeet_decoder(beam=2, batch_size=3)
-    encoder_inputs: list[np.typing.NDArray[np.float32]] = []
-    target_inputs: list[np.typing.NDArray[np.int32]] = []
 
     def execute(call: int) -> bool:
-        """Record first-step inputs and advance every active hypothesis.
+        """Check first-step inputs and advance every active hypothesis.
 
         Parameters
         ----------
@@ -915,8 +867,12 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
         """
 
         if call == 0:
-            encoder_inputs.append(decoder.encoder_input.get())
-            target_inputs.append(decoder.targets.get())
+            encoder_input = decoder.encoder_input.get()
+            np.testing.assert_array_equal(encoder_input[0], [1.0, 2.0, 3.0])
+            np.testing.assert_array_equal(encoder_input[1:], 0.0)
+            np.testing.assert_array_equal(
+                decoder.targets.get(), [[2], [0], [0], [0], [0], [0]]
+            )
         decoder.token_log_probs.fill(-10.0)
         decoder.token_log_probs[:, decoder.blank_id] = 0.0
         decoder.duration_log_probs.fill(-10.0)
@@ -925,7 +881,8 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
         decoder.output_state_2[...] = decoder.state_2
         return True
 
-    decoder.decoder = RuntimeDecoderContext(decoder, execute)
+    context = RuntimeDecoderContext(decoder, execute)
+    decoder.decoder = context
     decoder.encoder_input.fill(-1.0)
     decoder.targets.fill(-1)
     token_ids, timestamps = decoder(
@@ -934,11 +891,7 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
 
     assert token_ids == [[]]
     assert timestamps == [[]]
-    np.testing.assert_array_equal(encoder_inputs[0][0], [1.0, 2.0, 3.0])
-    np.testing.assert_array_equal(encoder_inputs[0][1:], 0.0)
-    np.testing.assert_array_equal(
-        target_inputs[0], np.array([[2], [0], [0], [0], [0], [0]], dtype=np.int32)
-    )
+    assert context.calls > 0
     np.testing.assert_array_equal(decoder.search_output_lengths.get(), [1, 0, 0])
 
 
@@ -962,14 +915,36 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
         ),
     ),
 )
+@pytest.mark.parametrize(
+    "unaligned_buffer",
+    (
+        None,
+        "state_1",
+        "state_2",
+        "output_state_1",
+        "output_state_2",
+        "next_state_1",
+        "next_state_2",
+    ),
+)
 def test_parakeet_decoder_routes_recurrent_state_by_emission(
-    state_dtype: np.dtype, state_hidden_dim: int, state_layers: int
+    state_dtype: np.dtype,
+    state_hidden_dim: int,
+    state_layers: int,
+    unaligned_buffer: str | None,
 ) -> None:
     decoder = make_fake_parakeet_decoder(
         state_dtype=state_dtype,
         state_hidden_dim=state_hidden_dim,
         state_layers=state_layers,
     )
+    if unaligned_buffer is not None:
+        original = getattr(decoder, unaligned_buffer)
+        view = cp.empty(original.size + 1, dtype=original.dtype)[1:].reshape(
+            original.shape
+        )
+        assert view.flags.c_contiguous and view.data.ptr % 16 != 0
+        setattr(decoder, unaligned_buffer, view)
     state_values = cp.arange(decoder.state_1.size, dtype=np.float32).reshape(
         decoder.state_1.shape
     )
@@ -1017,7 +992,7 @@ def test_parakeet_decoder_routes_recurrent_state_by_emission(
 
     assert token_ids == [[1]]
     np.testing.assert_allclose(timestamps, [[0.0]])
-    assert len(state_snapshots) == TDT_SEARCH_CHUNK_STEPS
+    assert len(state_snapshots) == TDT_BEAM_SEARCH_CHUNK_STEPS
     np.testing.assert_array_equal(state_snapshots[0][0], 0.0)
     np.testing.assert_array_equal(state_snapshots[0][1], 0.0)
     expected_values = state_values.get()
@@ -1036,7 +1011,73 @@ def test_parakeet_decoder_blank_advances_without_emitting_token() -> None:
 
     assert token_ids == [[]]
     assert timestamps == [[]]
-    assert context.calls == TDT_SEARCH_CHUNK_STEPS
+    assert context.calls == TDT_BEAM_SEARCH_CHUNK_STEPS
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "buffer_name, message",
+    [
+        ("node_tokens", "TDT token buffers"),
+        ("output_timestamps_host", "TDT host output buffers"),
+    ],
+)
+def test_parakeet_decoder_rejects_missing_reusable_buffers(
+    buffer_name: str, message: str
+) -> None:
+    decoder = make_fake_parakeet_decoder()
+    install_static_decoder_context(decoder, [-8.0, 0.0, -8.0], [-8.0, 0.0])
+    encoder_output = cp.zeros((1, 1, 3), dtype=np.float32)
+    lengths = cp.array([1], dtype=np.int32)
+    expected = ([[1]], [[0.0]])
+    assert decoder(encoder_output, lengths) == expected
+    buffer = getattr(decoder, buffer_name)
+    setattr(decoder, buffer_name, None)
+
+    with pytest.raises(ASRInferenceError, match=message):
+        decoder(encoder_output, lengths)
+
+    setattr(decoder, buffer_name, buffer)
+    assert decoder(encoder_output, lengths) == expected
+
+
+@pytest.mark.cuda
+def test_parakeet_decoder_stops_at_step_budget_with_stale_active_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoder = make_fake_parakeet_decoder()
+    decoder.max_symbols_per_timestep = 1
+    context = install_static_decoder_context(decoder, [-8.0, 0.0, -8.0], [-8.0, 0.0])
+    kernel = parakeet_decoder.TDT_BEAM_SEARCH_KERNEL
+
+    def search_with_stale_flag(*args, **kwargs) -> None:
+        """Run real search but leave its completion flag active.
+
+        Parameters
+        ----------
+        *args
+            Grid, block, and kernel arguments forwarded to the real CUDA kernel.
+        **kwargs
+            Launch options, including shared memory and the decoder stream.
+
+        Notes
+        -----
+        The forced active flag exercises the decoder's step-budget limit without
+        changing the hypotheses produced by the kernel.
+        """
+
+        kernel(*args, **kwargs)
+        decoder.active_flags.fill(1)
+
+    monkeypatch.setattr(
+        parakeet_decoder, "TDT_BEAM_SEARCH_KERNEL", search_with_stale_flag
+    )
+
+    assert decoder(
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
+    ) == ([[1]], [[0.0]])
+    assert context.calls == 2
+    np.testing.assert_array_equal(decoder.active_flags_host, [1])
 
 
 @pytest.mark.cuda
@@ -1238,27 +1279,12 @@ def test_parakeet_decoder_recovers_from_invalidated_cuda_capture() -> None:
 
 
 @pytest.mark.cuda
-def test_parakeet_decoder_propagates_non_invalidation_capture_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_parakeet_decoder_propagates_non_invalidation_capture_error() -> None:
     decoder = make_fake_parakeet_decoder()
     decoder.cuda_graph_supported = True
     decoder.max_symbols_per_timestep = 20
 
-    class FakeCaptureError(RuntimeError):
-        """Expose a CUDA runtime status through a deterministic test error."""
-
-        def __init__(self, status: int) -> None:
-            """Initialize the error from one CUDA runtime status.
-
-            Parameters
-            ----------
-            status : int
-                CUDA runtime error code exposed through ``status``.
-            """
-
-            super().__init__(f"CUDA capture error {status}")
-            self.status = status
+    failure = cp.cuda.runtime.CUDARuntimeError(17)
 
     class FailingCaptureStream(cp.cuda.Stream):
         """Finish graph capture and then report an unexpected CUDA error."""
@@ -1268,27 +1294,24 @@ def test_parakeet_decoder_propagates_non_invalidation_capture_error(
 
             Raises
             ------
-            FakeCaptureError
+            cp.cuda.runtime.CUDARuntimeError
                 Always raised after CuPy finishes the active capture.
             """
 
             super().end_capture()
-            raise FakeCaptureError(17)
+            raise failure
 
-    monkeypatch.setattr(
-        parakeet_decoder.cp.cuda.runtime, "CUDARuntimeError", FakeCaptureError
-    )
     decoder.stream = FailingCaptureStream(non_blocking=True)
     install_static_decoder_context(decoder, [-10.0, 0.0, -10.0], [0.0, -10.0])
     encoder_output = cp.zeros((1, 1, 3), dtype=np.float32)
     output_lengths = cp.ones(1, dtype=np.int32)
     cp.cuda.get_current_stream().synchronize()
 
-    with pytest.raises(FakeCaptureError) as error:
+    with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
         decoder(encoder_output, output_lengths)
     decoder.stream.synchronize()
 
-    assert error.value.status == 17
+    assert error.value is failure
     assert decoder.cuda_graph_supported
     assert decoder.cuda_graph is None
 
@@ -1309,11 +1332,11 @@ def test_parakeet_decoder_grows_and_reuses_output_buffers() -> None:
     )
 
     short_tokens, _ = decoder(backing_output[:, :1], cp.array([1], dtype=np.int32))
-    short_buffers = [getattr(decoder, name) for name in buffer_names]
+    short_buffers = {name: getattr(decoder, name) for name in buffer_names}
     assert decoder.token_capacity == 11
 
     long_tokens, _ = decoder(backing_output, cp.array([3], dtype=np.int32))
-    long_buffers = [getattr(decoder, name) for name in buffer_names]
+    long_buffers = {name: getattr(decoder, name) for name in buffer_names}
     assert decoder.token_capacity == 33
 
     final_tokens, _ = decoder(backing_output[:, :1], cp.array([1], dtype=np.int32))
@@ -1321,11 +1344,9 @@ def test_parakeet_decoder_grows_and_reuses_output_buffers() -> None:
     assert short_tokens == [[1]]
     assert long_tokens == [[1, 1, 1]]
     assert final_tokens == [[1]]
-    for name, short_buffer, long_buffer in zip(
-        buffer_names, short_buffers, long_buffers, strict=True
-    ):
-        assert long_buffer is not short_buffer
-        assert getattr(decoder, name) is long_buffer
+    for name in buffer_names:
+        assert long_buffers[name] is not short_buffers[name]
+        assert getattr(decoder, name) is long_buffers[name]
 
 
 @pytest.mark.cuda
@@ -1464,6 +1485,7 @@ def make_beam_search_buffers(
         node_tokens=cp.empty(beam * token_stride, dtype=np.int32),
         node_timestamps=cp.empty(beam * token_stride, dtype=np.float32),
         node_counts=cp.zeros(1, dtype=np.int32),
+        history_cache=cp.zeros((1, TDT_HISTORY_CACHE_SIZE), dtype=np.uint64),
         completed_scores=cp.full(1, -np.inf, dtype=np.float32),
         completed_nodes=cp.full(1, -1, dtype=np.int32),
         completed_lengths=cp.zeros(1, dtype=np.int32),
@@ -1487,7 +1509,9 @@ def make_beam_search_buffers(
     )
 
 
-def run_beam_search(buffers: SimpleNamespace, threads: int = 256) -> None:
+def run_beam_search(
+    buffers: SimpleNamespace, threads: int = TDT_BEAM_SEARCH_THREADS
+) -> None:
     """Launch the TDT beam-search kernel for a prepared fixture.
 
     Parameters
@@ -1500,77 +1524,86 @@ def run_beam_search(buffers: SimpleNamespace, threads: int = 256) -> None:
 
     duration_count = buffers.durations.size
     positive_duration_count = buffers.positive_duration_indexes.size
-    TDT_BEAM_SEARCH_KERNEL(
-        (1,),
-        (threads,),
-        (
-            buffers.token_log_probs,
-            buffers.duration_log_probs,
-            buffers.top_token_scores,
-            buffers.top_token_indexes,
-            buffers.scores,
-            buffers.nodes,
-            buffers.hashes,
-            buffers.lengths,
-            buffers.time_indexes,
-            buffers.last_tokens,
-            buffers.symbols,
-            buffers.next_scores,
-            buffers.next_nodes,
-            buffers.next_hashes,
-            buffers.next_lengths,
-            buffers.next_time_indexes,
-            buffers.next_last_tokens,
-            buffers.next_symbols,
-            buffers.parent_indexes,
-            buffers.use_output_state,
-            buffers.node_parents,
-            buffers.node_tokens,
-            buffers.node_timestamps,
-            buffers.node_counts,
-            buffers.completed_scores,
-            buffers.completed_nodes,
-            buffers.completed_lengths,
-            buffers.active_flags,
-            buffers.output_lengths,
-            buffers.durations,
-            buffers.positive_duration_indexes,
-            buffers.state_1,
-            buffers.state_2,
-            buffers.output_state_1,
-            buffers.output_state_2,
-            buffers.next_state_1,
-            buffers.next_state_2,
-            buffers.encoder_output,
-            buffers.encoder_input,
-            buffers.targets,
-            np.int32(4),
-            np.int32(1),
-            buffers.runtime_dimensions,
-            np.int32(4),
-            np.int32(0),
-            np.int32(0),
-            np.int32(0),
-            np.int32(buffers.token_stride),
-            np.int32(buffers.beam),
-            np.int32(duration_count),
-            np.int32(positive_duration_count),
-            np.int32(buffers.blank_id),
-            np.int32(10),
-            np.float32(0.0),
-            np.float32(0.08),
-        ),
-        shared_mem=expected_beam_search_shared_memory_bytes(
-            buffers.beam, duration_count, positive_duration_count, threads
-        ),
+    shared_memory = expected_beam_search_shared_memory_bytes(
+        buffers.beam, duration_count, positive_duration_count, threads
     )
+    with pytest.MonkeyPatch.context() as patch:
+        if shared_memory > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
+            patch.setattr(
+                TDT_BEAM_SEARCH_KERNEL, "max_dynamic_shared_size_bytes", shared_memory
+            )
+
+        TDT_BEAM_SEARCH_KERNEL(
+            (1,),
+            (threads,),
+            (
+                buffers.token_log_probs,
+                buffers.duration_log_probs,
+                buffers.top_token_scores,
+                buffers.top_token_indexes,
+                buffers.scores,
+                buffers.nodes,
+                buffers.hashes,
+                buffers.lengths,
+                buffers.time_indexes,
+                buffers.last_tokens,
+                buffers.symbols,
+                buffers.next_scores,
+                buffers.next_nodes,
+                buffers.next_hashes,
+                buffers.next_lengths,
+                buffers.next_time_indexes,
+                buffers.next_last_tokens,
+                buffers.next_symbols,
+                buffers.parent_indexes,
+                buffers.use_output_state,
+                buffers.node_parents,
+                buffers.node_tokens,
+                buffers.node_timestamps,
+                buffers.node_counts,
+                buffers.completed_scores,
+                buffers.completed_nodes,
+                buffers.completed_lengths,
+                buffers.active_flags,
+                buffers.output_lengths,
+                buffers.durations,
+                buffers.positive_duration_indexes,
+                buffers.state_1,
+                buffers.state_2,
+                buffers.output_state_1,
+                buffers.output_state_2,
+                buffers.next_state_1,
+                buffers.next_state_2,
+                buffers.encoder_output,
+                buffers.encoder_input,
+                buffers.targets,
+                np.int32(4),
+                np.int32(1),
+                buffers.runtime_dimensions,
+                np.int32(4),
+                np.int32(0),
+                np.int32(0),
+                np.int32(0),
+                np.int32(buffers.token_stride),
+                np.int32(buffers.beam),
+                np.int32(duration_count),
+                np.int32(positive_duration_count),
+                np.int32(buffers.blank_id),
+                np.int32(10),
+                np.float32(0.0),
+                np.float32(0.08),
+                buffers.history_cache,
+                np.int32(TDT_HISTORY_CACHE_SIZE),
+            ),
+            shared_mem=shared_memory,
+        )
 
 
 @pytest.mark.cuda
 def test_parakeet_beam_search_scans_beyond_first_thread_block() -> None:
     beam = 16
     buffers = make_beam_search_buffers(beam, (1,), token_stride=2, num_frames=2)
-    assert beam * (beam + 1) > 256
+    assert beam * (beam + 1) > TDT_BEAM_SEARCH_THREADS
 
     buffers.token_log_probs[:, buffers.blank_id] = 0.0
     buffers.token_log_probs[-1, buffers.blank_id] = 5.0
@@ -1596,6 +1629,7 @@ def test_parakeet_beam_search_scans_beyond_first_thread_block() -> None:
 @pytest.mark.cuda
 def test_parakeet_beam_search_merges_duplicate_blank_histories() -> None:
     buffers = make_beam_search_buffers(2, (1,), token_stride=4, num_frames=2)
+    buffers.top_token_scores.fill(-np.inf)
     buffers.token_log_probs[:, buffers.blank_id] = 0.0
     buffers.scores[...] = cp.array([[0.0, -0.2]], dtype=np.float32)
     buffers.hashes.fill(0)
@@ -1611,6 +1645,430 @@ def test_parakeet_beam_search_merges_duplicate_blank_histories() -> None:
     np.testing.assert_array_equal(buffers.use_output_state.get(), [0, 0])
     np.testing.assert_array_equal(buffers.node_counts.get(), [0])
     np.testing.assert_array_equal(buffers.active_flags.get(), [1])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("masses", "expected_masses", "expected_parents"),
+    [
+        ([[0.18, 0.27], [0.252, 0.108]], [0.522, 0.18], [0, 0]),
+        ([[0.25, 0.17], [0.18, 0.24]], [0.35, 0.25], [1, 0]),
+    ],
+)
+def test_parakeet_beam_search_merges_before_pruning(
+    masses: list[list[float]],
+    expected_masses: list[float],
+    expected_parents: list[int],
+) -> None:
+    buffers = make_beam_search_buffers(2, (1, 2), token_stride=4, num_frames=4)
+    buffers.hashes.fill(0)
+    buffers.time_indexes[...] = cp.array([0, 1], dtype=np.int32)
+    masses_array = np.array(masses, dtype=np.float32)
+    parent_mass = masses_array.sum(axis=1)
+    buffers.scores[...] = cp.log(cp.array([parent_mass / 0.9]))
+    buffers.token_log_probs[...] = cp.log(cp.array([[0.07, 0.03, 0.9]] * 2))
+    buffers.top_token_scores[...] = buffers.token_log_probs[:, :2]
+    buffers.duration_log_probs[...] = cp.log(
+        cp.array(masses_array / parent_mass[:, None])
+    )
+    buffers.state_1[0, 1] = 7.0
+    buffers.state_2[0, 1] = 9.0
+
+    run_beam_search(buffers)
+
+    np.testing.assert_allclose(
+        np.exp(buffers.next_scores.get()[0]), expected_masses, rtol=1e-6
+    )
+    np.testing.assert_array_equal(buffers.next_time_indexes.get(), [2, 1])
+    np.testing.assert_array_equal(buffers.next_lengths.get(), [[0, 0]])
+    np.testing.assert_array_equal(buffers.parent_indexes.get(), expected_parents)
+    np.testing.assert_array_equal(
+        buffers.next_state_1.get(), buffers.state_1.get()[:, expected_parents]
+    )
+    np.testing.assert_array_equal(
+        buffers.next_state_2.get(), buffers.state_2.get()[:, expected_parents]
+    )
+    np.testing.assert_array_equal(buffers.use_output_state.get(), [0, 0])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "histories, emissions",
+    [
+        pytest.param([(0, 1), (1, 1)], [None, None], id="blank-collision"),
+        pytest.param([(0, 1), (0, 1)], [None, None], id="equal-blank-paths"),
+        pytest.param([(0, 1), (1, 1)], [0, 0], id="emission-collision"),
+        pytest.param([(0, 1), (0, 1)], [0, 0], id="equal-emission-paths"),
+        pytest.param([(0,), (1,)], [0, 1], id="different-emitted-tokens"),
+        pytest.param([(0,), (0, 1)], [1, None], id="emission-matches-blank"),
+        pytest.param([(1,), (0, 1)], [1, None], id="emission-blank-collision"),
+        pytest.param([(0, 1), (0,)], [None, 1], id="blank-matches-emission"),
+        pytest.param([(0, 1), (1,)], [None, 1], id="blank-emission-collision"),
+        pytest.param([(), (1,)], [1, None], id="empty-prefix"),
+        pytest.param([(), ()], [None, None], id="empty-histories"),
+        pytest.param(
+            [(0,) * 128, (1,) + (0,) * 127], [None, None], id="deep-collision"
+        ),
+        pytest.param([(0,) * 128] * 2, [None, None], id="deep-equal-paths"),
+    ],
+)
+def test_parakeet_beam_search_checks_history_after_hash_match(
+    histories: list[tuple[int, ...]], emissions: list[int | None]
+) -> None:
+    buffers = make_beam_search_buffers(
+        2, (1,), token_stride=max(map(len, histories)) + 2, num_frames=2
+    )
+    buffers.top_token_scores.fill(-np.inf)
+    buffers.token_log_probs.fill(-np.inf)
+    buffers.scores[...] = cp.array([[0, -0.2]], dtype=np.float32)
+    parents, tokens, nodes, hashes = [], [], [], []
+    for parent, (history, token) in enumerate(zip(histories, emissions, strict=True)):
+        node = -1
+        for value in history:
+            parents.append(node)
+            tokens.append(value)
+            node = len(tokens) - 1
+        nodes.append(node)
+        if token is None:
+            buffers.token_log_probs[parent, buffers.blank_id] = 0
+            hashes.append(1234)
+        else:
+            buffers.top_token_indexes[parent, 0] = token
+            buffers.top_token_scores[parent, 0] = 0
+            # Invert the rolling hash so every expanded candidate has hash 1234.
+            hashes.append((1234 - token - 1) * pow(1099511628211, -1, 2**64) % 2**64)
+    buffers.nodes[...] = cp.array([nodes], dtype=np.int32)
+    buffers.lengths[...] = cp.array([list(map(len, histories))], dtype=np.int32)
+    buffers.last_tokens[...] = cp.array(
+        [
+            history[len(history) - 1] if history else buffers.blank_id
+            for history in histories
+        ],
+        dtype=np.int32,
+    )
+    buffers.hashes[...] = cp.array([hashes], dtype=np.uint64)
+    buffers.node_parents[: len(parents)] = cp.array(parents, dtype=np.int32)
+    buffers.node_tokens[: len(tokens)] = cp.array(tokens, dtype=np.int32)
+    buffers.node_timestamps[: len(tokens)] = cp.arange(len(tokens), dtype=np.float32)
+    buffers.node_counts.fill(len(tokens))
+
+    run_beam_search(buffers)
+
+    candidates = [
+        history + (() if token is None else (token,))
+        for history, token in zip(histories, emissions, strict=True)
+    ]
+    merged = candidates[0] == candidates[1]
+    expected_scores = [np.logaddexp(0, -0.2), -np.inf] if merged else [0, -0.2]
+    np.testing.assert_allclose(buffers.next_scores.get()[0], expected_scores)
+    np.testing.assert_array_equal(
+        buffers.parent_indexes.get(), [0, -1 if merged else 1]
+    )
+    parents, tokens, nodes = (
+        array.get()
+        for array in (buffers.node_parents, buffers.node_tokens, buffers.next_nodes)
+    )
+    expected_histories = candidates[:1] if merged else candidates
+    for node, history in zip(
+        nodes[0, : len(expected_histories)], expected_histories, strict=True
+    ):
+        for token in reversed(history):
+            assert node >= 0
+            assert tokens[node] == token
+            node = parents[node]
+        assert node == -1
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("cache_size", (1, TDT_HISTORY_CACHE_SIZE))
+def test_history_cache_handles_concurrent_eviction(cache_size: int) -> None:
+    kernel = cp.RawKernel(
+        HISTORY_HELPERS_SOURCE
+        + r"""
+        extern "C" __global__ void compare_histories(const int2* pairs,
+            const int* parents, const int* tokens, unsigned char* equal,
+            unsigned long long* cache, int cache_size, int count)
+        {
+            const int index = blockIdx.x * blockDim.x + threadIdx.x;
+            if (index < count)
+            {
+                equal[index] = histories_equal(pairs[index].x, pairs[index].y,
+                    parents, tokens, cache, cache_size);
+            }
+        }
+        """,
+        "compare_histories",
+    )
+    histories = [(), (0,), (0,), (1,), (0, 1), (0, 1), (1, 1)]
+    pairs = [(left, right) for left in range(-1, 6) for right in range(-1, 6)]
+    expected = [histories[left + 1] == histories[right + 1] for left, right in pairs]
+    pairs_gpu = cp.array(pairs * 16, dtype=np.int32)
+    parents = cp.array([-1, -1, -1, 0, 1, 2], dtype=np.int32)
+    tokens = cp.array([0, 0, 1, 1, 1, 1], dtype=np.int32)
+    cache = cp.zeros(cache_size, dtype=np.uint64)
+    equal = cp.empty(pairs_gpu.shape[0], dtype=np.uint8)
+    # Only node pairs (0, 1) and (3, 4) have equal histories; zero is an empty slot.
+    valid_entries = {0, 1, (3 << 32) | 4}
+
+    for _ in range(3):
+        kernel(
+            ((equal.size + 127) // 128,),
+            (128,),
+            (
+                pairs_gpu,
+                parents,
+                tokens,
+                equal,
+                cache,
+                np.int32(cache_size),
+                np.int32(equal.size),
+            ),
+        )
+        np.testing.assert_array_equal(equal.get(), expected * 16)
+        entries = set(cache.get().tolist())
+        assert entries - {0}
+        assert entries <= valid_entries
+
+
+def reference_beam_candidates(
+    histories: list[tuple[int, ...]], buffers: SimpleNamespace
+) -> list[tuple[tuple[tuple[int, ...], int, int], float, int, bool]]:
+    """Compute a CPU reference for one merge-before-prune TDT search step.
+
+    Parameters
+    ----------
+    histories : list[tuple[int, ...]]
+        Token history for each parent hypothesis, in buffer row order.
+    buffers : SimpleNamespace
+        Single-utterance fixture from ``make_beam_search_buffers``. Log scores,
+        selected tokens, search positions, and durations are copied to the CPU
+        without modifying the fixture.
+
+    Returns
+    -------
+    list[tuple[tuple[tuple[int, ...], int, int], float, int, bool]]
+        Up to ``beam`` active or newly completed ``(key, log_prob, parent,
+        emitted)`` entries, sorted by merged log probability. Keys contain the
+        token history, frame index, and zero-duration symbol count. Parent and
+        emission flag come from the best individual path; ties prefer the
+        earlier representative candidate.
+
+    Notes
+    -----
+    Nonblank tokens expand over all durations; blanks require positive advances.
+    Matching keys merge with ``logaddexp`` before pruning. Equality compares
+    actual token histories rather than GPU hashes. Nonfinite scores and completed
+    parents are skipped. Blank penalty is zero, and ten successive zero-duration
+    emissions force a one-frame advance, matching ``run_beam_search``. At the
+    recording end, frame indexes clamp and symbol counts reset to zero.
+    """
+
+    beam = buffers.beam
+    scores = buffers.scores.get()[0]
+    token_scores = buffers.top_token_scores.get()
+    tokens = buffers.top_token_indexes.get()
+    blank_scores = buffers.token_log_probs.get()[:, buffers.blank_id]
+    duration_scores = buffers.duration_log_probs.get()
+    durations = buffers.durations.get().tolist()
+    times = buffers.time_indexes.get()
+    symbols = buffers.symbols.get()
+    output_length = int(buffers.output_lengths.get()[0])
+    candidates = [
+        (
+            parent,
+            int(tokens[parent, rank]),
+            duration,
+            scores[parent]
+            + duration_scores[parent, duration_index]
+            + token_scores[parent, rank],
+        )
+        for parent in range(beam)
+        for duration_index, duration in enumerate(durations)
+        for rank in range(beam)
+    ]
+    candidates.extend(
+        (
+            parent,
+            buffers.blank_id,
+            duration,
+            scores[parent]
+            + blank_scores[parent]
+            + duration_scores[parent, duration_index],
+        )
+        for parent in range(beam)
+        for duration_index, duration in enumerate(durations)
+        if duration > 0
+    )
+    grouped = {}
+    for index, (parent, token, duration, score) in enumerate(candidates):
+        if not np.isfinite(score) or times[parent] >= output_length:
+            continue
+        emitted = token != buffers.blank_id
+        history = histories[parent] + ((token,) if emitted else ())
+        count = int(symbols[parent]) + 1 if emitted and duration == 0 else 0
+        if count >= 10:
+            count = 0
+            duration = 1
+        time = min(int(times[parent]) + duration, output_length)
+        key = (history, time, count if time < output_length else 0)
+        if key not in grouped:
+            grouped[key] = (float(score), float(score), index, parent, emitted)
+        else:
+            total, *best_path = grouped[key]
+            if score > best_path[0]:
+                best_path = (score, index, parent, emitted)
+            grouped[key] = (np.logaddexp(total, score), *best_path)
+    ordered = sorted(grouped.items(), key=lambda item: (-item[1][0], item[1][2]))
+    return [(key, row[0], row[3], row[4]) for key, row in ordered[:beam]]
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("beam", [1, 2, 4, 8, 16, 32])
+def test_parakeet_beam_search_matches_enumeration(beam: int) -> None:
+    rng = np.random.default_rng(20260906)
+    for trial in range(8):
+        buffers = make_beam_search_buffers(beam, (0, 3, 1, 2), 8, 4)
+        histories = [(0,) * (parent % 3) for parent in range(beam)]
+        hashes, nodes, parents, history_tokens = [], [], [], []
+        for history in histories:
+            fingerprint, node = 0, -1
+            for token in history:
+                fingerprint = (fingerprint * 1099511628211 + token + 1) % 2**64
+                parents.append(node)
+                history_tokens.append(token)
+                node = len(parents) - 1
+            hashes.append(fingerprint)
+            nodes.append(node)
+        buffers.hashes[...] = cp.array([hashes], dtype=np.uint64)
+        buffers.lengths[...] = cp.array([[len(h) for h in histories]], dtype=np.int32)
+        buffers.last_tokens[...] = cp.array(
+            [0 if h else buffers.blank_id for h in histories], dtype=np.int32
+        )
+        buffers.nodes[...] = cp.array([nodes], dtype=np.int32)
+        buffers.node_counts.fill(len(parents))
+        buffers.node_parents[: len(parents)] = cp.array(parents, dtype=np.int32)
+        buffers.node_tokens[: len(parents)] = cp.array(history_tokens, dtype=np.int32)
+        buffers.time_indexes[...] = cp.array(rng.integers(0, 5, beam), dtype=np.int32)
+        buffers.symbols[...] = cp.array(rng.choice([0, 1, 9], beam), dtype=np.int32)
+        buffers.scores[...] = cp.array([rng.uniform(-5, 0, beam)], dtype=np.float32)
+        if trial % 2:
+            buffers.scores[0, 1:] = -np.inf
+        token_scores = rng.uniform(-10, 0, (beam, beam + 1)).astype(np.float32)
+        indexes = np.argsort(token_scores[:, :beam], axis=1)[:, ::-1]
+        buffers.token_log_probs[...] = cp.array(token_scores)
+        buffers.top_token_indexes[...] = cp.array(indexes, dtype=np.int32)
+        buffers.top_token_scores[...] = cp.array(
+            np.take_along_axis(token_scores, indexes, axis=1)
+        )
+        buffers.duration_log_probs[...] = cp.array(
+            rng.uniform(-5, 0, (beam, 4)), dtype=np.float32
+        )
+        expected = reference_beam_candidates(histories, buffers)
+        run_beam_search(buffers)
+        active = [row for row in expected if row[0][1] < 4]
+        completed = [row for row in expected if row[0][1] == 4]
+        scores = buffers.next_scores.get()[0]
+        np.testing.assert_allclose(
+            scores[: len(active)], [row[1] for row in active], atol=2e-6
+        )
+        assert np.isneginf(scores[len(active) :]).all()
+        for name, values in (
+            ("next_time_indexes", [row[0][1] for row in active]),
+            ("next_symbols", [row[0][2] for row in active]),
+            ("next_lengths", [len(row[0][0]) for row in active]),
+            ("parent_indexes", [row[2] for row in active]),
+            ("use_output_state", [row[3] for row in active]),
+        ):
+            np.testing.assert_array_equal(
+                getattr(buffers, name).get().ravel()[: len(active)],
+                values,
+                err_msg=name,
+            )
+        nodes = buffers.next_nodes.get()[0]
+        hashes = buffers.next_hashes.get()[0]
+        parents = buffers.node_parents.get()
+        tokens = buffers.node_tokens.get()
+        for index, (key, _, _, _) in enumerate(active):
+            node = nodes[index]
+            for token in reversed(key[0]):
+                assert node >= 0
+                assert tokens[node] == token
+                node = parents[node]
+            assert node == -1
+            fingerprint = 0
+            for token in key[0]:
+                fingerprint = (fingerprint * 1099511628211 + token + 1) % 2**64
+            assert hashes[index] == fingerprint
+        if completed:
+            best = max(completed, key=lambda row: row[1] / (len(row[0][0]) + 1))
+            np.testing.assert_allclose(
+                buffers.completed_scores.get(), best[1], atol=2e-6
+            )
+            assert buffers.completed_lengths.get()[0] == len(best[0][0])
+        else:
+            assert np.isneginf(buffers.completed_scores.get()[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("tied", [False, True])
+def test_parakeet_beam_search_merging_is_deterministic(tied: bool) -> None:
+    buffers = make_beam_search_buffers(16, (1, 2, 3), 4, 2)
+    buffers.top_token_scores.fill(-np.inf)
+    buffers.hashes.fill(0)
+    buffers.scores[...] = 0.0 if tied else cp.linspace(-10, 0, 16).reshape(1, 16)
+    buffers.token_log_probs[:, buffers.blank_id] = 0.0
+    results = []
+    for _ in range(20):
+        buffers.completed_scores.fill(-np.inf)
+        run_beam_search(buffers)
+        results.append(
+            (
+                buffers.next_scores.get(),
+                buffers.completed_scores.get(),
+                buffers.parent_indexes.get(),
+            )
+        )
+    for result in results[1:]:
+        for actual, expected in zip(result, results[0], strict=True):
+            np.testing.assert_array_equal(actual, expected)
+    expected_mass = np.exp(buffers.scores.get()).sum()
+    np.testing.assert_allclose(
+        np.exp(buffers.next_scores.get()[0, 0]), expected_mass, rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.exp(buffers.completed_scores.get()[0]), 2 * expected_mass, rtol=1e-6
+    )
+    assert buffers.parent_indexes.get()[0] == (0 if tied else 15)
+
+
+@pytest.mark.cuda
+def test_parakeet_beam_search_preserves_bucket_collisions() -> None:
+    buffers = make_beam_search_buffers(2, (1,), 4, 2)
+    buffers.top_token_scores.fill(-np.inf)
+    buffers.token_log_probs[:, buffers.blank_id] = 0.0
+    # These fingerprints share a bucket in the four-bucket table, not a history.
+    buffers.hashes[...] = cp.array([[1, 5]], dtype=np.uint64)
+
+    run_beam_search(buffers)
+
+    np.testing.assert_array_equal(buffers.next_scores.get(), [[0.0, 0.0]])
+    np.testing.assert_array_equal(buffers.next_hashes.get(), [[1, 5]])
+    np.testing.assert_array_equal(buffers.parent_indexes.get(), [0, 1])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("score", [-np.inf, np.inf, np.nan])
+def test_parakeet_beam_search_discards_nonfinite_candidates(score: float) -> None:
+    buffers = make_beam_search_buffers(2, (0, 1), 4, 2)
+    buffers.top_token_scores.fill(score)
+    buffers.token_log_probs.fill(score)
+
+    run_beam_search(buffers)
+
+    assert np.isneginf(buffers.next_scores.get()).all()
+    assert np.isneginf(buffers.completed_scores.get()).all()
+    np.testing.assert_array_equal(buffers.node_counts.get(), [0])
+    np.testing.assert_array_equal(buffers.active_flags.get(), [0])
 
 
 @pytest.mark.cuda
@@ -1942,6 +2400,57 @@ def make_parakeet_validation_decoder() -> ParakeetModifiedBeamSearchDecoder:
     return decoder
 
 
+@pytest.mark.parametrize(
+    "beam, vocab_size, search_limit, selection_limit",
+    [
+        (6, 32, 0, 0),
+        (32, 32, 64 * 1024, 0),
+        (6, 12256, 0, 0),
+        (6, 16000, 0, 64 * 1024),
+        (32, 16000, 64 * 1024, 64 * 1024),
+    ],
+)
+def test_parakeet_decoder_opts_in_to_large_shared_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    beam: int,
+    vocab_size: int,
+    search_limit: int,
+    selection_limit: int,
+) -> None:
+    engine = FakeParakeetEngine(None)
+    engine.shapes = {
+        "encoder_output": (beam, 4),
+        "targets": (beam, 1),
+        "input_states_1": (2, beam, 3),
+        "token_log_probs": (beam, vocab_size + 1),
+        "duration_log_probs": (beam, 5),
+    }
+    kernel = SimpleNamespace(max_dynamic_shared_size_bytes=0)
+    selection_kernel = SimpleNamespace(max_dynamic_shared_size_bytes=0)
+    monkeypatch.setattr(parakeet_decoder, "get_engine", lambda path: engine)
+    monkeypatch.setattr(parakeet_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(
+        NullCudaContext, "attributes", {"MaxSharedMemoryPerBlockOptin": 64 * 1024}
+    )
+    monkeypatch.setattr(parakeet_decoder, "TDT_BEAM_SEARCH_KERNEL", kernel)
+    monkeypatch.setattr(parakeet_decoder, "TDT_SELECT_TOKENS_KERNEL", selection_kernel)
+    with pytest.raises(ASRInitializationError, match="execution context"):
+        ParakeetModifiedBeamSearchDecoder(
+            Path("decoder.trt"),
+            1,
+            vocab_size,
+            (0, 1, 2, 3, 4),
+            10,
+            0.08,
+            0.0,
+            0,
+            cast(cp.cuda.Stream, NullCudaContext()),
+        )
+
+    assert kernel.max_dynamic_shared_size_bytes == search_limit
+    assert selection_kernel.max_dynamic_shared_size_bytes == selection_limit
+
+
 def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2022,16 +2531,23 @@ def test_parakeet_decoder_zero_frame_call_uses_cuda_contexts() -> None:
     assert events == ["enter_device", "enter_stream", "exit_stream", "exit_device"]
 
 
-def construct_parakeet_decoder(stream: cp.cuda.Stream | NullCudaContext) -> None:
-    """Initialize a Parakeet decoder through its context-setup boundary.
+def construct_parakeet_decoder(
+    stream: cp.cuda.Stream | NullCudaContext,
+) -> ParakeetModifiedBeamSearchDecoder:
+    """Initialize a decoder matching the default fake TensorRT engine.
 
     Parameters
     ----------
     stream : cp.cuda.Stream | NullCudaContext
         Real or no-op CUDA stream supplied to constructor tests.
+
+    Returns
+    -------
+    ParakeetModifiedBeamSearchDecoder
+        Decoder initialized with a two-utterance capacity and beam one.
     """
 
-    ParakeetModifiedBeamSearchDecoder(
+    return ParakeetModifiedBeamSearchDecoder(
         Path("decoder.trt"),
         batch_size=2,
         blank_id=7,
@@ -2044,21 +2560,29 @@ def construct_parakeet_decoder(stream: cp.cuda.Stream | NullCudaContext) -> None
     )
 
 
-def test_parakeet_decoder_swaps_all_search_buffers_and_rebinds_states() -> None:
+@pytest.mark.parametrize("rejected_name", (None, "input_states_1", "input_states_2"))
+def test_parakeet_decoder_swaps_buffers_and_rebinds_both_states(
+    rejected_name: str | None,
+) -> None:
     decoder = ParakeetModifiedBeamSearchDecoder.__new__(
         ParakeetModifiedBeamSearchDecoder
     )
-    original_buffers: dict[str, FakeDeviceBuffer] = {}
-    for pointer, name in enumerate(
-        (name for pair in PARAKEET_SEARCH_BUFFER_PAIRS for name in pair), start=1
-    ):
-        buffer = FakeDeviceBuffer(pointer)
+    original_buffers = {
+        name: FakeDeviceBuffer(pointer)
+        for pointer, name in enumerate(
+            (name for pair in PARAKEET_SEARCH_BUFFER_PAIRS for name in pair), start=1
+        )
+    }
+    for name, buffer in original_buffers.items():
         setattr(decoder, name, buffer)
-        original_buffers[name] = buffer
 
-    context = RecordingParakeetContext()
+    context = RecordingParakeetContext(rejected_name)
     decoder.decoder = cast(trt.IExecutionContext, context)
-    decoder.swap_buffers()
+    if rejected_name is None:
+        decoder.swap_buffers()
+    else:
+        with pytest.raises(ASRInferenceError, match="recurrent-state input"):
+            decoder.swap_buffers()
 
     for current_name, next_name in PARAKEET_SEARCH_BUFFER_PAIRS:
         assert getattr(decoder, current_name) is original_buffers[next_name]
@@ -2067,25 +2591,6 @@ def test_parakeet_decoder_swaps_all_search_buffers_and_rebinds_states() -> None:
         "input_states_1": decoder.state_1.data.ptr,
         "input_states_2": decoder.state_2.data.ptr,
     }
-
-
-@pytest.mark.parametrize("rejected_name", ("input_states_1", "input_states_2"))
-def test_parakeet_decoder_attempts_both_recurrent_bindings(rejected_name: str) -> None:
-    decoder = ParakeetModifiedBeamSearchDecoder.__new__(
-        ParakeetModifiedBeamSearchDecoder
-    )
-    for pointer, name in enumerate(
-        (name for pair in PARAKEET_SEARCH_BUFFER_PAIRS for name in pair), start=1
-    ):
-        setattr(decoder, name, FakeDeviceBuffer(pointer))
-
-    context = RecordingParakeetContext(rejected_name)
-    decoder.decoder = cast(trt.IExecutionContext, context)
-
-    with pytest.raises(ASRInferenceError, match="recurrent-state input"):
-        decoder.swap_buffers()
-
-    assert list(context.bindings) == ["input_states_1", "input_states_2"]
 
 
 @pytest.mark.parametrize(
@@ -2206,39 +2711,11 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
     stream = cp.cuda.get_current_stream()
     context = RecordingParakeetContext()
     engine = FakeParakeetEngine(context, encoder_trt_dtype, state_trt_dtype)
-    loaded_paths: list[Path] = []
-
-    def load_engine(engine_path: Path) -> FakeParakeetEngine:
-        """Record the requested path and return the configured fake engine.
-
-        Parameters
-        ----------
-        engine_path : Path
-            TensorRT engine path requested by the decoder.
-
-        Returns
-        -------
-        FakeParakeetEngine
-            Engine configured by the enclosing test.
-        """
-
-        loaded_paths.append(engine_path)
-        return engine
-
+    load_engine = Mock(return_value=engine)
     monkeypatch.setattr(parakeet_decoder, "get_engine", load_engine)
-    decoder = ParakeetModifiedBeamSearchDecoder(
-        Path("decoder.trt"),
-        batch_size=2,
-        blank_id=7,
-        durations=(0, 1),
-        max_symbols_per_timestep=10,
-        encoder_frame_shift_sec=0.08,
-        blank_penalty=0.0,
-        device_id=0,
-        stream=stream,
-    )
+    decoder = construct_parakeet_decoder(stream)
 
-    assert loaded_paths == [Path("decoder.trt")]
+    load_engine.assert_called_once_with(Path("decoder.trt"))
     assert sorted(engine.shape_requests) == sorted(engine.shapes)
     assert sorted(engine.dtype_requests) == sorted(engine.dtypes)
     assert context.profile_calls == [(0, stream.ptr)]
@@ -2303,11 +2780,13 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
         "hypothesis_nodes": (2, 1),
         "hypothesis_hashes": (2, 1),
         "node_counts": (2,),
+        "history_cache": (2, TDT_HISTORY_CACHE_SIZE),
     }
     for name, expected_shape in expected_shapes.items():
         assert getattr(decoder, name).shape == expected_shape
 
     assert decoder.encoder_input.dtype == encoder_array_dtype
+    assert decoder.history_cache.dtype == np.uint64
     assert {
         decoder.state_1.dtype,
         decoder.state_2.dtype,
@@ -2415,79 +2894,31 @@ def test_parakeet_decoder_reports_fixed_tensor_binding_failure(
     assert context.bindings[rejected_binding] > 0
 
 
-def test_parakeet_decoder_rejects_missing_execution_context(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "missing_context, message",
+    [
+        (True, "TensorRT could not create the Parakeet decoder execution context."),
+        (False, "TensorRT could not select Parakeet decoder optimization profile 0."),
+    ],
+    ids=["missing-context", "rejected-profile"],
+)
+def test_parakeet_decoder_reports_context_setup_failure(
+    monkeypatch: pytest.MonkeyPatch, missing_context: bool, message: str
 ) -> None:
     stream = NullCudaContext()
-    engine = FakeParakeetEngine(None)
-    loaded_paths: list[Path] = []
-
-    def load_engine(engine_path: Path) -> FakeParakeetEngine:
-        """Record the requested path and return the context-free engine.
-
-        Parameters
-        ----------
-        engine_path : Path
-            TensorRT engine path requested by the decoder.
-
-        Returns
-        -------
-        FakeParakeetEngine
-            Engine configured without an execution context.
-        """
-
-        loaded_paths.append(engine_path)
-        return engine
-
-    monkeypatch.setattr(parakeet_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(parakeet_decoder, "get_engine", load_engine)
-
-    with pytest.raises(ASRInitializationError) as error:
-        construct_parakeet_decoder(stream)
-
-    assert str(error.value) == (
-        "TensorRT could not create the Parakeet decoder execution context."
+    context = (
+        None if missing_context else RecordingParakeetContext(profile_accepted=False)
     )
-    assert loaded_paths == [Path("decoder.trt")]
-    assert sorted(engine.shape_requests) == sorted(engine.shapes)
-    assert sorted(engine.dtype_requests) == sorted(engine.dtypes)
-
-
-def test_parakeet_decoder_rejects_profile_selection_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = NullCudaContext()
-    context = RecordingParakeetContext(profile_accepted=False)
     engine = FakeParakeetEngine(context)
-    loaded_paths: list[Path] = []
-
-    def load_engine(engine_path: Path) -> FakeParakeetEngine:
-        """Record the requested path and return the profile-rejecting engine.
-
-        Parameters
-        ----------
-        engine_path : Path
-            TensorRT engine path requested by the decoder.
-
-        Returns
-        -------
-        FakeParakeetEngine
-            Engine whose context rejects profile selection.
-        """
-
-        loaded_paths.append(engine_path)
-        return engine
-
+    load_engine = Mock(return_value=engine)
     monkeypatch.setattr(parakeet_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(parakeet_decoder, "get_engine", load_engine)
 
     with pytest.raises(ASRInitializationError) as error:
         construct_parakeet_decoder(stream)
 
-    assert str(error.value) == (
-        "TensorRT could not select Parakeet decoder optimization profile 0."
-    )
-    assert loaded_paths == [Path("decoder.trt")]
-    assert sorted(engine.shape_requests) == sorted(engine.shapes)
-    assert sorted(engine.dtype_requests) == sorted(engine.dtypes)
-    assert context.profile_calls == [(0, stream.ptr)]
+    assert str(error.value) == message
+    load_engine.assert_called_once_with(Path("decoder.trt"))
+    if context is not None:
+        assert context.profile_calls == [(0, stream.ptr)]
+        assert context.bindings == {}

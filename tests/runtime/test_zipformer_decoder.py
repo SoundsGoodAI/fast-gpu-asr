@@ -5,7 +5,8 @@
 
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
-from typing import Any, cast
+from typing import cast
+from unittest.mock import Mock
 
 import cupy as cp
 import numpy as np
@@ -13,9 +14,15 @@ import pytest
 import tensorrt as trt
 import torch
 
-from fast_gpu_asr.constants import INT32_MAX, ZIPFORMER_DECODER_CONTEXTS_FILE
+from fast_gpu_asr.constants import (
+    CUDA_DEFAULT_SHARED_MEMORY_BYTES,
+    INT32_MAX,
+    ZIPFORMER_BEAM_SEARCH_THREADS,
+    ZIPFORMER_DECODER_CONTEXTS_FILE,
+)
 from fast_gpu_asr.decoder import gpu_kernels, zipformer_decoder
 from fast_gpu_asr.decoder.gpu_kernels import (
+    ZIPFORMER_BEAM_SEARCH_SOURCE,
     ZIPFORMER_FINALIZE_KERNEL,
     get_zipformer_beam_search_kernels,
 )
@@ -269,6 +276,7 @@ def test_zipformer_beam_search_factory_builds_matching_launches(
     vocab_size: int,
     register_supported: bool,
 ) -> None:
+    context_size = 2
     created_kernels: list[SimpleNamespace] = []
 
     def create_kernel(
@@ -293,7 +301,7 @@ def test_zipformer_beam_search_factory_builds_matching_launches(
             Recorded kernel metadata used as a lightweight stand-in.
         """
 
-        assert source == gpu_kernels.ZIPFORMER_BEAM_SEARCH_SOURCE
+        assert source == ZIPFORMER_BEAM_SEARCH_SOURCE
         kernel = SimpleNamespace(name=name, options=options, backend=backend)
         created_kernels.append(kernel)
         return kernel
@@ -301,17 +309,24 @@ def test_zipformer_beam_search_factory_builds_matching_launches(
     monkeypatch.setattr(gpu_kernels.cp, "RawKernel", create_kernel)
     get_zipformer_beam_search_kernels.cache_clear()
     try:
-        launches = get_zipformer_beam_search_kernels(beam, vocab_size, 2)
-        cached_launches = get_zipformer_beam_search_kernels(beam, vocab_size, 2)
+        launches = get_zipformer_beam_search_kernels(beam, vocab_size, context_size)
+        cached_launches = get_zipformer_beam_search_kernels(
+            beam, vocab_size, context_size
+        )
     finally:
         get_zipformer_beam_search_kernels.cache_clear()
 
     register_launch, shared_launch, threads = launches
-    register_memory = threads // 32 * 8 + beam * 8 + beam * 2 * 4
-    shared_memory = register_memory + beam * vocab_size * 4
+    register_memory = threads // 32 * (
+        np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
+    ) + beam * (
+        2 * np.dtype(np.float32).itemsize
+        + (3 + context_size) * np.dtype(np.int32).itemsize
+    )
+    shared_memory = register_memory + beam * vocab_size * np.dtype(np.float32).itemsize
 
     assert cached_launches is launches
-    assert threads == gpu_kernels.ZIPFORMER_BEAM_SEARCH_THREADS
+    assert threads == ZIPFORMER_BEAM_SEARCH_THREADS
     assert shared_launch[1] == shared_memory
     assert (register_launch is not None) is register_supported
     if register_launch is not None:
@@ -320,25 +335,20 @@ def test_zipformer_beam_search_factory_builds_matching_launches(
     expected_definitions = {
         f"-DZIPFORMER_BEAM={beam}",
         f"-DZIPFORMER_VOCAB_SIZE={vocab_size}",
-        "-DZIPFORMER_CONTEXT_SIZE=2",
+        f"-DZIPFORMER_CONTEXT_SIZE={context_size}",
         f"-DZIPFORMER_BEAM_SEARCH_THREADS={threads}",
     }
     assert len(created_kernels) == 1 + int(register_supported)
-    assert all(kernel.name == "zipformer_beam_search" for kernel in created_kernels)
-    assert all(kernel.backend == "nvcc" for kernel in created_kernels)
-    assert all(
-        expected_definitions <= set(kernel.options) for kernel in created_kernels
-    )
-    assert any(
-        "-DZIPFORMER_REGISTER_TOPK=0" in kernel.options for kernel in created_kernels
-    )
-    assert (
-        any(
-            "-DZIPFORMER_REGISTER_TOPK=1" in kernel.options
-            for kernel in created_kernels
-        )
-        is register_supported
-    )
+    for launch, register_topk in ((shared_launch, 0), (register_launch, 1)):
+        if launch is not None:
+            kernel = launch[0]
+            assert kernel in created_kernels
+            assert kernel.name == "zipformer_beam_search"
+            assert kernel.backend == "nvcc"
+            assert set(kernel.options) == expected_definitions | {
+                "--std=c++20",
+                f"-DZIPFORMER_REGISTER_TOPK={register_topk}",
+            }
 
 
 @pytest.mark.parametrize(
@@ -363,12 +373,8 @@ def test_zipformer_beam_search_factory_rejects_invalid_thread_count(
 
 
 def test_zipformer_beam_search_factory_rejects_shared_memory_overflow() -> None:
-    get_zipformer_beam_search_kernels.cache_clear()
-    try:
-        with pytest.raises(ValueError, match="dynamic shared memory exceeds"):
-            get_zipformer_beam_search_kernels(1, 1, INT32_MAX // 4)
-    finally:
-        get_zipformer_beam_search_kernels.cache_clear()
+    with pytest.raises(ValueError, match="dynamic shared memory exceeds"):
+        get_zipformer_beam_search_kernels(1, 1, INT32_MAX // 4)
 
 
 @pytest.mark.cuda
@@ -435,14 +441,15 @@ def test_ctc_greedy_reuses_buffers_without_leaking_results() -> None:
     first_tokens, first_timestamps = decoder(
         cp.eye(4, dtype=cp.float32)[first_paths], cp.full(2, 4, dtype=np.int32)
     )
-    allocated_buffers = (
-        decoder.emitted_tokens,
-        decoder.emitted_timestamps,
-        decoder.emitted_lengths,
-        decoder.emitted_tokens_host,
-        decoder.emitted_timestamps_host,
-        decoder.emitted_lengths_host,
+    buffer_names = (
+        "emitted_tokens",
+        "emitted_timestamps",
+        "emitted_lengths",
+        "emitted_tokens_host",
+        "emitted_timestamps_host",
+        "emitted_lengths_host",
     )
+    allocated_buffers = {name: getattr(decoder, name) for name in buffer_names}
 
     second_paths = cp.array([[3, 0, 1, 0], [0, 0, 0, 0]])
     second_tokens, second_timestamps = decoder(
@@ -455,18 +462,34 @@ def test_ctc_greedy_reuses_buffers_without_leaking_results() -> None:
     assert second_tokens == [[3, 1], []]
     np.testing.assert_allclose(second_timestamps[0], [0.0, 0.08])
     assert second_timestamps[1] == []
-    current_buffers = (
-        decoder.emitted_tokens,
-        decoder.emitted_timestamps,
-        decoder.emitted_lengths,
-        decoder.emitted_tokens_host,
-        decoder.emitted_timestamps_host,
-        decoder.emitted_lengths_host,
-    )
-    assert all(
-        current is allocated
-        for current, allocated in zip(current_buffers, allocated_buffers, strict=True)
-    )
+    for name, buffer in allocated_buffers.items():
+        assert getattr(decoder, name) is buffer, name
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "buffer_name, message",
+    [
+        ("emitted_timestamps", "CTC output buffers"),
+        ("emitted_timestamps_host", "CTC host output buffers"),
+    ],
+)
+def test_ctc_greedy_rejects_missing_reusable_buffers(
+    buffer_name: str, message: str
+) -> None:
+    decoder = make_ctc_decoder()
+    log_probs = cp.array([[[0.0, 1.0], [1.0, 0.0]]], dtype=np.float32)
+    lengths = cp.array([2], dtype=np.int32)
+    expected = ([[1]], [[0.0]])
+    assert decoder(log_probs, lengths) == expected
+    buffer = getattr(decoder, buffer_name)
+    setattr(decoder, buffer_name, None)
+
+    with pytest.raises(ASRInferenceError, match=message):
+        decoder(log_probs, lengths)
+
+    setattr(decoder, buffer_name, buffer)
+    assert decoder(log_probs, lengths) == expected
 
 
 @pytest.mark.cuda
@@ -483,128 +506,67 @@ def test_ctc_greedy_returns_empty_results_for_zero_frames() -> None:
 
 @pytest.mark.cuda
 def test_zipformer_register_and_shared_search_match() -> None:
-    batch_size = 2
     beam = 6
     vocab_size = 16
-    context_size = 2
-    encoder_dim = 8
-    register_launch, shared_launch, threads = get_zipformer_beam_search_kernels(
-        beam, vocab_size, context_size
+    outputs = (
+        np.random.default_rng(0)
+        .normal(size=(3, 2 * beam, vocab_size))
+        .astype(np.float32)
     )
-    assert register_launch is not None
-
-    rng = np.random.default_rng(0)
-    log_probs = cp.array(
-        rng.normal(size=(batch_size * beam, vocab_size)).astype(np.float32)
-    )
-    hypothesis_scores = cp.array(rng.normal(size=(batch_size, beam)).astype(np.float32))
-    hypothesis_nodes = cp.full((batch_size, beam), -1, dtype=np.int32)
-    hypothesis_lengths = cp.zeros((batch_size, beam), dtype=np.int32)
-    hypothesis_hashes = cp.arange(batch_size * beam, dtype=np.uint64).reshape(
-        batch_size, beam
-    )
-    initial_contexts = cp.array(
-        rng.integers(
-            0, vocab_size, size=(batch_size * beam, context_size), dtype=np.int32
-        )
-    )
+    outputs -= np.logaddexp.reduce(outputs, axis=2, keepdims=True)
+    encoder_output = cp.arange(48, dtype=np.float32).reshape(2, 3, 8)
     output_lengths = cp.array([10, -1], dtype=np.int32)
-    encoder_output = cp.zeros((batch_size, 1, encoder_dim), dtype=np.float32)
-    context_lookup = cp.zeros(
-        ((vocab_size + 1) ** context_size, encoder_dim), dtype=np.float32
-    )
-
-    def run_search(
-        launch: tuple[cp.RawKernel, int],
-    ) -> tuple[np.typing.NDArray[np.generic], ...]:
-        """Run one beam-search tactic and return its host-visible state.
-
-        Parameters
-        ----------
-        launch : tuple[cp.RawKernel, int]
-            Specialized kernel and its required dynamic shared-memory size.
-
-        Returns
-        -------
-        tuple[np.typing.NDArray[np.generic], ...]
-            Search outputs, contexts, history nodes, and per-utterance node counts.
-        """
-
-        kernel, shared_memory_bytes = launch
-        contexts = initial_contexts.copy()
-        next_scores = cp.empty_like(hypothesis_scores)
-        next_nodes = cp.empty_like(hypothesis_nodes)
-        next_lengths = cp.empty_like(hypothesis_lengths)
-        next_hashes = cp.empty_like(hypothesis_hashes)
-        node_elements = batch_size * beam
-        node_parents = cp.full(node_elements, -2, dtype=np.int32)
-        node_tokens = cp.full(node_elements, -2, dtype=np.int32)
-        node_timestamps = cp.full(node_elements, -2.0, dtype=np.float32)
-        node_counts = cp.zeros(batch_size, dtype=np.int32)
-
-        kernel(
-            (batch_size,),
-            (threads,),
-            (
-                log_probs,
-                encoder_output,
-                cp.empty((batch_size * beam, encoder_dim), dtype=np.float32),
-                context_lookup,
-                cp.empty((batch_size * beam, encoder_dim), dtype=np.float32),
-                contexts,
-                hypothesis_scores,
-                hypothesis_nodes,
-                hypothesis_lengths,
-                hypothesis_hashes,
-                next_scores,
-                next_nodes,
-                next_lengths,
-                next_hashes,
-                node_parents,
-                node_tokens,
-                node_timestamps,
-                node_counts,
-                output_lengths,
-                np.int32(0),
-                np.int32(1),
-                np.int32(encoder_dim),
-                np.int32(0),
-                np.int32(0),
-                np.int32(0),
-                np.int32(0),
-                np.float32(0.1),
-                np.float32(0.04),
-            ),
-            shared_mem=shared_memory_bytes,
+    decoders, results = [], []
+    for use_register_search in (False, True):
+        decoder = make_fake_zipformer_decoder(
+            batch_size=2,
+            beam=beam,
+            vocab_size=vocab_size,
+            context_size=2,
+            encoder_dim=8,
+            decoder_dtype=np.dtype(np.float32),
+            sequential_context_lookup=True,
         )
-        return tuple(
-            array.get()
-            for array in (
-                next_scores,
-                next_nodes,
-                next_lengths,
-                next_hashes,
-                contexts,
-                node_parents,
-                node_tokens,
-                node_timestamps,
-                node_counts,
-            )
-        )
+        decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+        decoder.blank_penalty = 0.1
+        decoder.decoder = ScriptedDecoderContext(decoder, tuple(outputs))
+        results.append(decoder(encoder_output, output_lengths))
+        decoders.append(decoder)
 
-    register_results = run_search(register_launch)
-    shared_results = run_search(shared_launch)
-    for register_result, shared_result in zip(
-        register_results, shared_results, strict=True
+    shared, register = decoders
+    assert register.register_beam_search is not None
+    assert results[0] == results[1]
+    assert results[0][0][1] == results[0][1][1] == []
+    for name in (
+        "next_scores",
+        "next_nodes",
+        "next_lengths",
+        "next_hashes",
+        "contexts",
+        "node_counts",
+        "encoder_input",
+        "decoder_input",
     ):
-        np.testing.assert_array_equal(register_result, shared_result)
-    np.testing.assert_array_equal(register_results[0][1], hypothesis_scores.get()[1])
-    np.testing.assert_array_equal(register_results[1][1], [-1] * beam)
-    np.testing.assert_array_equal(register_results[2][1], [0] * beam)
+        np.testing.assert_array_equal(
+            getattr(shared, name).get(), getattr(register, name).get(), err_msg=name
+        )
+    count = int(shared.node_counts.get()[0])
+    for name in ("node_parents", "node_tokens", "node_timestamps"):
+        np.testing.assert_array_equal(
+            getattr(shared, name).get()[:count],
+            getattr(register, name).get()[:count],
+            err_msg=name,
+        )
     np.testing.assert_array_equal(
-        register_results[4][beam:], initial_contexts.get()[beam:]
+        shared.next_scores.get()[1], [0.0] + [-np.inf] * (beam - 1)
     )
-    assert register_results[8][1] == 0
+    np.testing.assert_array_equal(shared.next_nodes.get()[1], -1)
+    np.testing.assert_array_equal(shared.next_lengths.get()[1], 0)
+    np.testing.assert_array_equal(shared.next_hashes.get()[1], 0)
+    np.testing.assert_array_equal(
+        shared.contexts.get()[beam:], shared.initial_contexts.get()[beam:]
+    )
+    assert shared.node_counts.get()[1] == 0
 
 
 @pytest.mark.cuda
@@ -614,84 +576,47 @@ def test_zipformer_register_and_shared_search_match() -> None:
 def test_zipformer_search_updates_distinct_parent_histories(
     use_register_search: bool,
 ) -> None:
-    beam = 2
-    vocab_size = 4
-    context_size = 2
-    encoder_dim = 4
-    register_launch, shared_launch, threads = get_zipformer_beam_search_kernels(
-        beam, vocab_size, context_size
+    decoder = make_fake_zipformer_decoder(
+        beam=2,
+        context_size=2,
+        encoder_dim=4,
+        decoder_dtype=np.dtype(np.float32),
+        sequential_context_lookup=True,
     )
-    assert register_launch is not None
-    kernel, shared_memory_bytes = (
-        register_launch if use_register_search else shared_launch
-    )
-
-    encoder_input = cp.empty((beam, encoder_dim), dtype=np.float32)
-    decoder_input = cp.empty_like(encoder_input)
-    contexts = cp.array([[1, 2], [3, 1]], dtype=np.int32)
-    next_scores = cp.empty((1, beam), dtype=np.float32)
-    next_nodes = cp.empty((1, beam), dtype=np.int32)
-    next_lengths = cp.empty((1, beam), dtype=np.int32)
-    next_hashes = cp.empty((1, beam), dtype=np.uint64)
-    node_parents = cp.full(beam * 3, -2, dtype=np.int32)
-    node_tokens = cp.full(beam * 3, -2, dtype=np.int32)
-    node_timestamps = cp.full(beam * 3, -2.0, dtype=np.float32)
-    node_counts = cp.zeros(1, dtype=np.int32)
-    context_lookup = cp.arange(
-        (vocab_size + 1) ** context_size * encoder_dim, dtype=np.float32
-    ).reshape(-1, encoder_dim)
-
-    kernel(
-        (1,),
-        (threads,),
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    decoder.decoder = ScriptedDecoderContext(
+        decoder,
         (
-            cp.array(
-                [[-0.4, -5.0, -5.0, -0.1], [-0.6, -5.0, 0.0, -5.0]], dtype=np.float32
-            ),
-            cp.arange(12, dtype=np.float32).reshape(1, 3, encoder_dim),
-            encoder_input,
-            context_lookup,
-            decoder_input,
-            contexts,
-            cp.array([[0.0, -0.2]], dtype=np.float32),
-            cp.full((1, beam), -1, dtype=np.int32),
-            cp.zeros((1, beam), dtype=np.int32),
-            cp.zeros((1, beam), dtype=np.uint64),
-            next_scores,
-            next_nodes,
-            next_lengths,
-            next_hashes,
-            node_parents,
-            node_tokens,
-            node_timestamps,
-            node_counts,
-            cp.array([3], dtype=np.int32),
-            np.int32(1),
-            np.int32(3),
-            np.int32(encoder_dim),
-            np.int32(0),
-            np.int32(0),
-            np.int32(0),
-            np.int32(0),
-            np.float32(0.0),
-            np.float32(0.04),
+            [-np.inf, 0.0, -np.inf, -0.2],
+            [[-np.inf, -np.inf, 0.0, -np.inf], [-np.inf, 0.0, -np.inf, -np.inf]],
+            [[-0.4, -5.0, -5.0, -0.1], [-0.6, -5.0, 0.0, -5.0]],
+            [0.0, -np.inf, -np.inf, -np.inf],
         ),
-        shared_mem=shared_memory_bytes,
+    )
+    tokens, timestamps = decoder(
+        cp.arange(16, dtype=np.float32).reshape(1, 4, 4), cp.array([4], dtype=np.int32)
     )
 
-    np.testing.assert_allclose(next_scores.get(), [[-0.1, -0.2]], atol=1e-7)
-    np.testing.assert_array_equal(next_nodes.get(), [[0, 1]])
-    np.testing.assert_array_equal(next_lengths.get(), [[1, 1]])
-    np.testing.assert_array_equal(contexts.get(), [[2, 3], [1, 2]])
-    np.testing.assert_array_equal(node_parents.get()[:2], [-1, -1])
-    np.testing.assert_array_equal(node_tokens.get()[:2], [3, 2])
-    np.testing.assert_allclose(node_timestamps.get()[:2], [0.04, 0.04])
-    np.testing.assert_array_equal(node_counts.get(), [2])
+    assert tokens == [[1, 2, 3]]
+    np.testing.assert_allclose(timestamps, [[0.0, 0.04, 0.08]])
+    np.testing.assert_allclose(
+        decoder.hypothesis_scores.get(), [[-0.1, -0.2]], atol=1e-7
+    )
+    np.testing.assert_array_equal(decoder.hypothesis_nodes.get(), [[4, 5]])
+    np.testing.assert_array_equal(decoder.hypothesis_lengths.get(), [[3, 3]])
+    np.testing.assert_array_equal(decoder.contexts.get(), [[2, 3], [1, 2]])
+    np.testing.assert_array_equal(decoder.node_parents.get()[:6], [-1, -1, 0, 1, 2, 3])
+    np.testing.assert_array_equal(decoder.node_tokens.get()[:6], [1, 3, 2, 1, 3, 2])
+    np.testing.assert_allclose(
+        decoder.node_timestamps.get()[:6], [0.0, 0.0, 0.04, 0.04, 0.08, 0.08]
+    )
+    np.testing.assert_array_equal(decoder.node_counts.get(), [6])
     np.testing.assert_array_equal(
-        encoder_input.get(), np.tile(np.arange(8, 12, dtype=np.float32), (beam, 1))
+        decoder.encoder_input.get(),
+        np.tile(np.arange(12, 16, dtype=np.float32), (2, 1)),
     )
     np.testing.assert_array_equal(
-        decoder_input.get(),
+        decoder.decoder_input.get(),
         np.vstack(
             (np.arange(76, 80, dtype=np.float32), np.arange(52, 56, dtype=np.float32))
         ),
@@ -699,178 +624,364 @@ def test_zipformer_search_updates_distinct_parent_histories(
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("invalid_score", (-np.inf, np.nan))
+@pytest.mark.parametrize("invalid_score", (-np.inf, np.inf, np.nan))
+@pytest.mark.parametrize(
+    "use_register_search", (False, True), ids=("shared", "register")
+)
 def test_zipformer_search_keeps_nonfinite_candidates_in_bounds(
-    invalid_score: float,
+    use_register_search: bool, invalid_score: float
 ) -> None:
-    beam = 2
-    vocab_size = 3
-    context_size = 1
-    encoder_dim = 4
-    register_launch, shared_launch, threads = get_zipformer_beam_search_kernels(
-        beam, vocab_size, context_size
+    decoder = make_fake_zipformer_decoder(
+        beam=2, vocab_size=3, encoder_dim=4, decoder_dtype=np.dtype(np.float32)
     )
-    assert register_launch is not None
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    decoder.decoder = ScriptedDecoderContext(decoder, ([invalid_score] * 3,))
 
-    def run_search(
-        launch: tuple[cp.RawKernel, int],
-    ) -> tuple[np.typing.NDArray[np.generic], ...]:
-        """Run one beam-search tactic against non-finite candidate scores.
-
-        Parameters
-        ----------
-        launch : tuple[cp.RawKernel, int]
-            Specialized kernel and its required dynamic shared-memory size.
-
-        Returns
-        -------
-        tuple[np.typing.NDArray[np.generic], ...]
-            Host copies of bounded search outputs and history state.
-        """
-
-        kernel, shared_memory_bytes = launch
-        next_scores = cp.empty((1, beam), dtype=np.float32)
-        next_nodes = cp.empty((1, beam), dtype=np.int32)
-        next_lengths = cp.empty((1, beam), dtype=np.int32)
-        next_hashes = cp.empty((1, beam), dtype=np.uint64)
-        node_counts = cp.zeros(1, dtype=np.int32)
-        contexts = cp.zeros((beam, context_size), dtype=np.int32)
-        node_parents = cp.full(beam, -2, dtype=np.int32)
-        node_tokens = cp.full(beam, -2, dtype=np.int32)
-        node_timestamps = cp.full(beam, -2.0, dtype=np.float32)
-        kernel(
-            (1,),
-            (threads,),
-            (
-                cp.full((beam, vocab_size), invalid_score, dtype=np.float32),
-                cp.zeros((1, 1, encoder_dim), dtype=np.float32),
-                cp.empty((beam, encoder_dim), dtype=np.float32),
-                cp.zeros(
-                    ((vocab_size + 1) ** context_size, encoder_dim), dtype=np.float32
-                ),
-                cp.empty((beam, encoder_dim), dtype=np.float32),
-                contexts,
-                cp.array([[0.0, -np.inf]], dtype=np.float32),
-                cp.full((1, beam), -1, dtype=np.int32),
-                cp.zeros((1, beam), dtype=np.int32),
-                cp.zeros((1, beam), dtype=np.uint64),
-                next_scores,
-                next_nodes,
-                next_lengths,
-                next_hashes,
-                node_parents,
-                node_tokens,
-                node_timestamps,
-                node_counts,
-                cp.array([1], dtype=np.int32),
-                np.int32(0),
-                np.int32(1),
-                np.int32(encoder_dim),
-                np.int32(0),
-                np.int32(0),
-                np.int32(0),
-                np.int32(0),
-                np.float32(0.0),
-                np.float32(0.04),
-            ),
-            shared_mem=shared_memory_bytes,
-        )
-        return tuple(
-            array.get()
-            for array in (next_scores, next_nodes, next_lengths, contexts, node_counts)
-        )
-
-    register_results = run_search(register_launch)
-    shared_results = run_search(shared_launch)
-    for register_result, shared_result in zip(
-        register_results, shared_results, strict=True
-    ):
-        np.testing.assert_array_equal(register_result, shared_result)
-    np.testing.assert_array_equal(register_results[0], [[-np.inf, -np.inf]])
-    np.testing.assert_array_equal(register_results[1], [[-1, 0]])
-    np.testing.assert_array_equal(register_results[2], [[0, 1]])
-    np.testing.assert_array_equal(register_results[3], [[0], [1]])
-    np.testing.assert_array_equal(register_results[4], [1])
+    assert decoder(
+        cp.zeros((1, 1, 4), dtype=np.float32), cp.array([1], dtype=np.int32)
+    ) == ([[]], [[]])
+    np.testing.assert_array_equal(decoder.next_scores.get(), -np.inf)
+    np.testing.assert_array_equal(decoder.next_nodes.get(), -1)
+    np.testing.assert_array_equal(decoder.next_lengths.get(), 0)
+    np.testing.assert_array_equal(decoder.next_hashes.get(), 0)
+    np.testing.assert_array_equal(decoder.contexts.get(), 0)
+    np.testing.assert_array_equal(decoder.node_counts.get(), [0])
 
 
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     "use_register_search", (False, True), ids=("shared", "register")
 )
-def test_zipformer_search_merges_and_resorts_duplicate_histories(
+@pytest.mark.parametrize("invalid_score", (-np.inf, np.inf, np.nan))
+def test_zipformer_search_preserves_finite_candidates(
+    use_register_search: bool, invalid_score: float
+) -> None:
+    decoder = make_fake_zipformer_decoder(beam=2)
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    decoder.decoder = ScriptedDecoderContext(
+        decoder, ([-8.0, 0.0, invalid_score, -4.0],)
+    )
+
+    assert decoder(
+        cp.zeros((1, 1, 3), dtype=np.float32), cp.array([1], dtype=np.int32)
+    ) == ([[1]], [[0.0]])
+    np.testing.assert_array_equal(decoder.next_scores.get(), [[0.0, -4.0]])
+    np.testing.assert_array_equal(decoder.node_tokens.get()[:2], [1, 3])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "use_register_search", (False, True), ids=("shared", "register")
+)
+def test_zipformer_search_merges_before_pruning_and_refills_beam(
     use_register_search: bool,
 ) -> None:
-    beam = 3
-    vocab_size = 3
-    register_launch, shared_launch, threads = get_zipformer_beam_search_kernels(
-        beam, vocab_size, 1
+    decoder = make_fake_zipformer_decoder(
+        beam=3, vocab_size=3, encoder_dim=1, decoder_dtype=np.dtype(np.float32)
     )
-    assert register_launch is not None
-    kernel, shared_memory_bytes = (
-        register_launch if use_register_search else shared_launch
-    )
-
-    next_scores = cp.empty((1, beam), dtype=np.float32)
-    next_nodes = cp.empty((1, beam), dtype=np.int32)
-    next_lengths = cp.empty((1, beam), dtype=np.int32)
-    next_hashes = cp.empty((1, beam), dtype=np.uint64)
-    node_parents = cp.array([-1, -2, -2, -2, -2, -2], dtype=np.int32)
-    node_tokens = cp.array([1, -2, -2, -2, -2, -2], dtype=np.int32)
-    node_timestamps = cp.array([0.0, -2.0, -2.0, -2.0, -2.0, -2.0], dtype=np.float32)
-    node_counts = cp.array([1], dtype=np.int32)
-    contexts = cp.array([[1], [0], [0]], dtype=np.int32)
-
-    kernel(
-        (1,),
-        (threads,),
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    decoder.decoder = ScriptedDecoderContext(
+        decoder,
         (
-            cp.array(
-                [[-0.2, -8.0, -0.1], [-8.0, -0.3, -8.0], [-8.0, -8.0, -8.0]],
-                dtype=np.float32,
-            ),
-            cp.zeros((1, 2, 1), dtype=np.float32),
-            cp.empty((beam, 1), dtype=np.float32),
-            cp.zeros((vocab_size + 1, 1), dtype=np.float32),
-            cp.empty((beam, 1), dtype=np.float32),
-            contexts,
-            cp.array([[0.0, 0.0, -np.inf]], dtype=np.float32),
-            cp.array([[0, -1, -1]], dtype=np.int32),
-            cp.array([[1, 0, 0]], dtype=np.int32),
-            cp.array([[2, 0, 0]], dtype=np.uint64),
-            next_scores,
-            next_nodes,
-            next_lengths,
-            next_hashes,
-            node_parents,
-            node_tokens,
-            node_timestamps,
-            node_counts,
-            cp.array([2], dtype=np.int32),
-            np.int32(1),
-            np.int32(2),
-            np.int32(1),
-            np.int32(0),
-            np.int32(0),
-            np.int32(0),
-            np.int32(0),
-            np.float32(0.0),
-            np.float32(0.04),
+            [-0.1, 0.0, -np.inf],
+            [[-0.2, -8.0, -0.1], [-7.9, -0.2, -7.9], [-8.0, -8.0, -8.0]],
         ),
-        shared_mem=shared_memory_bytes,
+    )
+    tokens, timestamps = decoder(
+        cp.zeros((1, 2, 1), dtype=np.float32), cp.array([2], dtype=np.int32)
     )
 
+    assert tokens == [[1]]
+    np.testing.assert_allclose(timestamps, [[0.0]])
     expected_score = np.logaddexp(np.float32(-0.2), np.float32(-0.3))
-    scores = next_scores.get()
-    np.testing.assert_allclose(scores[0, 0], expected_score, atol=1e-7)
-    np.testing.assert_allclose(scores[0, 1], -0.1, atol=1e-7)
-    assert np.isneginf(scores[0, 2])
-    np.testing.assert_array_equal(next_nodes.get(), [[0, 1, -1]])
-    np.testing.assert_array_equal(next_lengths.get(), [[1, 2, 0]])
-    np.testing.assert_array_equal(contexts.get(), [[1], [2], [0]])
-    np.testing.assert_array_equal(node_parents.get()[:2], [-1, 0])
-    np.testing.assert_array_equal(node_tokens.get()[:2], [1, 2])
-    np.testing.assert_allclose(node_timestamps.get()[:2], [0.0, 0.04])
-    np.testing.assert_array_equal(node_counts.get(), [2])
+    np.testing.assert_allclose(
+        decoder.hypothesis_scores.get(), [[expected_score, -0.1, -8.0]], atol=1e-7
+    )
+    np.testing.assert_array_equal(decoder.hypothesis_nodes.get(), [[0, 1, 2]])
+    np.testing.assert_array_equal(decoder.hypothesis_lengths.get(), [[1, 2, 2]])
+    np.testing.assert_array_equal(decoder.contexts.get(), [[1], [2], [1]])
+    np.testing.assert_array_equal(decoder.node_parents.get()[:3], [-1, 0, 0])
+    np.testing.assert_array_equal(decoder.node_tokens.get()[:3], [1, 2, 1])
+    np.testing.assert_allclose(decoder.node_timestamps.get()[:3], [0.0, 0.04, 0.04])
+    np.testing.assert_array_equal(decoder.node_counts.get(), [3])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "first_tokens, second_tokens, histories, scores",
+    (
+        pytest.param(
+            (2, 1), (3, 0), ((2, 3), (1, 3)), (0, -0.2), id="different-histories"
+        ),
+        pytest.param(
+            (1, 0),
+            (3, 1),
+            ((1, 3),),
+            (np.logaddexp(0, -0.2), -np.inf),
+            id="same-history-different-nodes",
+        ),
+        pytest.param(
+            (1, 2, 0),
+            (3, 0, 1),
+            ((1, 3), (2, 3)),
+            (np.logaddexp(0, -0.2), -0.1, -np.inf),
+            id="collision-before-true-match",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "use_register_search", (False, True), ids=("shared", "register")
+)
+def test_zipformer_search_checks_history_after_hash_match(
+    monkeypatch: pytest.MonkeyPatch,
+    use_register_search: bool,
+    first_tokens: tuple[int, ...],
+    second_tokens: tuple[int, ...],
+    histories: tuple[tuple[int, ...], ...],
+    scores: tuple[float, ...],
+) -> None:
+    beam = len(first_tokens)
+    decoder = make_fake_zipformer_decoder(beam=beam)
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    outputs = np.full((3, beam, 4), -np.inf, dtype=np.float32)
+    outputs[0, 0, list(first_tokens)] = np.linspace(0, -0.2, beam)
+    outputs[1, np.arange(beam), second_tokens] = 0
+    outputs[2, 0, 0] = 0
+    outputs[2, 1:, 3] = 0
+    context = ScriptedDecoderContext(decoder, tuple(outputs))
+    execute = context.execute_async_v3
+
+    def execute_with_collision(stream_ptr: int) -> bool:
+        """Inject matching fingerprints before the final scripted decoder call.
+
+        Parameters
+        ----------
+        stream_ptr : int
+            CUDA stream pointer forwarded unchanged to the original execution
+            method.
+
+        Returns
+        -------
+        bool
+            Execution status returned by the original scripted context.
+
+        Notes
+        -----
+        On the third invocation, set the longer history's hash to 4 and the
+        shorter histories' hashes to 0. Extending a zero-hash prefix with token 3
+        also produces 4, forcing exact-history comparisons despite matching
+        fingerprints. Only hashes are overridden; scripted scores and token
+        backpointers retain their normal behavior.
+        """
+
+        if context.calls == 2:
+            decoder.hypothesis_hashes[...] = cp.array(
+                [[4] + [0] * (beam - 1)], dtype=np.uint64
+            )
+        return execute(stream_ptr)
+
+    monkeypatch.setattr(context, "execute_async_v3", execute_with_collision)
+    decoder.decoder = context
+    tokens, timestamps = decoder(
+        cp.zeros((1, 3, 3), dtype=np.float32), cp.array([3], dtype=np.int32)
+    )
+
+    assert tokens == [list(histories[0])]
+    np.testing.assert_allclose(timestamps, [[0, 0.04]])
+    np.testing.assert_allclose(decoder.next_scores.get()[0], scores)
+    nodes, parents, node_tokens = (
+        array.get()
+        for array in (decoder.next_nodes, decoder.node_parents, decoder.node_tokens)
+    )
+    for node, history in zip(nodes[0, : len(histories)], histories, strict=True):
+        for token in reversed(history):
+            assert node >= 0
+            assert node_tokens[node] == token
+            node = parents[node]
+        assert node == -1
+
+
+def reference_zipformer_search(
+    outputs: np.ndarray, lengths: list[int], blank_id: int, blank_penalty: float
+) -> list[list[tuple[tuple[int, ...], np.float32, tuple[float, ...]]]]:
+    """Compute a CPU reference for frame-synchronous merge-before-prune search.
+
+    Parameters
+    ----------
+    outputs : np.ndarray
+        Float32 token log probabilities of shape
+        ``(num_frames, batch_size, beam, vocab_size)``. Parent rows follow the
+        preceding frame's hypothesis ranking. The input is not modified.
+    lengths : list[int]
+        Valid encoder-frame count for each utterance; later frames are ignored.
+    blank_id : int
+        Token column that advances time without extending the token history.
+    blank_penalty : float
+        Value subtracted from blank log probabilities before candidate merging.
+
+    Returns
+    -------
+    list[list[tuple]]
+        Per-utterance lists of up to ``beam`` ``(token_history, merged_log_prob,
+        timestamps)`` tuples, ordered by descending merged score. Histories and
+        timestamps are tuples; timestamps are in seconds. Scores remain
+        unnormalized so callers can apply final length normalization separately.
+
+    Notes
+    -----
+    Each utterance starts with one empty, zero-score hypothesis. Every frame
+    expands all tokens, discards nonfinite candidates, and merges equal full
+    histories with ``logaddexp`` before pruning. At most one token is emitted
+    per frame. Timestamps use the fixtures' 40 ms frame shift and follow the
+    highest-scoring contributing candidate at each step, not the merged score.
+    Candidate and merged-score ties prefer the lower ``parent * vocab_size +
+    token`` index of the representative path.
+    """
+
+    beam = outputs.shape[2]
+    batches = [[((), np.float32(0), ())] for _ in lengths]
+    for frame, batch_scores in enumerate(outputs):
+        for batch, scores in enumerate(batch_scores):
+            if frame >= lengths[batch]:
+                continue
+            candidates = {}
+            for parent, (history, mass, times) in enumerate(batches[batch]):
+                for token, log_prob in enumerate(scores[parent]):
+                    emitted = token != blank_id
+                    score = (
+                        mass
+                        + log_prob
+                        - np.float32(blank_penalty if not emitted else 0)
+                    )
+                    if not np.isfinite(score):
+                        continue
+                    tokens = history + (token,) if emitted else history
+                    timestamps = times + (frame * 0.04,) if emitted else times
+                    index = parent * scores.shape[1] + token
+                    if tokens not in candidates:
+                        candidates[tokens] = (score, score, index, timestamps)
+                    else:
+                        merged, *best_path = candidates[tokens]
+                        if score > best_path[0]:
+                            best_path = (score, index, timestamps)
+                        candidates[tokens] = (np.logaddexp(merged, score), *best_path)
+            ranked = sorted(
+                candidates.items(), key=lambda item: (-item[1][0], item[1][2])
+            )
+            batches[batch] = [
+                (tokens, data[0], data[3]) for tokens, data in ranked[:beam]
+            ]
+    return batches
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "beam, vocab_size, use_register_search",
+    [
+        (1, 5, False),
+        (1, 5, True),
+        (2, 5, False),
+        (2, 5, True),
+        (8, 5, False),
+        (8, 5, True),
+        (16, 5, False),
+        (8, 512, False),
+        (8, 512, True),
+        (16, 512, False),
+    ],
+)
+@pytest.mark.parametrize("blank_id", [0, 4])
+def test_zipformer_search_matches_merge_before_prune_reference(
+    beam: int, vocab_size: int, use_register_search: bool, blank_id: int
+) -> None:
+    decoder = make_fake_zipformer_decoder(
+        batch_size=2,
+        beam=beam,
+        vocab_size=vocab_size,
+        context_size=2,
+        blank_id=blank_id,
+    )
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    decoder.blank_penalty = 0.2
+    outputs = (
+        np.random.default_rng(41)
+        .normal(size=(7, 2, beam, vocab_size))
+        .astype(np.float32)
+    )
+    if vocab_size == 512:
+        outputs[:, :, :, blank_id] += 4
+    outputs -= np.logaddexp.reduce(outputs, axis=3, keepdims=True)
+    decoder.decoder = ScriptedDecoderContext(
+        decoder, tuple(outputs.reshape(7, 2 * beam, vocab_size))
+    )
+    lengths = [7, 5]
+    tokens, timestamps = decoder(
+        cp.zeros((2, 7, 3), dtype=np.float32), cp.array(lengths, dtype=np.int32)
+    )
+    expected = reference_zipformer_search(
+        outputs, lengths, blank_id, decoder.blank_penalty
+    )
+    scores = decoder.next_scores.get()
+    nodes = decoder.next_nodes.get()
+    parents, node_tokens, times = (
+        a.get()
+        for a in (decoder.node_parents, decoder.node_tokens, decoder.node_timestamps)
+    )
+    for batch, hypotheses in enumerate(expected):
+        np.testing.assert_allclose(
+            scores[batch, : len(hypotheses)], [hyp[1] for hyp in hypotheses], atol=2e-6
+        )
+        assert np.isneginf(scores[batch, len(hypotheses) :]).all()
+        for rank, (history, _, history_times) in enumerate(hypotheses):
+            actual_tokens, actual_times = [], []
+            node = nodes[batch, rank]
+            for _ in history:
+                assert node >= 0
+                actual_tokens.append(int(node_tokens[node]))
+                actual_times.append(float(times[node]))
+                node = parents[node]
+            assert node == -1
+            assert tuple(reversed(actual_tokens)) == history
+            np.testing.assert_allclose(
+                list(reversed(actual_times)), history_times, atol=1e-7
+            )
+        best = max(hypotheses, key=lambda hyp: hyp[1] / (len(hyp[0]) + 2))
+        assert tokens[batch] == list(best[0])
+        np.testing.assert_allclose(timestamps[batch], best[2], atol=1e-7)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "beam, use_register_search",
+    [(2, False), (2, True), (8, False), (8, True), (16, False)],
+)
+def test_zipformer_search_recovers_duplicates_below_unmerged_cutoff(
+    beam: int, use_register_search: bool
+) -> None:
+    vocab_size = beam + 1
+    decoder = make_fake_zipformer_decoder(
+        beam=beam, vocab_size=vocab_size, context_size=2
+    )
+    decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
+    outputs = np.full((2, beam, vocab_size), -20, dtype=np.float32)
+    outputs[0, 0, 0] = 0
+    outputs[0, 0, 1] = -0.1
+    outputs[1, 0, 1] = -1
+    outputs[1, 1, 0] = -0.9
+    outputs[1, 0, 2:] = -0.8
+    outputs[1, 1, 2] = -0.7
+    decoder.decoder = ScriptedDecoderContext(decoder, tuple(outputs))
+
+    tokens, timestamps = decoder(
+        cp.zeros((1, 2, 3), dtype=np.float32), cp.array([2], dtype=np.int32)
+    )
+
+    assert tokens == [[1]]
+    np.testing.assert_allclose(timestamps, [[0.04]])
+    np.testing.assert_allclose(
+        decoder.hypothesis_scores.get()[0, 0], np.logaddexp(-1, -1), atol=1e-7
+    )
+    assert np.isfinite(decoder.hypothesis_scores.get()).sum() == beam
 
 
 @pytest.mark.cuda
@@ -1040,6 +1151,34 @@ def test_zipformer_decoder_reports_tensorrt_execution_failure() -> None:
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize(
+    "buffer_name, message",
+    [
+        ("node_tokens", "Zipformer search buffers"),
+        ("output_timestamps", "Zipformer device output buffers"),
+        ("output_timestamps_host", "Zipformer output buffers"),
+    ],
+)
+def test_zipformer_decoder_rejects_missing_reusable_buffers(
+    buffer_name: str, message: str
+) -> None:
+    decoder = make_fake_zipformer_decoder()
+    decoder.decoder = ScriptedDecoderContext(decoder, ([-8.0, 0.0, -8.0, -8.0],))
+    encoder_output = cp.zeros((1, 1, 3), dtype=np.float32)
+    lengths = cp.array([1], dtype=np.int32)
+    expected = ([[1]], [[0.0]])
+    assert decoder(encoder_output, lengths) == expected
+    buffer = getattr(decoder, buffer_name)
+    setattr(decoder, buffer_name, None)
+
+    with pytest.raises(ASRInferenceError, match=message):
+        decoder(encoder_output, lengths)
+
+    setattr(decoder, buffer_name, buffer)
+    assert decoder(encoder_output, lengths) == expected
+
+
+@pytest.mark.cuda
 def test_zipformer_decoder_falls_back_after_captured_execution_failure() -> None:
     decoder = make_fake_zipformer_decoder()
     decoder.cuda_graph_supported = True
@@ -1082,7 +1221,7 @@ def test_zipformer_decoder_handles_cuda_capture_errors(
             self.status = status
 
     class InvalidatingStream(cp.cuda.Stream):
-        """Finish capture, then report CUDA's invalidated-capture status."""
+        """Finish capture, then report the configured CUDA error."""
 
         def end_capture(self) -> cp.cuda.graph.Graph:
             """End stream capture and raise the configured CUDA error.
@@ -1128,60 +1267,16 @@ def test_zipformer_decoder_handles_cuda_capture_errors(
 def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffers(
     use_register_search: bool,
 ) -> None:
-    decoder = make_fake_zipformer_decoder(
-        batch_size=2, beam=2, context_size=1, encoder_dim=3, vocab_size=4
-    )
+    decoder = make_fake_zipformer_decoder(batch_size=2, beam=2)
     decoder.beam_search_register_batch_limit = 64 if use_register_search else 0
     decoder.cuda_graph_supported = True
     assert decoder.register_beam_search is not None
 
-    kernel_calls = {"register": 0, "shared": 0}
-
-    def record_launch(
-        name: str, launch: tuple[cp.RawKernel, int]
-    ) -> tuple[cp.RawKernel, int]:
-        """Wrap one search tactic and count its kernel launches.
-
-        Parameters
-        ----------
-        name : str
-            Counter key identifying the register or shared-memory tactic.
-        launch : tuple[cp.RawKernel, int]
-            Kernel and dynamic shared-memory size returned by the factory.
-
-        Returns
-        -------
-        tuple[cp.RawKernel, int]
-            Counting kernel wrapper and the unchanged shared-memory size.
-        """
-
-        kernel, shared_memory_bytes = launch
-
-        def recording_kernel(*args: Any, **kwargs: Any) -> Any:
-            """Count and forward one CuPy kernel invocation.
-
-            Parameters
-            ----------
-            *args : Any
-                Positional launch arguments forwarded to the wrapped kernel.
-            **kwargs : Any
-                Keyword launch arguments forwarded to the wrapped kernel.
-
-            Returns
-            -------
-            Any
-                Return value produced by the wrapped CuPy kernel.
-            """
-
-            kernel_calls[name] += 1
-            return kernel(*args, **kwargs)
-
-        return cast(cp.RawKernel, recording_kernel), shared_memory_bytes
-
-    decoder.register_beam_search = record_launch(
-        "register", decoder.register_beam_search
-    )
-    decoder.shared_beam_search = record_launch("shared", decoder.shared_beam_search)
+    register, register_memory = decoder.register_beam_search
+    shared, shared_memory = decoder.shared_beam_search
+    register, shared = Mock(wraps=register), Mock(wraps=shared)
+    decoder.register_beam_search = register, register_memory
+    decoder.shared_beam_search = shared, shared_memory
 
     decoder.decoder = ScriptedDecoderContext(
         decoder, ([-1.0, 0.0, -8.0, -8.0], [-1.0, -8.0, 0.0, -8.0])
@@ -1217,10 +1312,8 @@ def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffer
     assert token_ids == [[1, 2], [1]]
     assert decoder.cuda_graph is None
     assert decoder.decoder.calls == 6
-    selected_kernel = "register" if use_register_search else "shared"
-    unselected_kernel = "shared" if use_register_search else "register"
-    assert kernel_calls[selected_kernel] > 0
-    assert kernel_calls[unselected_kernel] == 0
+    assert register.called == use_register_search
+    assert shared.called != use_register_search
 
 
 @pytest.mark.cuda
@@ -1269,8 +1362,15 @@ def test_zipformer_decoder_uses_live_graph_inputs_and_invalidates_changed_buffer
         ),
     ),
 )
+@pytest.mark.parametrize(
+    "unaligned_buffer",
+    (None, "encoder_output", "encoder_input", "context_lookup", "decoder_input"),
+)
 def test_zipformer_decoder_converts_inputs_to_engine_precision(
-    encoder_dtype: np.dtype, context_dtype: np.dtype, decoder_dtype: np.dtype
+    encoder_dtype: np.dtype,
+    context_dtype: np.dtype,
+    decoder_dtype: np.dtype,
+    unaligned_buffer: str | None,
 ) -> None:
     decoder = make_fake_zipformer_decoder(
         context_size=2,
@@ -1285,6 +1385,21 @@ def test_zipformer_decoder_converts_inputs_to_engine_precision(
     encoder_output = (
         cp.arange(16, dtype=np.float32).astype(encoder_dtype).reshape(1, 2, 8)
     )
+    if unaligned_buffer is not None:
+        original = (
+            encoder_output
+            if unaligned_buffer == "encoder_output"
+            else getattr(decoder, unaligned_buffer)
+        )
+        view = cp.empty(original.size + 1, dtype=original.dtype)[1:].reshape(
+            original.shape
+        )
+        view[...] = original
+        assert view.flags.c_contiguous and view.data.ptr % 16 != 0
+        if unaligned_buffer == "encoder_output":
+            encoder_output = view
+        else:
+            setattr(decoder, unaligned_buffer, view)
     token_ids, _ = decoder(encoder_output, cp.array([2], dtype=np.int32))
 
     assert token_ids == [[1]]
@@ -1774,21 +1889,18 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
         stream=stream,
     )
 
-    expected_context_dtype = (
-        cp.dtype("bfloat16")
-        if context_dtype == torch.bfloat16
-        else np.dtype(np.float16 if context_dtype == torch.float16 else np.float32)
-    )
-    expected_engine_dtype = (
-        cp.dtype("bfloat16")
-        if engine_dtype == trt.bfloat16
-        else np.dtype(np.float16 if engine_dtype == trt.float16 else np.float32)
-    )
+    cupy_dtypes = {
+        torch.float32: np.dtype(np.float32),
+        torch.float16: np.dtype(np.float16),
+        torch.bfloat16: cp.dtype("bfloat16"),
+    }
     engine_torch_dtype = {
         trt.float32: torch.float32,
         trt.float16: torch.float16,
         trt.bfloat16: torch.bfloat16,
     }[engine_dtype]
+    expected_context_dtype = cupy_dtypes[context_dtype]
+    expected_engine_dtype = cupy_dtypes[engine_torch_dtype]
     expected_context_lookup = context_lookup.to(context_dtype).to(torch.float32).numpy()
     expected_initial_decoder_input = (
         context_lookup.to(context_dtype)
@@ -1856,6 +1968,63 @@ def test_zipformer_decoder_initializes_every_wide_beam_context(
     )
     assert decoder.hypothesis_scores.shape == (2, 3)
     assert decoder.contexts.shape == (6, 2)
+
+
+@pytest.mark.parametrize(
+    "beam, vocab_size, required",
+    [
+        (6, 512, 12584),
+        (8, 1525, CUDA_DEFAULT_SHARED_MEMORY_BYTES),
+        (32, 512, 66560),
+    ],
+)
+def test_zipformer_decoder_opts_in_to_large_shared_memory(
+    monkeypatch: pytest.MonkeyPatch, beam: int, vocab_size: int, required: int
+) -> None:
+    engine = FakeZipformerEngine(None)
+    engine.shapes = {
+        "decoder_input": (beam, 4),
+        "encoder_output": (beam, 4),
+        "tokens_log_prob": (beam, vocab_size),
+    }
+    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda path: engine)
+    monkeypatch.setattr(zipformer_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(
+        NullCudaContext,
+        "attributes",
+        {"MultiProcessorCount": 1, "MaxSharedMemoryPerBlockOptin": 96 * 1024},
+    )
+    monkeypatch.setattr(
+        gpu_kernels.cp,
+        "RawKernel",
+        lambda *args, **kwargs: SimpleNamespace(max_dynamic_shared_size_bytes=0),
+    )
+    get_zipformer_beam_search_kernels.cache_clear()
+    try:
+        with pytest.raises(ASRInitializationError, match="execution context"):
+            ZipformerModifiedBeamSearchDecoder(
+                Path("decoder.trt"),
+                1,
+                2,
+                vocab_size,
+                0,
+                0.04,
+                0.0,
+                0,
+                cast(cp.cuda.Stream, NullCudaContext()),
+            )
+        register_launch, (kernel, shared_memory_bytes), _ = (
+            get_zipformer_beam_search_kernels(beam, vocab_size, 2)
+        )
+    finally:
+        get_zipformer_beam_search_kernels.cache_clear()
+
+    assert shared_memory_bytes == required
+    assert kernel.max_dynamic_shared_size_bytes == (
+        96 * 1024 if required > CUDA_DEFAULT_SHARED_MEMORY_BYTES else 0
+    )
+    if register_launch is not None:
+        assert register_launch[0].max_dynamic_shared_size_bytes == 0
 
 
 def test_zipformer_decoder_rejects_missing_execution_context(

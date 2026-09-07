@@ -7,12 +7,16 @@ Runtime validation bounds fixed engine tensors and configured search tables to
 signed 32-bit indexing, while kernels clamp device-resident output lengths. The
 search state remains on the GPU and is safe to replay from CUDA graphs; CTC
 widens flattened offsets because its output stride comes directly from a dynamic
-frame count.
+frame count. Packed copies also check pointer alignment: a contiguous view may
+start inside an allocation. Nonfinite transducer candidates are treated as
+unreachable before top-k selection. History fingerprints only filter possible
+merges; matching token sequences are verified through their GPU backpointers.
 """
 
 from functools import cache
 
 import cupy as cp
+import numpy as np
 
 from ..constants import INT32_MAX, ZIPFORMER_BEAM_SEARCH_THREADS
 
@@ -56,8 +60,70 @@ CTC_COLLAPSE_KERNEL = cp.RawKernel(
 )
 
 
-ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
+HISTORY_HELPERS_SOURCE = r"""
+    // Called only after candidate lengths and fingerprints match. Nodes belong
+    // to append-only, acyclic histories. A shared node proves the remaining
+    // prefixes equal, even when their timestamps or recurrent states differ.
+    // Optional memoization has a power-of-two capacity and must be cleared
+    // whenever node IDs are recycled for another decoder call.
+    __device__ __forceinline__ bool histories_equal(int left, int right, const int* node_parents,
+        const int* node_tokens, unsigned long long* history_cache = nullptr, int cache_size = 0)
+    {
+        unsigned long long first_pair = 0;
+        int first_slot = 0;
+        while (left != right)
+        {
+            if (left < 0 || right < 0)
+            {
+                return false;
+            }
+            if (history_cache != nullptr)
+            {
+                // Pack the exact ordered pair of nonnegative int32 node IDs,
+                // not a fingerprint. Atomic entries make concurrent eviction
+                // harmless: a different pair is always a miss, never a match.
+                const unsigned int lower = left < right ? left : right;
+                const unsigned int upper = left < right ? right : left;
+                const unsigned long long pair =
+                    (static_cast<unsigned long long>(lower) << 32) | upper;
+                unsigned long long mixed = (pair ^ (pair >> 32)) * 1099511628211ULL;
+                mixed ^= mixed >> 32;
+                const int slot = static_cast<unsigned int>(mixed) & (cache_size - 1);
+                if (first_pair == 0)
+                {
+                    first_pair = pair;
+                    first_slot = slot;
+                }
+                if (atomicCAS(history_cache + slot, 0ULL, 0ULL) == pair)
+                {
+                    if (pair == first_pair)
+                    {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            if (node_tokens[left] != node_tokens[right])
+            {
+                return false;
+            }
+            left = node_parents[left];
+            right = node_parents[right];
+        }
+        if (first_pair != 0)
+        {
+            atomicExch(history_cache + first_slot, first_pair);
+        }
+        return true;
+    }
+"""
+
+
+ZIPFORMER_BEAM_SEARCH_SOURCE = (
+    HISTORY_HELPERS_SOURCE
+    + r"""
     #include <climits>
+    #include <cstdint>
     #include <cuda_bf16.h>
     #include <cuda_fp16.h>
     #include <math_constants.h>
@@ -138,6 +204,19 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
         return score > other_score || (score == other_score && index < other_index);
     }
 
+    __device__ __forceinline__ float zipformer_candidate_score(const float* log_probs,
+        const float* hypothesis_scores, int parent, int token, int blank_id, float blank_penalty)
+    {
+        float score = hypothesis_scores[parent] + log_probs[parent * ZIPFORMER_VOCAB_SIZE + token];
+        if (token == blank_id)
+        {
+            score -= blank_penalty;
+        }
+        // Positive infinity must not outrank finite paths and then terminate
+        // materialization of the selected beam below.
+        return isfinite(score) ? score : zipformer_lowest_score();
+    }
+
     __device__ __forceinline__ void zipformer_warp_best(float& score, int& index)
     {
         // Every launched block contains complete warps and no lane exits before
@@ -200,8 +279,9 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
         const int candidate_count = beam * vocab_size;
         // Dynamic shared memory contains, in order, optional candidate scores,
         // one score/index pair per warp, the selected score/index pairs, a
-        // snapshot of every parent predictor context. All regions are 4-byte
-        // aligned; the Python launch helper computes this exact byte count.
+        // snapshot of every parent predictor context, and sparse merge pairs.
+        // All regions are 4-byte aligned; the Python launch helper computes
+        // this exact byte count.
         extern __shared__ unsigned char shared_memory[];
         const int lane = thread & 31;
         const int warp = thread >> 5;
@@ -216,6 +296,9 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
         float* selected_scores = reinterpret_cast<float*>(reduction_indexes + num_warps);
         int* selected_indexes = reinterpret_cast<int*>(selected_scores + beam);
         int* current_contexts = selected_indexes + beam;
+        int* merged_indexes = current_contexts + beam * context_size;
+        int* removed_indexes = merged_indexes + beam;
+        float* merged_scores = reinterpret_cast<float*>(removed_indexes + beam);
 
         // Contexts are updated in place below. Preserve the parent rows before
         // thread zero starts writing the next generation.
@@ -224,12 +307,65 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
             current_contexts[index] = contexts[context_base + index];
         }
 
+        // Live parent histories are unique. Nonblank extensions therefore only
+        // duplicate a longer parent's blank path. Find these pairs in O(beam^2)
+        // rather than hashing the entire hypothesis-by-vocabulary table.
+        for (int parent = thread; parent < beam; parent += blockDim.x)
+        {
+            merged_indexes[parent] = -1;
+            const int parent_index = hypothesis_base + parent;
+            const int node = hypothesis_nodes[parent_index];
+            if (node < 0 || !isfinite(hypothesis_scores[parent_index]))
+            {
+                continue;
+            }
+            const int token = node_tokens[node];
+            for (int shorter = 0; shorter < beam; ++shorter)
+            {
+                const int shorter_index = hypothesis_base + shorter;
+                // Unsigned wrap is intentional: fingerprints filter candidates,
+                // but only matching token histories may merge.
+                if (hypothesis_lengths[shorter_index] + 1 != hypothesis_lengths[parent_index]
+                    || hypothesis_hashes[shorter_index] * 1099511628211ULL
+                               + static_cast<unsigned long long>(token + 1)
+                           != hypothesis_hashes[parent_index])
+                {
+                    continue;
+                }
+                // The longer history already ends in token, so compare its
+                // prefix with the shorter history before merging the extension.
+                if (!histories_equal(hypothesis_nodes[shorter_index], node_parents[node],
+                        node_parents, node_tokens))
+                {
+                    continue;
+                }
+                const float blank_score = zipformer_candidate_score(
+                    log_probs, hypothesis_scores, parent_index, blank_id, blank_id, blank_penalty);
+                const float token_score = zipformer_candidate_score(
+                    log_probs, hypothesis_scores, shorter_index, token, blank_id, blank_penalty);
+                if (isfinite(blank_score) && isfinite(token_score))
+                {
+                    const int blank_candidate = parent * vocab_size + blank_id;
+                    const int token_candidate = shorter * vocab_size + token;
+                    const bool keep_blank = zipformer_score_is_better(
+                        blank_score, blank_candidate, token_score, token_candidate);
+                    merged_indexes[parent] = keep_blank ? blank_candidate : token_candidate;
+                    removed_indexes[parent] = keep_blank ? token_candidate : blank_candidate;
+                    const float maximum = fmaxf(blank_score, token_score);
+                    merged_scores[parent] =
+                        maximum + logf(expf(blank_score - maximum) + expf(token_score - maximum));
+                }
+                break;
+            }
+        }
+        __syncthreads();
+
     #if ZIPFORMER_REGISTER_TOPK
         constexpr int items_per_thread =
             (ZIPFORMER_BEAM * ZIPFORMER_VOCAB_SIZE - 1) / ZIPFORMER_BEAM_SEARCH_THREADS + 1;
-        // Each thread sorts its strided candidates in registers. Global ranks
-        // then require one block reduction apiece instead of rescanning shared
-        // candidate scores beam times.
+        // Sort short per-thread lists instead of rescanning shared scores for
+        // each rank. Dynamic indexing may place these lists in local memory;
+        // the register variant's name does not guarantee spill-free code.
         float local_scores[items_per_thread];
         int local_indexes[items_per_thread];
     #pragma unroll
@@ -242,19 +378,36 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
             {
                 const int parent = candidate / vocab_size;
                 const int token = candidate - parent * vocab_size;
-                score = hypothesis_scores[hypothesis_base + parent]
-                        + log_probs[(hypothesis_base + parent) * vocab_size + token];
-                if (token == blank_id)
-                {
-                    score -= blank_penalty;
-                }
-                if (isnan(score))
-                {
-                    score = zipformer_lowest_score();
-                }
+                score = zipformer_candidate_score(log_probs, hypothesis_scores,
+                    hypothesis_base + parent, token, blank_id, blank_penalty);
                 candidate_index = candidate;
             }
 
+            local_scores[item] = score;
+            local_indexes[item] = candidate_index;
+        }
+        for (int parent = 0; parent < beam; ++parent)
+        {
+            const int winner = merged_indexes[parent];
+            if (winner >= 0)
+            {
+                const int loser = removed_indexes[parent];
+                if (winner % ZIPFORMER_BEAM_SEARCH_THREADS == thread)
+                {
+                    local_scores[winner / ZIPFORMER_BEAM_SEARCH_THREADS] = merged_scores[parent];
+                }
+                if (loser % ZIPFORMER_BEAM_SEARCH_THREADS == thread)
+                {
+                    local_scores[loser / ZIPFORMER_BEAM_SEARCH_THREADS] = zipformer_lowest_score();
+                }
+            }
+        }
+
+    #pragma unroll
+        for (int item = 1; item < items_per_thread; ++item)
+        {
+            const float score = local_scores[item];
+            const int candidate_index = local_indexes[item];
             int position = item;
     #pragma unroll
             while (position > 0
@@ -307,22 +460,22 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
     #else
         // The occupancy-oriented variant materializes all candidate scores once,
         // then removes one block-wide maximum for each retained rank.
-        __syncthreads();
         for (int candidate = thread; candidate < candidate_count; candidate += blockDim.x)
         {
             const int parent = candidate / vocab_size;
             const int token = candidate - parent * vocab_size;
-            float score = hypothesis_scores[hypothesis_base + parent]
-                          + log_probs[(hypothesis_base + parent) * vocab_size + token];
-            if (token == blank_id)
+            candidate_scores[candidate] = zipformer_candidate_score(log_probs, hypothesis_scores,
+                hypothesis_base + parent, token, blank_id, blank_penalty);
+        }
+        __syncthreads();
+        for (int parent = thread; parent < beam; parent += blockDim.x)
+        {
+            const int winner = merged_indexes[parent];
+            if (winner >= 0)
             {
-                score -= blank_penalty;
+                candidate_scores[winner] = merged_scores[parent];
+                candidate_scores[removed_indexes[parent]] = zipformer_lowest_score();
             }
-            if (isnan(score))
-            {
-                score = zipformer_lowest_score();
-            }
-            candidate_scores[candidate] = score;
         }
         __syncthreads();
 
@@ -381,9 +534,12 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                 }
             }
 
-            int output_count = 0;
             for (int rank = 0; rank < beam; ++rank)
             {
+                if (!isfinite(selected_scores[rank]))
+                {
+                    break;
+                }
                 const int selected_index = selected_indexes[rank];
                 const int parent = selected_index / vocab_size;
                 const int token = selected_index - parent * vocab_size;
@@ -398,36 +554,6 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                                   + static_cast<unsigned long long>(token + 1)
                             : hypothesis_hashes[parent_index];
 
-                int duplicate = -1;
-                for (int output = 0; output < output_count; ++output)
-                {
-                    const int output_index = hypothesis_base + output;
-                    // Length plus a 64-bit rolling history fingerprint avoids
-                    // repeatedly walking compact backpointer chains here. A hash
-                    // collision is possible in principle but negligibly likely;
-                    // exact chain comparison would dominate this serial merge.
-                    if (next_lengths[output_index] != candidate_length
-                        || next_hashes[output_index] != candidate_hash)
-                    {
-                        continue;
-                    }
-                    duplicate = output;
-                    break;
-                }
-
-                if (duplicate >= 0)
-                {
-                    const int duplicate_index = hypothesis_base + duplicate;
-                    const float first = next_scores[duplicate_index];
-                    const float second = selected_scores[rank];
-                    const float maximum = fmaxf(first, second);
-                    next_scores[duplicate_index] =
-                        isinf(maximum)
-                            ? maximum
-                            : maximum + logf(expf(first - maximum) + expf(second - maximum));
-                    continue;
-                }
-
                 int candidate_node = parent_node;
                 if (emitted)
                 {
@@ -441,7 +567,7 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                         roundf(frame_index * encoder_frame_shift_sec * 1000.0F) / 1000.0F;
                 }
 
-                const int output_index = hypothesis_base + output_count;
+                const int output_index = hypothesis_base + rank;
                 const long long output_context_base =
                     static_cast<long long>(output_index) * context_size;
                 next_scores[output_index] = selected_scores[rank];
@@ -464,56 +590,6 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                         contexts[output_context_base + context] =
                             current_contexts[parent * context_size + context];
                     }
-                }
-                ++output_count;
-            }
-
-            // Duplicate merging can reduce the number of live hypotheses and
-            // changes their scores. Restore descending order before constructing
-            // the predictor-cache row indexes for the next frame.
-            for (int output = 0; output < output_count; ++output)
-            {
-                int best = output;
-                for (int candidate = output + 1; candidate < output_count; ++candidate)
-                {
-                    if (next_scores[hypothesis_base + candidate]
-                        > next_scores[hypothesis_base + best])
-                    {
-                        best = candidate;
-                    }
-                }
-                if (best == output)
-                {
-                    continue;
-                }
-
-                const int output_index = hypothesis_base + output;
-                const int best_index = hypothesis_base + best;
-                const long long output_context_base =
-                    static_cast<long long>(output_index) * context_size;
-                const long long best_context_base =
-                    static_cast<long long>(best_index) * context_size;
-                const float score = next_scores[output_index];
-                next_scores[output_index] = next_scores[best_index];
-                next_scores[best_index] = score;
-
-                const int node = next_nodes[output_index];
-                next_nodes[output_index] = next_nodes[best_index];
-                next_nodes[best_index] = node;
-
-                const int length = next_lengths[output_index];
-                next_lengths[output_index] = next_lengths[best_index];
-                next_lengths[best_index] = length;
-
-                const unsigned long long hash = next_hashes[output_index];
-                next_hashes[output_index] = next_hashes[best_index];
-                next_hashes[best_index] = hash;
-
-                for (int context = 0; context < context_size; ++context)
-                {
-                    const int value = contexts[output_context_base + context];
-                    contexts[output_context_base + context] = contexts[best_context_base + context];
-                    contexts[best_context_base + context] = value;
                 }
             }
 
@@ -540,16 +616,21 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
             const bool same_dtype = encoder_output_dtype == encoder_input_dtype
                                     && encoder_output_dtype == context_lookup_dtype;
             const int packed_elements = encoder_output_dtype == ZIPFORMER_FLOAT32 ? 4 : 8;
+            const uintptr_t addresses = reinterpret_cast<uintptr_t>(encoder_output_raw)
+                                        | reinterpret_cast<uintptr_t>(encoder_input_raw)
+                                        | reinterpret_cast<uintptr_t>(context_lookup_raw)
+                                        | reinterpret_cast<uintptr_t>(decoder_input_raw);
             const bool can_copy_16_bytes = same_dtype
                                            && (encoder_output_dtype == ZIPFORMER_FLOAT32
                                                || encoder_output_dtype == ZIPFORMER_FLOAT16
                                                || encoder_output_dtype == ZIPFORMER_BFLOAT16)
-                                           && encoder_dim % packed_elements == 0;
+                                           && encoder_dim % packed_elements == 0
+                                           && addresses % alignof(uint4) == 0;
             if (can_copy_16_bytes)
             {
-                // All runtime buffers are CUDA-aligned, and the divisibility check
-                // keeps every row 16-byte aligned. The values need no conversion,
-                // so one uint4 path handles FP32, FP16, and BF16 bit-for-bit.
+                // Check both base addresses and row widths. Contiguous slices
+                // need not start at a 16-byte boundary. Aligned values need no
+                // conversion, so uint4 handles all three dtypes bit-for-bit.
                 const int packed_dim = encoder_dim / packed_elements;
                 const uint4* encoder_output_packed =
                     reinterpret_cast<const uint4*>(encoder_output_raw);
@@ -560,7 +641,7 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
                 const int encoder_output_packed_base =
                     (utterance * max_frames + next_frame) * packed_dim;
                 const int hypothesis_packed_base = hypothesis_base * packed_dim;
-                for (int index = thread; index < beam * packed_dim; index += blockDim.x)
+                for (unsigned int index = thread; index < beam * packed_dim; index += blockDim.x)
                 {
                     const int hypothesis = index / packed_dim;
                     const int feature = index - hypothesis * packed_dim;
@@ -572,7 +653,9 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
             }
             else
             {
-                for (int index = thread; index < beam * encoder_dim; index += blockDim.x)
+                // The final stride may exceed INT_MAX even when every accessed
+                // element fits. An unsigned counter exits instead of wrapping negative.
+                for (unsigned int index = thread; index < beam * encoder_dim; index += blockDim.x)
                 {
                     const int hypothesis = index / encoder_dim;
                     const int feature = index - hypothesis * encoder_dim;
@@ -591,6 +674,7 @@ ZIPFORMER_BEAM_SEARCH_SOURCE = r"""
         }
     }
     """
+)
 
 
 @cache
@@ -631,11 +715,14 @@ def get_zipformer_beam_search_kernels(
     Notes
     -----
     Both variants compile ``beam``, ``vocab_size``, and ``context_size`` into the
-    CUDA source. The register-local variant is emitted only for warp-aligned
+    CUDA source. Callers must supply validated positive integer shapes.
+    The register-local variant is emitted only for warp-aligned
     blocks, beams no larger than eight, and at most eight candidates per thread.
     It minimizes synchronization for small launches, while the shared-memory
     variant retains occupancy for large batches. Results are cached by search
     shape so each configuration creates its CuPy kernels only once.
+    The compiler can place dynamically indexed candidate lists in local memory;
+    compare compiled resource usage and timings before changing the dispatch rule.
     """
 
     threads = ZIPFORMER_BEAM_SEARCH_THREADS
@@ -648,9 +735,17 @@ def get_zipformer_beam_search_kernels(
     candidates_per_thread = (beam * vocab_size - 1) // threads + 1
     register_topk_supported = beam <= 8 and candidates_per_thread <= 8
 
-    reduction_bytes = threads // 32 * 8
-    register_shared_memory_bytes = reduction_bytes + beam * 8 + beam * context_size * 4
-    shared_memory_bytes = register_shared_memory_bytes + beam * vocab_size * 4
+    reduction_bytes = (
+        threads // 32 * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
+    )
+    register_shared_memory_bytes = reduction_bytes + beam * (
+        2 * np.dtype(np.float32).itemsize
+        + 3 * np.dtype(np.int32).itemsize
+        + context_size * np.dtype(np.int32).itemsize
+    )
+    shared_memory_bytes = (
+        register_shared_memory_bytes + beam * vocab_size * np.dtype(np.float32).itemsize
+    )
     if shared_memory_bytes > INT32_MAX:
         raise ValueError(
             "Zipformer beam-search dynamic shared memory exceeds the signed "
@@ -735,6 +830,7 @@ ZIPFORMER_FINALIZE_KERNEL = cp.RawKernel(
 
 
 TDT_VALUE_HELPERS_SOURCE = r"""
+    #include <cstdint>
     #include <cuda_bf16.h>
     #include <cuda_fp16.h>
 
@@ -786,17 +882,20 @@ TDT_VALUE_HELPERS_SOURCE = r"""
     {
         const bool same_dtype = encoder_output_dtype == encoder_input_dtype;
         const int packed_elements = encoder_output_dtype == TDT_FLOAT32 ? 4 : 8;
-        const bool can_copy_16_bytes = same_dtype && encoder_dim % packed_elements == 0;
+        const uintptr_t addresses = reinterpret_cast<uintptr_t>(encoder_output_raw)
+                                    | reinterpret_cast<uintptr_t>(encoder_input_raw);
+        const bool can_copy_16_bytes =
+            same_dtype && encoder_dim % packed_elements == 0 && addresses % alignof(uint4) == 0;
         if (can_copy_16_bytes)
         {
-            // CUDA allocations are naturally aligned. Divisible row widths keep
-            // every row 16-byte aligned, so one bitwise path serves all dtypes.
+            // Both base addresses and row widths are aligned; contiguous views
+            // with an offset instead take the scalar path below.
             const int encoder_vectors = encoder_dim / packed_elements;
             const uint4* encoder_output = reinterpret_cast<const uint4*>(encoder_output_raw);
             uint4* encoder_input = reinterpret_cast<uint4*>(encoder_input_raw);
             const int output_vector_base = output_base / packed_elements;
             const int input_vector_base = input_base / packed_elements;
-            for (int feature = thread; feature < encoder_vectors; feature += blockDim.x)
+            for (unsigned int feature = thread; feature < encoder_vectors; feature += blockDim.x)
             {
                 encoder_input[input_vector_base + feature] =
                     active ? encoder_output[output_vector_base + feature] : make_uint4(0, 0, 0, 0);
@@ -804,8 +903,9 @@ TDT_VALUE_HELPERS_SOURCE = r"""
             return;
         }
 
-        // The scalar path also converts values when encoder precisions differ.
-        for (int feature = thread; feature < encoder_dim; feature += blockDim.x)
+        // The final stride may pass INT_MAX; only in-bounds offsets are converted
+        // back to int. The scalar path also handles mixed encoder precisions.
+        for (unsigned int feature = thread; feature < encoder_dim; feature += blockDim.x)
         {
             const float value = active ? load_tdt_value(encoder_output_raw, output_base + feature,
                                              encoder_output_dtype)
@@ -955,7 +1055,7 @@ TDT_SELECT_TOKENS_KERNEL = cp.RawKernel(
         {
             float score = active ? token_log_probs[hypothesis * (vocab_size + 1) + token]
                                  : tdt_lowest_score();
-            candidate_scores[token] = isnan(score) ? tdt_lowest_score() : score;
+            candidate_scores[token] = isfinite(score) ? score : tdt_lowest_score();
         }
         __syncthreads();
 
@@ -1004,10 +1104,99 @@ TDT_SELECT_TOKENS_KERNEL = cp.RawKernel(
 )
 
 TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
-    TDT_VALUE_HELPERS_SOURCE
+    HISTORY_HELPERS_SOURCE
+    + TDT_VALUE_HELPERS_SOURCE
     + TDT_TOPK_HELPERS_SOURCE
     + TDT_SCORE_HELPERS_SOURCE
     + r"""
+    struct TdtCandidate
+    {
+        int parent;
+        int duration_index;
+        int token;
+        int length;
+        int time;
+        int symbols;
+        unsigned long long hash;
+    };
+
+    __device__ __forceinline__ TdtCandidate tdt_candidate(int index, int beam, int duration_count,
+        int positive_duration_count, int hypothesis_base, int blank_id,
+        int max_symbols_per_timestep, int output_length, const int* durations,
+        const int* positive_duration_indexes, const int* top_token_indexes,
+        const unsigned long long* hypothesis_hashes, const int* hypothesis_lengths,
+        const int* time_indexes, const int* symbols_at_timestep)
+    {
+        TdtCandidate candidate;
+        const int per_parent = duration_count * beam;
+        const int token_count = per_parent * beam;
+        const bool emitted = index < token_count;
+        if (emitted)
+        {
+            candidate.parent = hypothesis_base + index / per_parent;
+            candidate.duration_index = index % per_parent / beam;
+            candidate.token = top_token_indexes[candidate.parent * beam + index % beam];
+        }
+        else
+        {
+            const int blank_index = index - token_count;
+            candidate.parent = hypothesis_base + blank_index / positive_duration_count;
+            candidate.duration_index =
+                positive_duration_indexes[blank_index % positive_duration_count];
+            candidate.token = blank_id;
+        }
+        candidate.length = hypothesis_lengths[candidate.parent] + emitted;
+        // The rolling fingerprint is only a filter. Equal keys also require
+        // an exact token-history check before their scores can merge.
+        candidate.hash = emitted ? hypothesis_hashes[candidate.parent] * 1099511628211ULL
+                                       + static_cast<unsigned long long>(candidate.token + 1)
+                                 : hypothesis_hashes[candidate.parent];
+        tdt_advance_search_state(emitted, durations[candidate.duration_index],
+            time_indexes[candidate.parent], symbols_at_timestep[candidate.parent],
+            max_symbols_per_timestep, output_length, candidate.time, candidate.symbols);
+        if (candidate.time >= output_length)
+        {
+            candidate.symbols = 0;
+        }
+        return candidate;
+    }
+
+    __device__ __forceinline__ bool tdt_histories_equal(const TdtCandidate& left,
+        const TdtCandidate& right, int blank_id, const int* hypothesis_nodes,
+        const int* node_parents, const int* node_tokens, unsigned long long* history_cache,
+        int cache_size)
+    {
+        int left_node = hypothesis_nodes[left.parent];
+        int right_node = hypothesis_nodes[right.parent];
+        // Emitted tokens are not materialized yet. Compare these virtual tails
+        // first, removing a stored tail from the blank path when necessary.
+        if (left.token != blank_id && right.token != blank_id)
+        {
+            if (left.token != right.token)
+            {
+                return false;
+            }
+        }
+        else if (left.token != blank_id)
+        {
+            if (right_node < 0 || left.token != node_tokens[right_node])
+            {
+                return false;
+            }
+            right_node = node_parents[right_node];
+        }
+        else if (right.token != blank_id)
+        {
+            if (left_node < 0 || right.token != node_tokens[left_node])
+            {
+                return false;
+            }
+            left_node = node_parents[left_node];
+        }
+        return histories_equal(
+            left_node, right_node, node_parents, node_tokens, history_cache, cache_size);
+    }
+
     __device__ __forceinline__ void gather_tdt_states(int hypothesis, int thread,
         const void* input_state_1_raw, const void* input_state_2_raw,
         const void* output_state_1_raw, const void* output_state_2_raw, const int* parent_indexes,
@@ -1035,7 +1224,8 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         int state_layers, const int* runtime_dimensions, int encoder_dim, int state_dtype,
         int encoder_output_dtype, int encoder_input_dtype, int token_stride, int beam,
         int duration_count, int positive_duration_count, int blank_id, int max_symbols_per_timestep,
-        float blank_penalty, float encoder_frame_shift_sec)
+        float blank_penalty, float encoder_frame_shift_sec, unsigned long long* history_cache,
+        int history_cache_size)
     {
         // Runtime dimensions live in device memory so a captured search graph
         // can be replayed for different batch and temporal shapes.
@@ -1054,6 +1244,11 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         const int token_candidates_per_parent = duration_count * beam;
         const int token_candidate_count = beam * token_candidates_per_parent;
         const int candidate_count = token_candidate_count + beam * positive_duration_count;
+        int bucket_count = 1;
+        while (bucket_count < (candidate_count + 1LL) / 2)
+        {
+            bucket_count *= 2;
+        }
 
         for (int output = thread; output < beam; output += blockDim.x)
         {
@@ -1095,51 +1290,131 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         const int lane = thread & 31;
         const int warp = thread >> 5;
         const int num_warps = blockDim.x >> 5;
-        // Shared memory contains all expanded candidate scores, one reduction
-        // score/index pair per warp, and the final `beam` selected pairs.
+        // Each candidate belongs to one bucket. Linked lists avoid a full
+        // candidate-by-candidate comparison and require no floating-point atomics.
         float* candidate_scores = reinterpret_cast<float*>(shared_memory);
-        float* reduction_scores = candidate_scores + candidate_count;
+        int* candidate_links = reinterpret_cast<int*>(candidate_scores + candidate_count);
+        int* bucket_heads = candidate_links + candidate_count;
+        float* reduction_scores = reinterpret_cast<float*>(bucket_heads + bucket_count);
         int* reduction_indexes = reinterpret_cast<int*>(reduction_scores + num_warps);
         float* selected_scores = reinterpret_cast<float*>(reduction_indexes + num_warps);
         int* selected_indexes = reinterpret_cast<int*>(selected_scores + beam);
+        for (int bucket = thread; bucket < bucket_count; bucket += blockDim.x)
+        {
+            bucket_heads[bucket] = -1;
+        }
+        __syncthreads();
 
         // Expand each parent with its top nonblank tokens at every duration.
         // Blank candidates use only positive durations so search always makes
         // progress instead of admitting an infinite blank-duration-zero loop.
         for (int candidate = thread; candidate < candidate_count; candidate += blockDim.x)
         {
-            int parent;
-            int duration_index;
+            const TdtCandidate state = tdt_candidate(candidate, beam, duration_count,
+                positive_duration_count, hypothesis_base, blank_id, max_symbols_per_timestep,
+                output_length, durations, positive_duration_indexes, top_token_indexes,
+                hypothesis_hashes, hypothesis_lengths, time_indexes, symbols_at_timestep);
+            const int parent_index = state.parent;
             float score;
             if (candidate < token_candidate_count)
             {
-                parent = candidate / token_candidates_per_parent;
-                const int parent_candidate = candidate - parent * token_candidates_per_parent;
-                duration_index = parent_candidate / beam;
-                const int token_rank = parent_candidate - duration_index * beam;
-                const int parent_index = hypothesis_base + parent;
                 score = hypothesis_scores[parent_index]
-                        + duration_log_probs[parent_index * duration_count + duration_index]
-                        + top_token_scores[parent_index * beam + token_rank];
+                        + duration_log_probs[parent_index * duration_count + state.duration_index]
+                        + top_token_scores[parent_index * beam + candidate % beam];
             }
             else
             {
-                const int blank_candidate = candidate - token_candidate_count;
-                parent = blank_candidate / positive_duration_count;
-                const int duration_rank = blank_candidate - parent * positive_duration_count;
-                duration_index = positive_duration_indexes[duration_rank];
-                const int parent_index = hypothesis_base + parent;
                 score = hypothesis_scores[parent_index]
                         + token_log_probs[parent_index * (blank_id + 1) + blank_id] - blank_penalty
-                        + duration_log_probs[parent_index * duration_count + duration_index];
+                        + duration_log_probs[parent_index * duration_count + state.duration_index];
             }
-            const int parent_index = hypothesis_base + parent;
             if (!isfinite(hypothesis_scores[parent_index])
                 || time_indexes[parent_index] >= output_length)
             {
                 score = tdt_lowest_score();
             }
-            candidate_scores[candidate] = isnan(score) ? tdt_lowest_score() : score;
+            candidate_scores[candidate] = isfinite(score) ? score : tdt_lowest_score();
+            if (isfinite(score))
+            {
+                unsigned long long key =
+                    state.hash
+                    ^ (static_cast<unsigned long long>(state.length) * 0x9e3779b97f4a7c15ULL)
+                    ^ (static_cast<unsigned long long>(state.time) * 0xbf58476d1ce4e5b9ULL)
+                    ^ (static_cast<unsigned long long>(state.symbols) * 0x94d049bb133111ebULL);
+                key ^= key >> 32;
+                const int bucket = static_cast<unsigned int>(key) & (bucket_count - 1);
+                candidate_links[candidate] = atomicExch(bucket_heads + bucket, candidate);
+            }
+        }
+        __syncthreads();
+
+        for (int bucket = thread; bucket < bucket_count; bucket += blockDim.x)
+        {
+            // Atomic insertion order varies between launches. Sort each short
+            // bucket by candidate index so logaddexp and ties are reproducible.
+            int sorted = -1;
+            for (int candidate = bucket_heads[bucket]; candidate >= 0;)
+            {
+                const int next = candidate_links[candidate];
+                if (sorted < 0 || candidate < sorted)
+                {
+                    candidate_links[candidate] = sorted;
+                    sorted = candidate;
+                }
+                else
+                {
+                    int previous = sorted;
+                    while (candidate_links[previous] >= 0 && candidate_links[previous] < candidate)
+                    {
+                        previous = candidate_links[previous];
+                    }
+                    candidate_links[candidate] = candidate_links[previous];
+                    candidate_links[previous] = candidate;
+                }
+                candidate = next;
+            }
+            for (int first = sorted; first >= 0; first = candidate_links[first])
+            {
+                const TdtCandidate state = tdt_candidate(first, beam, duration_count,
+                    positive_duration_count, hypothesis_base, blank_id, max_symbols_per_timestep,
+                    output_length, durations, positive_duration_indexes, top_token_indexes,
+                    hypothesis_hashes, hypothesis_lengths, time_indexes, symbols_at_timestep);
+                float merged = candidate_scores[first];
+                float best_score = merged;
+                int best = first;
+                int previous = first;
+                for (int other = candidate_links[first]; other >= 0; other = candidate_links[other])
+                {
+                    const TdtCandidate other_state = tdt_candidate(other, beam, duration_count,
+                        positive_duration_count, hypothesis_base, blank_id,
+                        max_symbols_per_timestep, output_length, durations,
+                        positive_duration_indexes, top_token_indexes, hypothesis_hashes,
+                        hypothesis_lengths, time_indexes, symbols_at_timestep);
+                    if (state.hash == other_state.hash && state.length == other_state.length
+                        && state.time == other_state.time && state.symbols == other_state.symbols
+                        && tdt_histories_equal(state, other_state, blank_id, hypothesis_nodes,
+                            node_parents, node_tokens,
+                            history_cache + static_cast<long long>(utterance) * history_cache_size,
+                            history_cache_size))
+                    {
+                        const float score = candidate_scores[other];
+                        merged = tdt_merge_log_scores(merged, score);
+                        if (tdt_score_is_better(score, other, best_score, best))
+                        {
+                            best = other;
+                            best_score = score;
+                        }
+                        candidate_scores[other] = tdt_lowest_score();
+                        candidate_links[previous] = candidate_links[other];
+                    }
+                    else
+                    {
+                        previous = other;
+                    }
+                }
+                candidate_scores[first] = tdt_lowest_score();
+                candidate_scores[best] = merged;
+            }
         }
         __syncthreads();
 
@@ -1182,166 +1457,21 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         if (thread == 0)
         {
             const int node_base = utterance * beam * token_stride;
-            int unique_count = 0;
-            // History length, time, and a 64-bit rolling fingerprint identify a
-            // path. Active paths must also agree on their zero-duration symbol
-            // count because that state controls the future force-advance rule.
-            // Exact backpointer-chain comparison would make this serial section
-            // substantially slower; the residual collision probability is
-            // negligible.
-            for (int rank = 0; rank < beam; ++rank)
+            int retained_count = 0;
+            while (retained_count < beam && isfinite(selected_scores[retained_count]))
             {
-                const int candidate = selected_indexes[rank];
-                const bool emitted = candidate < token_candidate_count;
-                int parent;
-                int duration_index;
-                int token = blank_id;
-                if (emitted)
-                {
-                    parent = candidate / token_candidates_per_parent;
-                    const int parent_candidate = candidate - parent * token_candidates_per_parent;
-                    duration_index = parent_candidate / beam;
-                    const int token_rank = parent_candidate - duration_index * beam;
-                    token = top_token_indexes[(hypothesis_base + parent) * beam + token_rank];
-                }
-                else
-                {
-                    const int blank_candidate = candidate - token_candidate_count;
-                    parent = blank_candidate / positive_duration_count;
-                    const int duration_rank = blank_candidate - parent * positive_duration_count;
-                    duration_index = positive_duration_indexes[duration_rank];
-                }
-
-                const int parent_index = hypothesis_base + parent;
-                const int candidate_length = hypothesis_lengths[parent_index] + emitted;
-                // Unsigned wrap is intentional: this modulo-2^64 fingerprint is
-                // compared with length and time, and is never used as an address.
-                const unsigned long long candidate_hash =
-                    emitted ? hypothesis_hashes[parent_index] * 1099511628211ULL
-                                  + static_cast<unsigned long long>(token + 1)
-                            : hypothesis_hashes[parent_index];
-                int candidate_time;
-                int candidate_symbols;
-                tdt_advance_search_state(emitted, durations[duration_index],
-                    time_indexes[parent_index], symbols_at_timestep[parent_index],
-                    max_symbols_per_timestep, output_length, candidate_time, candidate_symbols);
-
-                int duplicate = -1;
-                for (int output = 0; output < unique_count; ++output)
-                {
-                    const int existing_candidate = selected_indexes[output];
-                    const bool existing_emitted = existing_candidate < token_candidate_count;
-                    int existing_parent;
-                    int existing_duration_index;
-                    int existing_token = blank_id;
-                    if (existing_emitted)
-                    {
-                        existing_parent = existing_candidate / token_candidates_per_parent;
-                        const int parent_candidate =
-                            existing_candidate - existing_parent * token_candidates_per_parent;
-                        existing_duration_index = parent_candidate / beam;
-                        const int token_rank = parent_candidate - existing_duration_index * beam;
-                        existing_token =
-                            top_token_indexes[(hypothesis_base + existing_parent) * beam
-                                              + token_rank];
-                    }
-                    else
-                    {
-                        const int blank_candidate = existing_candidate - token_candidate_count;
-                        existing_parent = blank_candidate / positive_duration_count;
-                        const int duration_rank =
-                            blank_candidate - existing_parent * positive_duration_count;
-                        existing_duration_index = positive_duration_indexes[duration_rank];
-                    }
-
-                    const int existing_parent_index = hypothesis_base + existing_parent;
-                    const int existing_length =
-                        hypothesis_lengths[existing_parent_index] + existing_emitted;
-                    const unsigned long long existing_hash =
-                        existing_emitted
-                            ? hypothesis_hashes[existing_parent_index] * 1099511628211ULL
-                                  + static_cast<unsigned long long>(existing_token + 1)
-                            : hypothesis_hashes[existing_parent_index];
-                    int existing_time;
-                    int existing_symbols;
-                    tdt_advance_search_state(existing_emitted, durations[existing_duration_index],
-                        time_indexes[existing_parent_index],
-                        symbols_at_timestep[existing_parent_index], max_symbols_per_timestep,
-                        output_length, existing_time, existing_symbols);
-                    if (existing_length == candidate_length && existing_hash == candidate_hash
-                        && existing_time == candidate_time
-                        && (candidate_time >= output_length
-                            || existing_symbols == candidate_symbols))
-                    {
-                        duplicate = output;
-                        break;
-                    }
-                }
-
-                if (duplicate >= 0)
-                {
-                    selected_scores[duplicate] =
-                        tdt_merge_log_scores(selected_scores[duplicate], selected_scores[rank]);
-                    continue;
-                }
-                selected_scores[unique_count] = selected_scores[rank];
-                selected_indexes[unique_count] = candidate;
-                ++unique_count;
-            }
-
-            const int retained_count = unique_count;
-            for (int output = 0; output < retained_count; ++output)
-            {
-                int best = output;
-                for (int candidate = output + 1; candidate < unique_count; ++candidate)
-                {
-                    if (selected_scores[candidate] > selected_scores[best])
-                    {
-                        best = candidate;
-                    }
-                }
-                if (best == output)
-                {
-                    continue;
-                }
-                const float score = selected_scores[output];
-                selected_scores[output] = selected_scores[best];
-                selected_scores[best] = score;
-                const int candidate = selected_indexes[output];
-                selected_indexes[output] = selected_indexes[best];
-                selected_indexes[best] = candidate;
+                ++retained_count;
             }
 
             for (int output = 0; output < retained_count; ++output)
             {
                 const int candidate = selected_indexes[output];
                 const bool emitted = candidate < token_candidate_count;
-                int parent;
-                int duration_index;
-                int token = blank_id;
-                if (emitted)
-                {
-                    parent = candidate / token_candidates_per_parent;
-                    const int parent_candidate = candidate - parent * token_candidates_per_parent;
-                    duration_index = parent_candidate / beam;
-                    const int token_rank = parent_candidate - duration_index * beam;
-                    token = top_token_indexes[(hypothesis_base + parent) * beam + token_rank];
-                }
-                else
-                {
-                    const int blank_candidate = candidate - token_candidate_count;
-                    parent = blank_candidate / positive_duration_count;
-                    const int duration_rank = blank_candidate - parent * positive_duration_count;
-                    duration_index = positive_duration_indexes[duration_rank];
-                }
-
-                const int parent_index = hypothesis_base + parent;
-                const int parent_length = hypothesis_lengths[parent_index];
-                int candidate_time;
-                int candidate_symbols;
-                tdt_advance_search_state(emitted, durations[duration_index],
-                    time_indexes[parent_index], symbols_at_timestep[parent_index],
-                    max_symbols_per_timestep, output_length, candidate_time, candidate_symbols);
+                const TdtCandidate state = tdt_candidate(candidate, beam, duration_count,
+                    positive_duration_count, hypothesis_base, blank_id, max_symbols_per_timestep,
+                    output_length, durations, positive_duration_indexes, top_token_indexes,
+                    hypothesis_hashes, hypothesis_lengths, time_indexes, symbols_at_timestep);
+                const int parent_index = state.parent;
 
                 int candidate_node = hypothesis_nodes[parent_index];
                 if (emitted)
@@ -1352,7 +1482,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                     candidate_node = node_base + node_counts[utterance];
                     ++node_counts[utterance];
                     node_parents[candidate_node] = hypothesis_nodes[parent_index];
-                    node_tokens[candidate_node] = token;
+                    node_tokens[candidate_node] = state.token;
                     node_timestamps[candidate_node] =
                         roundf(time_indexes[parent_index] * encoder_frame_shift_sec * 1000.0F)
                         / 1000.0F;
@@ -1361,14 +1491,11 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 const int output_index = hypothesis_base + output;
                 next_scores[output_index] = selected_scores[output];
                 next_nodes[output_index] = candidate_node;
-                next_hashes[output_index] = emitted
-                                                ? hypothesis_hashes[parent_index] * 1099511628211ULL
-                                                      + static_cast<unsigned long long>(token + 1)
-                                                : hypothesis_hashes[parent_index];
-                next_lengths[output_index] = parent_length + emitted;
-                next_time_indexes[output_index] = candidate_time;
-                next_last_tokens[output_index] = emitted ? token : last_tokens[parent_index];
-                next_symbols_at_timestep[output_index] = emitted ? candidate_symbols : 0;
+                next_hashes[output_index] = state.hash;
+                next_lengths[output_index] = state.length;
+                next_time_indexes[output_index] = state.time;
+                next_last_tokens[output_index] = emitted ? state.token : last_tokens[parent_index];
+                next_symbols_at_timestep[output_index] = state.symbols;
                 parent_indexes[output_index] = parent_index;
                 use_output_state[output_index] = emitted;
             }
@@ -1464,7 +1591,13 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         // preserve its input after a blank. A bitwise uint4 path moves 16 bytes
         // at once for every supported precision when rows are suitably aligned.
         const int packed_state_elements = state_dtype == TDT_FLOAT32 ? 4 : 8;
-        if (hidden_dim % packed_state_elements == 0)
+        const uintptr_t state_addresses = reinterpret_cast<uintptr_t>(input_state_1_raw)
+                                          | reinterpret_cast<uintptr_t>(input_state_2_raw)
+                                          | reinterpret_cast<uintptr_t>(output_state_1_raw)
+                                          | reinterpret_cast<uintptr_t>(output_state_2_raw)
+                                          | reinterpret_cast<uintptr_t>(next_state_1_raw)
+                                          | reinterpret_cast<uintptr_t>(next_state_2_raw);
+        if (hidden_dim % packed_state_elements == 0 && state_addresses % alignof(uint4) == 0)
         {
             const int hidden_vectors = hidden_dim / packed_state_elements;
             const uint4* input_state_1 = reinterpret_cast<const uint4*>(input_state_1_raw);
@@ -1473,7 +1606,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
             const uint4* output_state_2 = reinterpret_cast<const uint4*>(output_state_2_raw);
             uint4* next_state_1 = reinterpret_cast<uint4*>(next_state_1_raw);
             uint4* next_state_2 = reinterpret_cast<uint4*>(next_state_2_raw);
-            for (int state_vector = thread; state_vector < state_layers * hidden_vectors;
+            for (unsigned int state_vector = thread; state_vector < state_layers * hidden_vectors;
                 state_vector += blockDim.x)
             {
                 const int layer = state_vector / hidden_vectors;
@@ -1500,7 +1633,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
                 reinterpret_cast<const unsigned short*>(output_state_2_raw);
             unsigned short* next_state_1 = reinterpret_cast<unsigned short*>(next_state_1_raw);
             unsigned short* next_state_2 = reinterpret_cast<unsigned short*>(next_state_2_raw);
-            for (int state_index = thread; state_index < state_layers * hidden_dim;
+            for (unsigned int state_index = thread; state_index < state_layers * hidden_dim;
                 state_index += blockDim.x)
             {
                 const int layer = state_index / hidden_dim;
@@ -1522,7 +1655,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
             const float* output_state_2 = reinterpret_cast<const float*>(output_state_2_raw);
             float* next_state_1 = reinterpret_cast<float*>(next_state_1_raw);
             float* next_state_2 = reinterpret_cast<float*>(next_state_2_raw);
-            for (int state_index = thread; state_index < state_layers * hidden_dim;
+            for (unsigned int state_index = thread; state_index < state_layers * hidden_dim;
                 state_index += blockDim.x)
             {
                 const int layer = state_index / hidden_dim;

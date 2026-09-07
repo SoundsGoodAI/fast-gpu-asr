@@ -13,6 +13,7 @@ import torch
 
 from fast_gpu_asr.constants import (
     AUDIO_SAMPLES_PER_WORKER,
+    CUDA_DEFAULT_SHARED_MEMORY_BYTES,
     DECODER_TYPES,
     INT32_MAX,
     MODEL_CONFIG_FILE,
@@ -28,7 +29,11 @@ from fast_gpu_asr.constants import (
     PARAKEET_ONNX_FILE,
     PARAKEET_TENSORRT_FILE,
     PRECISION_DTYPES,
-    TDT_SEARCH_CHUNK_STEPS,
+    TDT_BEAM_SEARCH_CHUNK_STEPS,
+    TDT_BEAM_SEARCH_THREADS,
+    TDT_HISTORY_CACHE_SIZE,
+    TDT_PREPARE_INPUTS_THREADS,
+    TDT_SELECT_TOKENS_THREADS,
     TENSORRT_PLUGIN_NAMESPACE,
     TOKENIZER_FILE,
     TRANSDUCER_DECODER_TYPES,
@@ -90,64 +95,52 @@ def test_supported_decoder_types() -> None:
         "transducer_greedy_search",
         "ctc_greedy_search",
     )
-    assert TRANSDUCER_DECODER_TYPES == (
-        "transducer_modified_beam_search",
-        "transducer_greedy_search",
-    )
+    assert DECODER_TYPES[:2] == TRANSDUCER_DECODER_TYPES
 
 
 def test_serialized_model_contract_constants_are_stable() -> None:
-    assert (MODEL_TYPE_PARAKEET, MODEL_TYPE_ZIPFORMER) == (
-        "parakeet_asr",
-        "zipformer_asr",
-    )
-    assert (
-        MODEL_CONFIG_FILE,
-        TOKENIZER_FILE,
-        PARAKEET_ONNX_FILE,
-        PARAKEET_DECODER_ONNX_FILE,
-        PARAKEET_TENSORRT_FILE,
-        PARAKEET_DECODER_TENSORRT_FILE,
-        ZIPFORMER_ONNX_FILE,
-        ZIPFORMER_DECODER_ONNX_FILE,
-        ZIPFORMER_TENSORRT_FILE,
-        ZIPFORMER_DECODER_TENSORRT_FILE,
-        ZIPFORMER_DECODER_CONTEXTS_FILE,
-    ) == (
-        "model_config.yaml",
-        "bpe.model",
-        "parakeet.onnx",
-        "tdt_decoder.onnx",
-        "parakeet.trt",
-        "tdt_decoder.trt",
-        "zipformer.onnx",
-        "decoder.onnx",
-        "zipformer.trt",
-        "decoder.trt",
-        "decoder_contexts.pt",
-    )
+    assert MODEL_TYPE_PARAKEET == "parakeet_asr"
+    assert MODEL_TYPE_ZIPFORMER == "zipformer_asr"
+    assert MODEL_CONFIG_FILE == "model_config.yaml"
+    assert TOKENIZER_FILE == "bpe.model"
+    assert PARAKEET_ONNX_FILE == "parakeet.onnx"
+    assert PARAKEET_DECODER_ONNX_FILE == "tdt_decoder.onnx"
+    assert PARAKEET_TENSORRT_FILE == "parakeet.trt"
+    assert PARAKEET_DECODER_TENSORRT_FILE == "tdt_decoder.trt"
+    assert ZIPFORMER_ONNX_FILE == "zipformer.onnx"
+    assert ZIPFORMER_DECODER_ONNX_FILE == "decoder.onnx"
+    assert ZIPFORMER_TENSORRT_FILE == "zipformer.trt"
+    assert ZIPFORMER_DECODER_TENSORRT_FILE == "decoder.trt"
+    assert ZIPFORMER_DECODER_CONTEXTS_FILE == "decoder_contexts.pt"
 
 
 def test_shared_scalar_constants_are_stable() -> None:
-    assert type(ONNX_OPSET_VERSION) is int
-    assert ONNX_OPSET_VERSION == 20
+    assert isinstance(ONNX_OPSET_VERSION, int) and ONNX_OPSET_VERSION == 20
     assert TENSORRT_PLUGIN_NAMESPACE == "fast_gpu_asr"
-    assert type(INT32_MAX) is int
-    assert INT32_MAX == 2_147_483_647
+    assert isinstance(INT32_MAX, int) and INT32_MAX == 2_147_483_647
+    assert isinstance(CUDA_DEFAULT_SHARED_MEMORY_BYTES, int)
+    assert CUDA_DEFAULT_SHARED_MEMORY_BYTES == 48 * 1024
     assert ZERO_LOG == -20.7233
 
 
-def test_runtime_limits_and_tuning_values_satisfy_algorithm_constraints() -> None:
-    assert type(AUDIO_SAMPLES_PER_WORKER) is int
-    assert AUDIO_SAMPLES_PER_WORKER > 0
-    assert type(PARAKEET_MAX_ENCODER_FRAMES) is int
+def test_runtime_algorithm_constraints() -> None:
+    assert isinstance(AUDIO_SAMPLES_PER_WORKER, int) and AUDIO_SAMPLES_PER_WORKER > 0
+    assert isinstance(PARAKEET_MAX_ENCODER_FRAMES, int)
     assert 0 < PARAKEET_MAX_ENCODER_FRAMES <= INT32_MAX
-    assert type(TDT_SEARCH_CHUNK_STEPS) is int
-    assert TDT_SEARCH_CHUNK_STEPS > 0
-    assert TDT_SEARCH_CHUNK_STEPS % 2 == 0
-    assert type(ZIPFORMER_BEAM_SEARCH_THREADS) is int
-    assert 0 < ZIPFORMER_BEAM_SEARCH_THREADS <= 1024
-    assert ZIPFORMER_BEAM_SEARCH_THREADS % 32 == 0
+    assert isinstance(TDT_BEAM_SEARCH_CHUNK_STEPS, int)
+    assert TDT_BEAM_SEARCH_CHUNK_STEPS > 0
+    assert TDT_BEAM_SEARCH_CHUNK_STEPS % 2 == 0
+    assert isinstance(TDT_HISTORY_CACHE_SIZE, int)
+    assert 0 < TDT_HISTORY_CACHE_SIZE <= INT32_MAX
+    assert TDT_HISTORY_CACHE_SIZE & (TDT_HISTORY_CACHE_SIZE - 1) == 0
+    for threads in (
+        TDT_BEAM_SEARCH_THREADS,
+        TDT_PREPARE_INPUTS_THREADS,
+        TDT_SELECT_TOKENS_THREADS,
+        ZIPFORMER_BEAM_SEARCH_THREADS,
+    ):
+        assert isinstance(threads, int)
+        assert 0 < threads <= 1024 and threads % 32 == 0
 
 
 def test_plugin_identifiers_are_stable() -> None:
@@ -225,7 +218,6 @@ def test_plugin_dependencies() -> None:
 
     assert set(CUDA_BUILD_LIBRARIES) == dependencies
     assert len(CUDA_BUILD_LIBRARIES) == len(dependencies)
-    assert set(CUDA_BUILD_LIBRARIES) <= set(CUDA_RUNTIME_LIBRARIES)
     assert CUDA_RUNTIME_LIBRARIES == ("cudart", "cublasLt", "cublas", "cufft")
     assert dict(PLUGIN_BUILDS) == {
         "zipformer_attention_value_plugin.cu": ("cublas", "cudart"),
@@ -289,9 +281,7 @@ static_assert(std::is_const_v<std::remove_extent_t<decltype(kPluginNamespace)>>)
 int main()
 {
     return std::fwrite(kPluginNamespace, 1, sizeof(kPluginNamespace), stdout)
-            == sizeof(kPluginNamespace)
-        ? 0
-        : 1;
+        != sizeof(kPluginNamespace);
 }
 """,
         encoding="utf8",

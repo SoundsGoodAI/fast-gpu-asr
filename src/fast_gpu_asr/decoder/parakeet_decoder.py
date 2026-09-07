@@ -11,7 +11,15 @@ import cupyx as cpx
 import numpy as np
 import tensorrt as trt
 
-from ..constants import INT32_MAX, TDT_SEARCH_CHUNK_STEPS
+from ..constants import (
+    CUDA_DEFAULT_SHARED_MEMORY_BYTES,
+    INT32_MAX,
+    TDT_BEAM_SEARCH_CHUNK_STEPS,
+    TDT_BEAM_SEARCH_THREADS,
+    TDT_HISTORY_CACHE_SIZE,
+    TDT_PREPARE_INPUTS_THREADS,
+    TDT_SELECT_TOKENS_THREADS,
+)
 from ..utils import ASRInferenceError, ASRInitializationError, get_engine
 from .gpu_kernels import (
     TDT_BEAM_SEARCH_KERNEL,
@@ -27,11 +35,11 @@ class ParakeetModifiedBeamSearchDecoder:
     Decoder engines with ``beam=1`` use the same search path as wider beams,
     so greedy decoding does not require a second implementation. Each active
     hypothesis expands over nonblank token-duration combinations and
-    blank-duration advances. Retained duplicate histories at the same
-    encoder position are merged, token histories use compact GPU backpointers,
-    recurrent states are routed on the device, and final selection applies
-    length-normalized log probability. The host only polls completion
-    periodically and copies the selected histories.
+    blank-duration advances. Duplicate histories with the same encoder position
+    and active symbol count are merged before beam pruning. Token histories use
+    compact GPU backpointers, recurrent states are routed on the device, and
+    final selection applies length-normalized log probability. The host only
+    polls completion periodically and copies the selected histories.
     """
 
     def __init__(
@@ -113,25 +121,39 @@ class ParakeetModifiedBeamSearchDecoder:
             }
             self.state_dtype = self.kernel_dtype_map[state_dtype]
             self.encoder_input_dtype = self.kernel_dtype_map[encoder_dtype]
-            self.prepare_inputs_threads = 256
-            self.token_selection_threads = 512
-            self.beam_search_threads = 256
+            self.prepare_inputs_threads = TDT_PREPARE_INPUTS_THREADS
+            self.token_selection_threads = TDT_SELECT_TOKENS_THREADS
+            self.beam_search_threads = TDT_BEAM_SEARCH_THREADS
             candidate_count = self.beam * (
                 len(durations) * self.beam + len(positive_duration_indexes)
             )
+            bucket_count = 1 << ((candidate_count - 1) // 2).bit_length()
             self.beam_search_shared_memory_bytes = (
-                candidate_count * np.dtype(np.float32).itemsize
+                candidate_count
+                * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
+                + bucket_count * np.dtype(np.int32).itemsize
                 + self.beam_search_threads
                 // 32
                 * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
                 + self.beam
                 * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
             )
+            if self.beam_search_shared_memory_bytes > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
+                TDT_BEAM_SEARCH_KERNEL.max_dynamic_shared_size_bytes = (
+                    self.device.attributes["MaxSharedMemoryPerBlockOptin"]
+                )
             self.token_selection_shared_memory_bytes = self.blank_id * np.dtype(
                 np.float32
             ).itemsize + self.token_selection_threads // 32 * (
                 np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
             )
+            if (
+                self.token_selection_shared_memory_bytes
+                > CUDA_DEFAULT_SHARED_MEMORY_BYTES
+            ):
+                TDT_SELECT_TOKENS_KERNEL.max_dynamic_shared_size_bytes = (
+                    self.device.attributes["MaxSharedMemoryPerBlockOptin"]
+                )
 
             self.decoder = engine.create_execution_context()
             if self.decoder is None:
@@ -200,6 +222,9 @@ class ParakeetModifiedBeamSearchDecoder:
             self.hypothesis_hashes = cp.empty(search_shape, dtype=np.uint64)
             self.next_hashes = cp.empty_like(self.hypothesis_hashes)
             self.node_counts = cp.empty(batch_size, dtype=np.int32)
+            self.history_cache = cp.empty(
+                (batch_size, TDT_HISTORY_CACHE_SIZE), dtype=np.uint64
+            )
             self.node_parents: cp.ndarray | None = None
             self.node_tokens: cp.ndarray | None = None
             self.node_timestamps: cp.ndarray | None = None
@@ -412,6 +437,7 @@ class ParakeetModifiedBeamSearchDecoder:
             self.hypothesis_nodes.fill(-1)
             self.hypothesis_hashes.fill(0)
             self.node_counts.fill(0)
+            self.history_cache.fill(0)
             self.time_indexes.fill(0)
             self.last_tokens.fill(self.blank_id)
             self.symbols_at_timestep.fill(0)
@@ -477,18 +503,18 @@ class ParakeetModifiedBeamSearchDecoder:
             # An even chunk amortizes launches while restoring ping-pong buffers to
             # their canonical identities after graph replay. This cadence performed
             # best across batch-one and batch-256 decoder benchmarks.
-            for chunk_start in range(0, max_steps, TDT_SEARCH_CHUNK_STEPS):
-                chunk_steps = min(TDT_SEARCH_CHUNK_STEPS, max_steps - chunk_start)
+            for chunk_start in range(0, max_steps, TDT_BEAM_SEARCH_CHUNK_STEPS):
+                chunk_steps = min(TDT_BEAM_SEARCH_CHUNK_STEPS, max_steps - chunk_start)
 
                 if (
-                    chunk_steps == TDT_SEARCH_CHUNK_STEPS
+                    chunk_steps == TDT_BEAM_SEARCH_CHUNK_STEPS
                     and self.cuda_graph_supported
                     and self.cuda_graph is not None
                 ):
                     self.cuda_graph.launch(self.stream)
                 else:
                     should_capture = (
-                        chunk_steps == TDT_SEARCH_CHUNK_STEPS
+                        chunk_steps == TDT_BEAM_SEARCH_CHUNK_STEPS
                         and self.cuda_graph_supported
                         and graph_warmed
                     )
@@ -592,6 +618,8 @@ class ParakeetModifiedBeamSearchDecoder:
                                     np.int32(self.max_symbols_per_timestep),
                                     np.float32(self.blank_penalty),
                                     np.float32(self.encoder_frame_shift_sec),
+                                    self.history_cache,
+                                    np.int32(TDT_HISTORY_CACHE_SIZE),
                                 ),
                                 shared_mem=self.beam_search_shared_memory_bytes,
                                 stream=self.stream,

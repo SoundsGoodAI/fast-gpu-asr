@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from pickle import UnpicklingError
 from typing import cast
+from unittest.mock import Mock, call
 
 import pytest
 import tensorrt as trt
@@ -777,22 +778,20 @@ def test_validate_model_config_rejects_unsupported_modes(
         validate_model_config(model_config)
 
 
-def test_validate_model_config_wraps_unresolved_interpolation() -> None:
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"model_type": "${missing_model_type}"},
+        {"cycle_a": "${cycle_b}", "cycle_b": "${cycle_a}"},
+    ],
+    ids=["missing-reference", "cycle"],
+)
+def test_validate_model_config_wraps_invalid_interpolation(
+    updates: dict[str, str],
+) -> None:
     model_config = make_parakeet_config()
-    model_config.model_type = "${missing_model_type}"
-
-    with pytest.raises(
-        ASRInitializationError, match="Failed to resolve model configuration"
-    ) as error:
-        validate_model_config(model_config)
-
-    assert error.value.__cause__ is not None
-
-
-def test_validate_model_config_wraps_interpolation_cycle() -> None:
-    model_config = make_parakeet_config()
-    model_config.cycle_a = "${cycle_b}"
-    model_config.cycle_b = "${cycle_a}"
+    for field, value in updates.items():
+        model_config[field] = value
 
     with pytest.raises(
         ASRInitializationError, match="Failed to resolve model configuration"
@@ -824,20 +823,12 @@ def test_validate_model_config_accepts_float32_blank_penalty(
     (
         -float(torch.finfo(torch.float32).max) * 2.0,
         float(torch.finfo(torch.float32).max) * 2.0,
+        float("inf"),
+        float("nan"),
+        0,
     ),
 )
-def test_validate_model_config_rejects_blank_penalty_outside_float32(
-    blank_penalty: float,
-) -> None:
-    model_config = make_zipformer_config()
-    model_config.decoder_params.blank_penalty = blank_penalty
-
-    with pytest.raises(ASRInitializationError, match="finite float32 value"):
-        validate_model_config(model_config)
-
-
-@pytest.mark.parametrize("blank_penalty", (float("inf"), float("nan"), 0))
-def test_validate_model_config_rejects_non_float32_blank_penalty(
+def test_validate_model_config_rejects_invalid_blank_penalty(
     blank_penalty: float | int,
 ) -> None:
     model_config = make_zipformer_config()
@@ -1180,88 +1171,45 @@ def test_validate_model_config_rejects_invalid_audio_profile(
         validate_model_config(model_config)
 
 
-@pytest.mark.parametrize("engine_name", ("zipformer.trt", "parakeet.trt"))
-def test_get_engine_loads_native_encoder_plugins(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_name: str
+@pytest.mark.parametrize(
+    "engine_name, needs_native_plugins",
+    [
+        ("zipformer.trt", True),
+        ("parakeet.trt", True),
+        ("decoder.trt", False),
+        ("tdt_decoder.trt", False),
+    ],
+)
+def test_get_engine_loads_plugins_and_deserializes_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine_name: str,
+    needs_native_plugins: bool,
 ) -> None:
     engine_path = tmp_path / engine_name
     engine_path.write_bytes(b"engine")
     engine = FakeEngine((), (), {}, {})
-    events: list[str] = []
-    initializer_calls: list[tuple[trt.ILogger, str]] = []
-    runtime_loggers: list[trt.ILogger] = []
-
-    class FakeRuntime:
-        """Record TensorRT runtime construction and engine deserialization."""
-
-        def __init__(self, logger: trt.ILogger) -> None:
-            """Record the logger used to construct the runtime.
-
-            Parameters
-            ----------
-            logger : trt.ILogger
-                TensorRT logger passed by ``get_engine``.
-            """
-
-            events.append("construct-runtime")
-            runtime_loggers.append(logger)
-
-        def deserialize_cuda_engine(self, serialized_engine: bytes) -> FakeEngine:
-            """Validate serialized bytes and return the configured fake engine.
-
-            Parameters
-            ----------
-            serialized_engine : bytes
-                Engine plan read from the test bundle.
-
-            Returns
-            -------
-            FakeEngine
-                Engine instance configured by the enclosing test.
-            """
-
-            events.append("deserialize-engine")
-            assert serialized_engine == b"engine"
-            return engine
-
-    def load_plugins() -> None:
-        """Record native custom-plugin loading."""
-
-        events.append("load-native-plugins")
-
-    def initialize_plugins(logger: trt.ILogger, namespace: str) -> bool:
-        """Record standard TensorRT plugin initialization.
-
-        Parameters
-        ----------
-        logger : trt.ILogger
-            Logger supplied to TensorRT plugin initialization.
-        namespace : str
-            Plugin namespace requested by ``get_engine``.
-
-        Returns
-        -------
-        bool
-            ``True`` to emulate successful initialization.
-        """
-
-        events.append("initialize-tensorrt-plugins")
-        initializer_calls.append((logger, namespace))
-        return True
-
-    monkeypatch.setattr(utils_module, "load_tensorrt_plugins", load_plugins)
-    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", initialize_plugins)
-    monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
+    calls = Mock()
+    calls.initialize_plugins.return_value = True
+    calls.runtime.return_value.deserialize_cuda_engine.return_value = engine
+    monkeypatch.setattr(utils_module, "load_tensorrt_plugins", calls.load_plugins)
+    monkeypatch.setattr(
+        utils_module.trt, "init_libnvinfer_plugins", calls.initialize_plugins
+    )
+    monkeypatch.setattr(utils_module.trt, "Runtime", calls.runtime)
 
     assert get_engine(engine_path) is engine
-    assert events == [
-        "load-native-plugins",
-        "initialize-tensorrt-plugins",
-        "construct-runtime",
-        "deserialize-engine",
+
+    logger = calls.runtime.call_args.args[0]
+    assert isinstance(logger, trt.ILogger)
+    expected_calls = [
+        call.initialize_plugins(logger, ""),
+        call.runtime(logger),
+        call.runtime().deserialize_cuda_engine(b"engine"),
     ]
-    assert len(runtime_loggers) == 1
-    assert initializer_calls == [(runtime_loggers[0], "")]
+    if needs_native_plugins:
+        expected_calls.insert(0, call.load_plugins())
+    assert calls.mock_calls == expected_calls
 
 
 @pytest.mark.parametrize("error_type", (OSError, RuntimeError))
@@ -1273,38 +1221,10 @@ def test_get_engine_wraps_native_plugin_load_failure(
     engine_path = tmp_path / "zipformer.trt"
     engine_path.write_bytes(b"engine")
     failure = error_type("plugin unavailable")
-
-    def fail_to_load_plugins() -> None:
-        """Raise the configured native-plugin loading failure.
-
-        Raises
-        ------
-        OSError | RuntimeError
-            Failure instance configured by the parametrized test.
-        """
-
-        raise failure
-
-    def fail_to_initialize(_logger: trt.ILogger, _namespace: str) -> bool:
-        """Fail if TensorRT initialization continues after plugin loading fails.
-
-        Parameters
-        ----------
-        _logger : trt.ILogger
-            Unused TensorRT logger.
-        _namespace : str
-            Unused plugin namespace.
-
-        Returns
-        -------
-        bool
-            This callback never returns because reaching it fails the test.
-        """
-
-        pytest.fail("TensorRT initialized after custom-plugin loading failed.")
-
-    monkeypatch.setattr(utils_module, "load_tensorrt_plugins", fail_to_load_plugins)
-    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", fail_to_initialize)
+    load_plugins = Mock(side_effect=failure)
+    initialize_plugins = Mock()
+    monkeypatch.setattr(utils_module, "load_tensorrt_plugins", load_plugins)
+    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", initialize_plugins)
 
     with pytest.raises(
         ASRInitializationError, match="Failed to load TensorRT plugins"
@@ -1312,142 +1232,33 @@ def test_get_engine_wraps_native_plugin_load_failure(
         get_engine(engine_path)
 
     assert error.value.__cause__ is failure
+    load_plugins.assert_called_once_with()
+    initialize_plugins.assert_not_called()
 
 
-@pytest.mark.parametrize("engine_name", ("decoder.trt", "tdt_decoder.trt"))
-def test_get_engine_does_not_load_native_plugins_for_decoder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_name: str
-) -> None:
-    engine_path = tmp_path / engine_name
-    engine_path.write_bytes(b"engine")
-    engine = FakeEngine((), (), {}, {})
-    events: list[str] = []
-
-    class FakeRuntime:
-        """Record decoder-engine deserialization without native plugin loading."""
-
-        def __init__(self, logger: trt.ILogger) -> None:
-            """Record runtime construction.
-
-            Parameters
-            ----------
-            logger : trt.ILogger
-                TensorRT logger supplied by ``get_engine``.
-            """
-
-            events.append("construct-runtime")
-
-        def deserialize_cuda_engine(self, serialized_engine: bytes) -> FakeEngine:
-            """Validate serialized bytes and return the configured fake engine.
-
-            Parameters
-            ----------
-            serialized_engine : bytes
-                Decoder engine plan read from the test bundle.
-
-            Returns
-            -------
-            FakeEngine
-                Engine instance configured by the enclosing test.
-            """
-
-            events.append("deserialize-engine")
-            assert serialized_engine == b"engine"
-            return engine
-
-    def initialize_plugins(_logger: trt.ILogger, _namespace: str) -> bool:
-        """Record successful standard TensorRT plugin initialization.
-
-        Parameters
-        ----------
-        _logger : trt.ILogger
-            TensorRT logger supplied by ``get_engine``.
-        _namespace : str
-            Plugin namespace supplied by ``get_engine``.
-
-        Returns
-        -------
-        bool
-            ``True`` to emulate successful initialization.
-        """
-
-        events.append("initialize-tensorrt-plugins")
-        return True
-
-    monkeypatch.setattr(
-        utils_module,
-        "load_tensorrt_plugins",
-        lambda: pytest.fail("Decoder engine unexpectedly loaded encoder plugins."),
-    )
-    monkeypatch.setattr(utils_module.trt, "init_libnvinfer_plugins", initialize_plugins)
-    monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
-
-    assert get_engine(engine_path) is engine
-    assert events == [
-        "initialize-tensorrt-plugins",
-        "construct-runtime",
-        "deserialize-engine",
-    ]
-
-
-@pytest.mark.parametrize("deserialize_result", (None, RuntimeError("invalid plan")))
+@pytest.mark.parametrize(
+    "error_type", (None, RuntimeError), ids=["no-engine", "exception"]
+)
 def test_get_engine_reports_deserialization_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    deserialize_result: None | RuntimeError,
+    error_type: type[RuntimeError] | None,
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
     engine_path.write_bytes(b"engine")
-
-    class FakeRuntime:
-        """Emulate TensorRT deserialization failure modes."""
-
-        def __init__(self, logger: trt.ILogger) -> None:
-            """Retain the TensorRT logger supplied at construction.
-
-            Parameters
-            ----------
-            logger : trt.ILogger
-                Logger passed by ``get_engine``.
-            """
-
-            self.logger = logger
-
-        def deserialize_cuda_engine(self, serialized_engine: bytes) -> None:
-            """Return no engine or raise the configured deserialization failure.
-
-            Parameters
-            ----------
-            serialized_engine : bytes
-                Serialized engine plan supplied by ``get_engine``.
-
-            Returns
-            -------
-            None
-                Returned when TensorRT deserialization produces no engine.
-
-            Raises
-            ------
-            RuntimeError
-                Raised when the parametrized test supplies a runtime failure.
-            """
-
-            if isinstance(deserialize_result, RuntimeError):
-                raise deserialize_result
-            return None
-
+    failure = error_type("invalid plan") if error_type else None
+    runtime = Mock()
+    runtime.deserialize_cuda_engine = Mock(return_value=None, side_effect=failure)
     monkeypatch.setattr(
         utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
     )
-    monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
+    monkeypatch.setattr(utils_module.trt, "Runtime", lambda _logger: runtime)
 
     with pytest.raises(ASRInitializationError, match="Failed to deserialize") as error:
         get_engine(engine_path)
 
-    if deserialize_result is None:
-        assert error.value.__cause__ is None
-    else:
-        assert error.value.__cause__ is deserialize_result
+    assert error.value.__cause__ is failure
+    runtime.deserialize_cuda_engine.assert_called_once_with(b"engine")
 
 
 def test_get_engine_wraps_runtime_construction_failure(
@@ -1456,78 +1267,34 @@ def test_get_engine_wraps_runtime_construction_failure(
     engine_path = tmp_path / "decoder.trt"
     engine_path.write_bytes(b"engine")
     failure = RuntimeError("runtime unavailable")
-
-    def make_runtime(_logger: trt.ILogger) -> None:
-        """Raise the configured TensorRT runtime-construction failure.
-
-        Parameters
-        ----------
-        _logger : trt.ILogger
-            Logger supplied to the runtime constructor.
-
-        Raises
-        ------
-        RuntimeError
-            Always raised to emulate unavailable TensorRT runtime state.
-        """
-
-        raise failure
-
+    runtime = Mock(side_effect=failure)
     monkeypatch.setattr(
         utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
     )
-    monkeypatch.setattr(utils_module.trt, "Runtime", make_runtime)
+    monkeypatch.setattr(utils_module.trt, "Runtime", runtime)
 
     with pytest.raises(ASRInitializationError, match="Failed to deserialize") as error:
         get_engine(engine_path)
 
     assert error.value.__cause__ is failure
+    runtime.assert_called_once()
 
 
 def test_get_engine_wraps_file_read_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
-
-    class FakeRuntime:
-        """Reject deserialization after the expected engine read failure."""
-
-        def __init__(self, logger: trt.ILogger) -> None:
-            """Retain the TensorRT logger supplied at construction.
-
-            Parameters
-            ----------
-            logger : trt.ILogger
-                Logger passed by ``get_engine``.
-            """
-
-            self.logger = logger
-
-        def deserialize_cuda_engine(self, serialized_engine: bytes) -> FakeEngine:
-            """Fail if deserialization is reached with unexpected bytes.
-
-            Parameters
-            ----------
-            serialized_engine : bytes
-                Unexpected serialized engine data.
-
-            Returns
-            -------
-            FakeEngine
-                This method never returns because reaching it fails the test.
-            """
-
-            pytest.fail(f"Unexpected engine bytes: {serialized_engine!r}")
-
+    runtime = Mock()
     monkeypatch.setattr(
         utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
     )
-    monkeypatch.setattr(utils_module.trt, "Runtime", FakeRuntime)
+    monkeypatch.setattr(utils_module.trt, "Runtime", lambda _logger: runtime)
 
     with pytest.raises(ASRInitializationError, match="Failed to deserialize") as error:
         get_engine(engine_path)
 
-    assert isinstance(error.value.__cause__, OSError)
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+    runtime.deserialize_cuda_engine.assert_not_called()
 
 
 def test_get_engine_reports_plugin_initialization_failure(
@@ -1535,25 +1302,16 @@ def test_get_engine_reports_plugin_initialization_failure(
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
     engine_path.touch()
-
-    def fail_to_make_runtime(_logger: trt.ILogger) -> None:
-        """Fail if runtime construction follows failed plugin initialization.
-
-        Parameters
-        ----------
-        _logger : trt.ILogger
-            Unused TensorRT logger.
-        """
-
-        pytest.fail("Runtime constructed after TensorRT plugin initialization failed.")
-
+    runtime = Mock()
     monkeypatch.setattr(
         utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: False
     )
-    monkeypatch.setattr(utils_module.trt, "Runtime", fail_to_make_runtime)
+    monkeypatch.setattr(utils_module.trt, "Runtime", runtime)
 
     with pytest.raises(ASRInitializationError, match="initialize TensorRT plugins"):
         get_engine(engine_path)
+
+    runtime.assert_not_called()
 
 
 def test_get_names_preserves_engine_order() -> None:
@@ -1698,25 +1456,8 @@ def test_validate_tokenizer_reports_loader_failure(
     tokenizer_path = tmp_path / "bpe.model"
     tokenizer_path.touch()
     failure = error_type("invalid tokenizer")
-
-    def fail_to_load(model_file: str) -> None:
-        """Validate the path and raise the configured tokenizer load failure.
-
-        Parameters
-        ----------
-        model_file : str
-            SentencePiece model path supplied by ``validate_tokenizer``.
-
-        Raises
-        ------
-        OSError | RuntimeError
-            Failure instance configured by the parametrized test.
-        """
-
-        assert model_file == str(tokenizer_path)
-        raise failure
-
-    monkeypatch.setattr(utils_module.spm, "SentencePieceProcessor", fail_to_load)
+    load = Mock(side_effect=failure)
+    monkeypatch.setattr(utils_module.spm, "SentencePieceProcessor", load)
 
     with pytest.raises(
         ASRInitializationError, match="Failed to load SentencePiece"
@@ -1724,6 +1465,7 @@ def test_validate_tokenizer_reports_loader_failure(
         validate_tokenizer(tmp_path, make_parakeet_config())
 
     assert error.value.__cause__ is failure
+    load.assert_called_once_with(model_file=str(tokenizer_path))
 
 
 @pytest.mark.parametrize("output_dtype", (trt.float32, trt.float16, trt.bfloat16))
@@ -2052,6 +1794,73 @@ def test_validate_decoder_engine_rejects_tensor_element_overflow(
         validate_decoder_engine(engine, model_config, 2)
 
 
+@pytest.mark.parametrize(
+    "architecture, beam, vocab_size, kernel_name, required",
+    [
+        ("parakeet", 32, 32, "beam search", 58688),
+        ("zipformer", 32, 512, "beam search", 66560),
+        ("parakeet", 6, 16000, "token selection", 64128),
+    ],
+)
+@pytest.mark.parametrize("limit_offset", [-1, 0, 1])
+def test_validate_decoder_engine_checks_shared_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    beam: int,
+    vocab_size: int,
+    kernel_name: str,
+    required: int,
+    limit_offset: int,
+) -> None:
+    config = make_model_config(architecture)
+    config.decoder_params.beam = beam
+    config.vocab_size = vocab_size
+    if architecture == "parakeet":
+        config.blank_id = vocab_size
+        config.decoder_params.tdt_durations = [0, 1, 2, 3, 4]
+        config.decoder_params.num_extra_outputs = 5
+    engine = make_decoder_engine(config)
+    limit = required + limit_offset
+
+    class FakeDevice:
+        """Expose the selected GPU's opt-in shared-memory limit without CUDA."""
+
+        attributes = {"MaxSharedMemoryPerBlockOptin": limit}
+
+    monkeypatch.setattr(utils_module.cp.cuda, "Device", FakeDevice)
+
+    if limit < required:
+        with pytest.raises(ASRInitializationError) as error:
+            validate_decoder_engine(engine, config, 2)
+        assert str(error.value) == (
+            f"{architecture.capitalize()} {kernel_name} requires {required} bytes of "
+            f"shared memory per block, but this GPU supports {limit}."
+        )
+    else:
+        validate_decoder_engine(engine, config, 2)
+
+
+@pytest.mark.parametrize(
+    "architecture, beam, vocab_size", [("zipformer", 8, 1525), ("parakeet", 6, 12256)]
+)
+def test_validate_decoder_engine_accepts_default_shared_memory_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    beam: int,
+    vocab_size: int,
+) -> None:
+    config = make_model_config(architecture)
+    config.decoder_params.beam = beam
+    config.vocab_size = vocab_size
+    if architecture == "parakeet":
+        config.blank_id = vocab_size
+    monkeypatch.setattr(
+        utils_module.cp.cuda, "Device", lambda: pytest.fail("GPU queried")
+    )
+
+    validate_decoder_engine(make_decoder_engine(config), config, 2)
+
+
 def test_validate_zipformer_context_lookup_reports_missing_cache(
     tmp_path: Path,
 ) -> None:
@@ -2068,31 +1877,8 @@ def test_validate_zipformer_context_lookup_wraps_load_failure(
     context_lookup_path = tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE
     context_lookup_path.touch()
     failure = error_type("invalid cache")
-
-    def fail_to_load(path: Path, map_location: str, weights_only: bool) -> None:
-        """Validate cache-loading options and raise the configured failure.
-
-        Parameters
-        ----------
-        path : Path
-            Predictor context-cache path passed to ``torch.load``.
-        map_location : str
-            Device mapping requested while loading the cache.
-        weights_only : bool
-            Whether ``torch.load`` restricts deserialization to tensor data.
-
-        Raises
-        ------
-        Exception
-            Failure instance configured by the parametrized test.
-        """
-
-        assert path == context_lookup_path
-        assert map_location == "cpu"
-        assert weights_only is True
-        raise failure
-
-    monkeypatch.setattr(utils_module.torch, "load", fail_to_load)
+    load = Mock(side_effect=failure)
+    monkeypatch.setattr(utils_module.torch, "load", load)
 
     with pytest.raises(
         ASRInitializationError, match="Failed to load predictor context cache"
@@ -2100,6 +1886,9 @@ def test_validate_zipformer_context_lookup_wraps_load_failure(
         validate_zipformer_context_lookup(tmp_path, make_zipformer_config())
 
     assert error.value.__cause__ is failure
+    load.assert_called_once_with(
+        context_lookup_path, map_location="cpu", weights_only=True
+    )
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.float32, torch.bfloat16))
@@ -2195,71 +1984,43 @@ def test_validate_model_stops_after_tokenizer_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     failure = ASRInitializationError("invalid tokenizer")
-
-    def reject_tokenizer(_model_dir: Path, _model_config: DictConfig) -> None:
-        """Raise the configured tokenizer-validation failure.
-
-        Parameters
-        ----------
-        _model_dir : Path
-            Unused model bundle directory.
-        _model_config : DictConfig
-            Unused runtime model configuration.
-
-        Raises
-        ------
-        ASRInitializationError
-            Always raised to stop model validation at the tokenizer stage.
-        """
-
-        raise failure
-
-    monkeypatch.setattr(utils_module, "validate_tokenizer", reject_tokenizer)
-    monkeypatch.setattr(
-        utils_module,
-        "get_engine",
-        lambda _path: pytest.fail("Engine loaded after tokenizer validation failed."),
-    )
+    tokenizer = Mock(side_effect=failure)
+    load_engine = Mock()
+    monkeypatch.setattr(utils_module, "validate_tokenizer", tokenizer)
+    monkeypatch.setattr(utils_module, "get_engine", load_engine)
 
     with pytest.raises(ASRInitializationError) as error:
         validate_model(tmp_path, make_zipformer_config())
 
     assert error.value is failure
+    load_engine.assert_not_called()
 
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
-def test_validate_model_reports_missing_transducer_decoder_before_loading_encoder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
+@pytest.mark.parametrize("missing_index", (0, 1), ids=["encoder", "decoder"])
+def test_validate_model_reports_missing_engine_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    missing_index: int,
 ) -> None:
     model_config = make_model_config(architecture)
-    encoder_filename, decoder_filename = TRANSDUCER_MODEL_FILES[architecture]
-    (tmp_path / encoder_filename).touch()
-    tokenizer_calls: list[tuple[Path, DictConfig]] = []
+    filenames = TRANSDUCER_MODEL_FILES[architecture]
+    missing = filenames[missing_index]
+    for filename in filenames:
+        if filename != missing:
+            (tmp_path / filename).touch()
+    tokenizer = Mock()
+    load_engine = Mock()
+    monkeypatch.setattr(utils_module, "validate_tokenizer", tokenizer)
+    monkeypatch.setattr(utils_module, "get_engine", load_engine)
 
-    def validate_tokenizer(model_dir: Path, config: DictConfig) -> None:
-        """Record tokenizer validation before artifact preflight fails.
-
-        Parameters
-        ----------
-        model_dir : Path
-            Model bundle directory supplied by ``validate_model``.
-        config : DictConfig
-            Runtime model configuration supplied by ``validate_model``.
-        """
-
-        tokenizer_calls.append((model_dir, config))
-
-    monkeypatch.setattr(utils_module, "validate_tokenizer", validate_tokenizer)
-    monkeypatch.setattr(
-        utils_module,
-        "get_engine",
-        lambda _: pytest.fail("Engine loaded before artifact preflight completed."),
-    )
-
-    with pytest.raises(ASRInitializationError, match=decoder_filename):
+    with pytest.raises(ASRInitializationError) as error:
         validate_model(tmp_path, model_config)
 
-    assert tokenizer_calls == [(tmp_path, model_config)]
+    assert str(error.value) == f"Missing TensorRT engine {tmp_path / missing}."
+    tokenizer.assert_called_once_with(tmp_path, model_config)
+    load_engine.assert_not_called()
 
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
@@ -2333,94 +2094,26 @@ def test_validate_model_rejects_decoder_before_loading_context_cache(
         validate_model(tmp_path, model_config)
 
 
-@pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
-def test_validate_model_reports_missing_encoder_before_loading_engines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
-) -> None:
-    model_config = make_model_config(architecture)
-    encoder_filename = TRANSDUCER_MODEL_FILES[architecture][0]
-    tokenizer_calls: list[tuple[Path, DictConfig]] = []
-
-    def validate_tokenizer(model_dir: Path, config: DictConfig) -> None:
-        """Record tokenizer validation before missing-engine preflight.
-
-        Parameters
-        ----------
-        model_dir : Path
-            Model bundle directory supplied by ``validate_model``.
-        config : DictConfig
-            Runtime model configuration supplied by ``validate_model``.
-        """
-
-        tokenizer_calls.append((model_dir, config))
-
-    monkeypatch.setattr(utils_module, "validate_tokenizer", validate_tokenizer)
-    monkeypatch.setattr(
-        utils_module,
-        "get_engine",
-        lambda _path: pytest.fail("An engine was loaded before artifact preflight."),
-    )
-
-    with pytest.raises(ASRInitializationError, match=encoder_filename):
-        validate_model(tmp_path, model_config)
-
-    assert tokenizer_calls == [(tmp_path, model_config)]
-
-
 def test_validate_model_accepts_complete_zipformer_ctc_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_config = make_zipformer_config("ctc_greedy_search")
-    (tmp_path / "zipformer.trt").touch()
-    encoder = make_encoder_engine(model_config)
-    tokenizer_calls: list[tuple[Path, DictConfig]] = []
-    loaded_paths: list[Path] = []
-
-    def validate_tokenizer(model_dir: Path, config: DictConfig) -> None:
-        """Record tokenizer validation for a complete CTC bundle.
-
-        Parameters
-        ----------
-        model_dir : Path
-            Model bundle directory supplied by ``validate_model``.
-        config : DictConfig
-            Runtime model configuration supplied by ``validate_model``.
-        """
-
-        tokenizer_calls.append((model_dir, config))
-
-    monkeypatch.setattr(utils_module, "validate_tokenizer", validate_tokenizer)
-    monkeypatch.setattr(
-        utils_module,
-        "validate_zipformer_context_lookup",
-        lambda _model_dir, _model_config: pytest.fail(
-            "A CTC bundle unexpectedly validated a transducer context lookup."
-        ),
-    )
-
-    def load_engine(engine_path: Path) -> FakeEngine:
-        """Record and return the sole CTC encoder engine.
-
-        Parameters
-        ----------
-        engine_path : Path
-            Encoder engine path requested by ``validate_model``.
-
-        Returns
-        -------
-        FakeEngine
-            Valid Zipformer CTC encoder metadata.
-        """
-
-        loaded_paths.append(engine_path)
-        return encoder
-
+    encoder_path = tmp_path / "zipformer.trt"
+    encoder_path.touch()
+    tokenizer = Mock()
+    load_engine = Mock(return_value=make_encoder_engine(model_config))
+    validate_context = Mock()
+    monkeypatch.setattr(utils_module, "validate_tokenizer", tokenizer)
     monkeypatch.setattr(utils_module, "get_engine", load_engine)
+    monkeypatch.setattr(
+        utils_module, "validate_zipformer_context_lookup", validate_context
+    )
 
     validate_model(tmp_path, model_config)
 
-    assert tokenizer_calls == [(tmp_path, model_config)]
-    assert loaded_paths == [tmp_path / "zipformer.trt"]
+    tokenizer.assert_called_once_with(tmp_path, model_config)
+    load_engine.assert_called_once_with(encoder_path)
+    validate_context.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -2439,55 +2132,20 @@ def test_validate_model_accepts_complete_transducer_bundle(
         encoder_path: make_encoder_engine(model_config, batch_size=batch_size),
         decoder_path: make_decoder_engine(model_config, batch_size=batch_size),
     }
-    loaded_paths: list[Path] = []
-    context_calls: list[tuple[Path, DictConfig]] = []
-
+    load_engine = Mock(side_effect=engines.__getitem__)
+    validate_context = Mock()
     monkeypatch.setattr(
         utils_module, "validate_tokenizer", lambda _model_dir, _model_config: None
     )
-
-    def load_engine(engine_path: Path) -> FakeEngine:
-        """Record and return metadata for a requested transducer engine.
-
-        Parameters
-        ----------
-        engine_path : Path
-            Encoder or decoder engine path requested by ``validate_model``.
-
-        Returns
-        -------
-        FakeEngine
-            Matching engine metadata from the complete test bundle.
-        """
-
-        loaded_paths.append(engine_path)
-        return engines[engine_path]
-
     monkeypatch.setattr(utils_module, "get_engine", load_engine)
-
-    def validate_context(model_dir: Path, config: DictConfig) -> None:
-        """Record Zipformer context-cache validation and reject Parakeet use.
-
-        Parameters
-        ----------
-        model_dir : Path
-            Model bundle directory supplied by ``validate_model``.
-        config : DictConfig
-            Runtime model configuration supplied by ``validate_model``.
-        """
-
-        if architecture != "zipformer":
-            pytest.fail("Parakeet unexpectedly validated a context lookup.")
-        context_calls.append((model_dir, config))
-
     monkeypatch.setattr(
         utils_module, "validate_zipformer_context_lookup", validate_context
     )
 
     validate_model(tmp_path, model_config)
 
-    assert loaded_paths == [encoder_path, decoder_path]
-    expected_context_calls = (
-        [(tmp_path, model_config)] if architecture == "zipformer" else []
-    )
-    assert context_calls == expected_context_calls
+    assert load_engine.call_args_list == [call(encoder_path), call(decoder_path)]
+    if architecture == "zipformer":
+        validate_context.assert_called_once_with(tmp_path, model_config)
+    else:
+        validate_context.assert_not_called()

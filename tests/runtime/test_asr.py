@@ -424,14 +424,14 @@ def test_asr_routes_model_components(
     assert runtime.calls["encoder"] == [
         (tmp_path / encoder_filename, 16000, 3, runtime.stream, right_padding_samples)
     ]
-    assert type(model.encoder) is asr_module.Encoder
+    assert isinstance(model.encoder, asr_module.Encoder)
     assert model.encoder.batch_size == 7
     assert model.stream is runtime.stream
     assert runtime.calls["stream"] == [
         (("non_blocking", True), ("null", False), ("ptds", False))
     ]
     assert runtime.calls["postprocessor"] == [(tmp_path / "bpe.model", 16000)]
-    assert type(model.postprocessor) is asr_module.PostProcessor
+    assert isinstance(model.postprocessor, asr_module.PostProcessor)
 
     if decoder_filename is None:
         expected_decoder_args = (0, frame_shift_sec, 0.25, 3, runtime.stream)
@@ -469,7 +469,7 @@ def test_asr_routes_model_components(
     assert all(
         runtime.calls[name] == [] for name in decoder_classes if name != decoder_call
     )
-    assert type(model.decoder) is decoder_classes[decoder_call]
+    assert isinstance(model.decoder, decoder_classes[decoder_call])
     assert runtime.events == [
         ("enter_device", 3),
         ("stream", 3),

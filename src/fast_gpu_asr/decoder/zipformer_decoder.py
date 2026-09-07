@@ -12,7 +12,11 @@ import numpy as np
 import tensorrt as trt
 import torch
 
-from ..constants import INT32_MAX, ZIPFORMER_DECODER_CONTEXTS_FILE
+from ..constants import (
+    CUDA_DEFAULT_SHARED_MEMORY_BYTES,
+    INT32_MAX,
+    ZIPFORMER_DECODER_CONTEXTS_FILE,
+)
 from ..utils import ASRInferenceError, ASRInitializationError, get_engine
 from .gpu_kernels import (
     CTC_COLLAPSE_KERNEL,
@@ -212,9 +216,10 @@ class ZipformerModifiedBeamSearchDecoder:
     the same modified beam-search kernel as wider beams, which keeps RNNT
     decoding semantics in one implementation. "Modified" follows Icefall: each
     frame emits at most one symbol, candidates come from the current
-    hypothesis-by-vocabulary table, duplicate token histories are merged, and
-    the top ``beam`` histories are retained. Token histories use compact GPU
-    backpointers, and final selection applies length-normalized log probability.
+    hypothesis-by-vocabulary table, all duplicate token histories are merged
+    before pruning, and the top ``beam`` unique histories are retained. Token
+    histories use compact GPU backpointers, and final selection applies
+    length-normalized log probability.
     """
 
     def __init__(
@@ -277,6 +282,11 @@ class ZipformerModifiedBeamSearchDecoder:
             ) = get_zipformer_beam_search_kernels(
                 self.beam, vocab_size, self.context_size
             )
+            for launch in (self.register_beam_search, self.shared_beam_search):
+                if launch is not None and launch[1] > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
+                    launch[0].max_dynamic_shared_size_bytes = (
+                        self.device.attributes["MaxSharedMemoryPerBlockOptin"]
+                    )
 
             # Register-local candidate lists favor small grids. Once roughly half
             # the SMs have work, shared candidates preserve occupancy more reliably.
