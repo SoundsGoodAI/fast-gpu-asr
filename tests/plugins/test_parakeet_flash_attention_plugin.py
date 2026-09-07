@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import cupy as cp
@@ -91,22 +91,16 @@ ENGINE_CASES = (
         id="bf16",
     ),
 )
-ALTERNATE_ENGINE_CASE = EngineCase(
-    "fp32-h3-d5-scale075",
-    trt.float32,
-    cp.float32,
-    torch.float32,
-    3e-4,
+ALTERNATE_ENGINE_CASE = replace(
+    ENGINE_CASES[0],
+    name="fp32-h3-d5-scale075",
     num_heads=3,
     head_dim=5,
     scale=0.75,
 )
-MINIMUM_ENGINE_CASE = EngineCase(
-    "fp32-h1-d1-scale05",
-    trt.float32,
-    cp.float32,
-    torch.float32,
-    3e-4,
+MINIMUM_ENGINE_CASE = replace(
+    ENGINE_CASES[0],
+    name="fp32-h1-d1-scale05",
     num_heads=1,
     head_dim=1,
     scale=0.5,
@@ -569,14 +563,12 @@ def reference_attention(
     position_bias = torch.from_numpy(inputs.position_bias).to(case.torch_dtype)
     valid_lengths = torch.from_numpy(inputs.valid_lengths)
     batch_size, sequence_length, _ = qkv.shape
-    query, key, value = qkv.chunk(3, dim=2)
-    query = query.reshape(
-        batch_size, sequence_length, case.num_heads, case.head_dim
-    ).permute(0, 2, 1, 3)
-    key = key.reshape(
-        batch_size, sequence_length, case.num_heads, case.head_dim
-    ).permute(0, 2, 1, 3)
-    value = value.reshape(batch_size, sequence_length, case.num_heads, case.head_dim)
+    query, key, value = (
+        part.reshape(
+            batch_size, sequence_length, case.num_heads, case.head_dim
+        ).permute(0, 2, 1, 3)
+        for part in qkv.chunk(3, dim=2)
+    )
     position = position.reshape(1, -1, case.num_heads, case.head_dim).permute(
         0, 2, 1, 3
     )
@@ -612,7 +604,7 @@ def reference_attention(
         torch.zeros((), dtype=weights.dtype),
     ).to(case.torch_dtype)
     return (
-        torch.matmul(weights, value.permute(0, 2, 1, 3))
+        torch.matmul(weights, value)
         .permute(0, 2, 1, 3)
         .reshape(batch_size, sequence_length, case.channels)
         .float()
@@ -674,11 +666,10 @@ def test_parakeet_flash_attention_exercises_every_softmax_dispatch_slot(
 ) -> None:
     case = attention_engine.case
     inputs = zero_inputs(case, sequence_length, sequence_length)
-    for head in range(case.num_heads):
-        channel = head * case.head_dim
-        inputs.qkv[0, :, channel] = 20.0
-        inputs.qkv[0, sequence_length - 1, case.channels + channel] = 20.0
-    inputs.qkv[0, sequence_length - 1, 2 * case.channels :] = 1.0
+    query, key, value = np.split(inputs.qkv, 3, axis=2)
+    query[0, :, :: case.head_dim] = 20.0
+    key[0, sequence_length - 1, :: case.head_dim] = 20.0
+    value[0, sequence_length - 1] = 1.0
     actual = assert_run_matches_reference(
         run_engine(attention_engine, inputs), case, inputs
     )
@@ -686,7 +677,32 @@ def test_parakeet_flash_attention_exercises_every_softmax_dispatch_slot(
 
 
 @pytest.mark.parametrize(
-    "case", (ALTERNATE_ENGINE_CASE, MINIMUM_ENGINE_CASE), ids=lambda case: case.name
+    "case",
+    (
+        ALTERNATE_ENGINE_CASE,
+        MINIMUM_ENGINE_CASE,
+        replace(
+            ALTERNATE_ENGINE_CASE,
+            name="fp16-h3-d5-scale075",
+            trt_dtype=trt.float16,
+            cupy_dtype=cp.float16,
+            torch_dtype=torch.float16,
+            tolerance=5e-3,
+        ),
+        pytest.param(
+            replace(
+                ALTERNATE_ENGINE_CASE,
+                name="bf16-h3-d5-scale075",
+                trt_dtype=trt.bfloat16,
+                cupy_dtype=cp.dtype("bfloat16"),
+                torch_dtype=torch.bfloat16,
+                tolerance=3e-2,
+            ),
+            marks=pytest.mark.sm80,
+            id="bf16-h3-d5-scale075",
+        ),
+    ),
+    ids=lambda case: case.name,
 )
 def test_parakeet_flash_attention_supports_head_layouts_and_scales(
     plugin_creator: PluginCreatorFixture, case: EngineCase
@@ -716,8 +732,9 @@ def test_parakeet_flash_attention_promotes_score_sum_before_softmax(
     )
     assert engine is not None
     inputs = zero_inputs(case, 2, 2)
-    inputs.qkv[0, :, case.channels + 1] = 1.0
-    inputs.qkv[0, 1, 2 * case.channels] = 1.0
+    _, key, value = np.split(inputs.qkv, 3, axis=2)
+    key[0, :, 1] = 1.0
+    value[0, 1, 0] = 1.0
     inputs.position[0, 1, 0] = position_delta
     inputs.position[0, 2, 0] = -position_delta
     inputs.content_bias[0] = (0.0, 1.5)
@@ -741,15 +758,67 @@ def test_parakeet_flash_attention_masks_extreme_valid_logits(
 ) -> None:
     case = attention_engine.case
     inputs = zero_inputs(case, 2, 1)
-    for head in range(case.num_heads):
-        channel = head * case.head_dim
-        inputs.qkv[0, :, channel] = 1.0
-        inputs.qkv[0, 0, case.channels + channel] = -1200.0 / case.scale
-    inputs.qkv[0, 0, 2 * case.channels :] = 1.0
+    query, key, value = np.split(inputs.qkv, 3, axis=2)
+    query[0, :, :: case.head_dim] = 1.0
+    key[0, 0, :: case.head_dim] = -1200.0 / case.scale
+    value[0, 0] = 1.0
     actual = assert_run_matches_reference(
         run_engine(attention_engine, inputs), case, inputs
     )
     np.testing.assert_allclose(actual, 1.0, rtol=0.0, atol=case.tolerance)
+
+
+@pytest.mark.parametrize(
+    "score",
+    (-np.inf, np.inf, np.nan, pytest.param(-65504.0, id="finite-fp16-overflow")),
+)
+@pytest.mark.parametrize("valid_length", (0, 1, 2))
+def test_parakeet_flash_attention_preserves_nonfinite_score_semantics(
+    attention_engine: AttentionEngine, score: float, valid_length: int
+) -> None:
+    case = attention_engine.case
+    inputs = zero_inputs(case, 2, valid_length)
+    query, key, value = np.split(inputs.qkv, 3, axis=2)
+    query.fill(1.0)
+    key[0, 0] = score
+    value[0, 0] = 1.0
+    value[0, 1] = 7.0
+    run = run_engine(attention_engine, inputs, execute=False)
+
+    with run.stream:
+        run.output.fill(123.0)
+        assert run.context.execute_async_v3(run.stream.ptr)
+
+    run.stream.synchronize()
+
+    expected = reference_attention(inputs, case)
+    np.testing.assert_allclose(
+        cp.asnumpy(run.output).astype(np.float32),
+        expected,
+        rtol=case.tolerance,
+        atol=case.tolerance,
+        equal_nan=True,
+    )
+
+
+@pytest.mark.parametrize("score", (-30.0, 30.0))
+def test_parakeet_flash_attention_does_not_overflow_finite_scaled_logits(
+    plugin_creator: PluginCreatorFixture,
+    attention_engine: AttentionEngine,
+    score: float,
+) -> None:
+    _, creator = plugin_creator
+    case = replace(attention_engine.case, scale=1e37)
+    engine = build_attention_engine(creator, case, 1, 2)
+    assert engine is not None
+    inputs = zero_inputs(case, 2, 1)
+    _, key, value = np.split(inputs.qkv, 3, axis=2)
+    inputs.content_bias[:, 0] = 1.0
+    key[0, 0, :: case.head_dim] = score
+    value[0, 0] = 1.0
+    value[0, 1] = 7.0
+    actual = assert_run_matches_reference(run_engine(engine, inputs), case, inputs)
+    np.testing.assert_array_equal(actual, 1.0)
 
 
 def test_parakeet_flash_attention_applies_content_attention_and_bias(
@@ -757,13 +826,12 @@ def test_parakeet_flash_attention_applies_content_attention_and_bias(
 ) -> None:
     case = attention_engine.case
     inputs = zero_inputs(case, 3, 3)
-    inputs.qkv[0, :, 2 * case.channels :] = np.arange(1, 4, dtype=np.float32)[:, None]
-    for head in range(case.num_heads):
-        channel = head * case.head_dim
-        for frame in range(3):
-            if frame < 2:
-                inputs.qkv[0, frame, channel + frame] = 10.0
-            inputs.qkv[0, frame, case.channels + channel + frame] = 20.0
+    query, key, value = np.split(inputs.qkv, 3, axis=2)
+    value[0] = np.arange(1, 4, dtype=np.float32)[:, None]
+    for frame in range(3):
+        if frame < 2:
+            query[0, frame, frame :: case.head_dim] = 10.0
+        key[0, frame, frame :: case.head_dim] = 20.0
     inputs.content_bias[:, 2] = 5.0
     actual = assert_run_matches_reference(
         run_engine(attention_engine, inputs), case, inputs
@@ -779,10 +847,9 @@ def test_parakeet_flash_attention_preserves_head_and_value_layout(
 ) -> None:
     case = attention_engine.case
     inputs = zero_inputs(case, 7, 4)
-    for key in range(7):
-        for head in range(case.num_heads):
-            start = 2 * case.channels + head * case.head_dim
-            inputs.qkv[0, key, start : start + case.head_dim] = head * 10 + key
+    inputs.qkv[0, :, 2 * case.channels :] = np.arange(7)[:, np.newaxis] + np.repeat(
+        np.arange(case.num_heads) * 10, case.head_dim
+    )
     actual = assert_run_matches_reference(
         run_engine(attention_engine, inputs), case, inputs
     )
@@ -819,9 +886,7 @@ def test_parakeet_flash_attention_applies_relative_position_shift(
     inputs = zero_inputs(case, 3, 3)
     inputs.qkv[0, :, 2 * case.channels :] = np.arange(1, 4, dtype=np.float32)[:, None]
     inputs.position.fill(-50.0)
-    for head in range(case.num_heads):
-        inputs.position[0, 1, head * case.head_dim] = 50.0
-        inputs.position[0, 4, head * case.head_dim] = 50.0
+    inputs.position[0, (1, 4), :: case.head_dim] = 50.0
     inputs.position_bias[:, 0] = 1.0
     actual = assert_run_matches_reference(
         run_engine(attention_engine, inputs), case, inputs
@@ -849,7 +914,45 @@ def test_parakeet_flash_attention_supports_cuda_graph_replay(
                 cp.copyto(destination, cp.array(source, dtype=destination.dtype))
             run.output.fill(cp.nan)
             graph.launch(run.stream)
-        assert_run_matches_reference(run, case, inputs)
+        expected = assert_run_matches_reference(run, case, inputs)
+        for _ in range(3):
+            with run.stream:
+                run.output.fill(cp.nan)
+                graph.launch(run.stream)
+            run.stream.synchronize()
+            np.testing.assert_array_equal(
+                cp.asnumpy(run.output).astype(np.float32), expected
+            )
+
+
+def test_parakeet_flash_attention_supports_aligned_offset_buffers(
+    attention_engine: AttentionEngine,
+) -> None:
+    case = attention_engine.case
+    inputs = make_inputs(case, 2, 33, (33, 17))
+    run = run_engine(attention_engine, inputs, execute=False)
+    guarded = []
+    with run.stream:
+        for name, buffer in zip(
+            (*INPUT_NAMES, "output"), (*run.inputs, run.output), strict=True
+        ):
+            # TensorRT bindings require 256-byte alignment, including slices.
+            padding = 256 // buffer.itemsize
+            storage = cp.full(buffer.size + 2 * padding, 7, dtype=buffer.dtype)
+            view = storage[padding : padding + buffer.size].reshape(buffer.shape)
+            view[...] = buffer
+            assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+            assert run.context.set_tensor_address(name, view.data.ptr)
+            guarded.append((storage, view, padding))
+        run.inputs = tuple(view for _, view, _ in guarded[:-1])
+        run.output = guarded[-1][1]
+        assert run.context.execute_async_v3(run.stream.ptr)
+
+    assert_run_matches_reference(run, case, inputs)
+
+    for storage, _, padding in guarded:
+        np.testing.assert_array_equal(cp.asnumpy(storage[:padding]), 7)
+        np.testing.assert_array_equal(cp.asnumpy(storage[storage.size - padding :]), 7)
 
 
 def test_parakeet_flash_attention_reuses_context_across_shapes_and_streams(
@@ -877,11 +980,15 @@ def test_parakeet_flash_attention_supports_concurrent_contexts(
         make_inputs(attention_engine.case, 1, 33, (31,), seed=10001),
         make_inputs(attention_engine.case, 3, 65, (65, 34, 1), seed=10002),
     )
-    runs = [run_engine(attention_engine, values, execute=False) for values in inputs]
+    runs = [run_engine(attention_engine, values) for values in inputs]
     assert runs[0].context is not runs[1].context
     assert runs[0].stream.ptr != runs[1].stream.ptr
     for run in runs:
-        assert run.context.execute_async_v3(run.stream.ptr)
+        run.stream.synchronize()
+    for run in runs:
+        with run.stream:
+            run.output.fill(cp.nan)
+            assert run.context.execute_async_v3(run.stream.ptr)
     for run, values in zip(runs, inputs, strict=True):
         assert_run_matches_reference(run, attention_engine.case, values)
 
@@ -1086,10 +1193,10 @@ def test_parakeet_flash_attention_rejects_invalid_contracts(
     plugin_creator: PluginCreatorFixture, overrides: dict[int, InputSpec]
 ) -> None:
     _, creator = plugin_creator
-    specs = list(VALID_INPUT_SPECS)
-    for index, spec in overrides.items():
-        specs[index] = spec
-    assert not execute_static_contract(creator, tuple(specs))
+    specs = tuple(
+        overrides.get(index, spec) for index, spec in enumerate(VALID_INPUT_SPECS)
+    )
+    assert not execute_static_contract(creator, specs)
 
 
 @pytest.mark.parametrize("count", (4, 6), ids=("missing-input", "extra-input"))

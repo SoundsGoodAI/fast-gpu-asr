@@ -16,6 +16,8 @@ namespace fastgpuasr_tensorrt
 // TensorRT reserves tactic zero while selecting an implementation. Positive
 // IDs keep that sentinel distinct from the cuBLAS compute modes serialized in
 // an engine.
+// IDs select compute policies, not fixed cuBLAS algorithms. "Strict" means
+// non-FAST CUBLAS_COMPUTE_32F, not CUBLAS_COMPUTE_32F_PEDANTIC.
 inline constexpr int32_t kStrictComputeTactic = 1;
 inline constexpr int32_t kFast16FComputeTactic = 2;
 inline constexpr int32_t kFast16BFComputeTactic = 3;
@@ -27,14 +29,16 @@ inline constexpr std::array<int32_t, 4> kCublasComputeTactics{
     kFastTF32ComputeTactic,
 };
 
-// The FAST_* modes require FP32 A, B, and C storage and alter the internal
-// multiplication precision. GEMMs with FP16 or BF16 storage therefore retain
-// strict FP32 accumulation.
+// FAST_* modes require FP32 A, B, and C storage but permit internal
+// down-conversion; callers must account for its range and accuracy limits.
+// FP16/BF16 storage uses CUBLAS_COMPUTE_32F instead. Output conversion and
+// handle-level reduction policy remain the caller's responsibility.
 inline constexpr std::array<int32_t, 1> kReducedStorageCublasComputeTactics{
     kStrictComputeTactic,
 };
 
-// Query only during tactic enumeration, never on the inference hot path.
+// Query the current device during enumeration, never on the inference hot path.
+// Failure disables Ampere-only choices; false is not a GPU-availability check.
 inline bool deviceSupportsAmpereCompute() noexcept
 {
     int device{};
@@ -63,6 +67,8 @@ constexpr std::span<int32_t const> getCublasComputeTactics(
     }
 }
 
+// Check dtype compatibility only. Enumeration filters hardware support;
+// serialized engines still require a compatible device at inference time.
 constexpr bool isCublasComputeTactic(
     int32_t tactic, nvinfer1::DataType type = nvinfer1::DataType::kFLOAT) noexcept
 {

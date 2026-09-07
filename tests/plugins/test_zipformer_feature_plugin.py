@@ -176,6 +176,9 @@ def make_fields(extractor=None, **overrides) -> list[trt.PluginField]:
 def make_plugin(creator, fields=None):
     """Create a plugin, leaving acceptance or rejection to the caller.
 
+    Retain the field objects through creation: PluginFieldCollection borrows
+    their NumPy backing arrays rather than keeping them alive.
+
     Parameters
     ----------
     creator : trt.IPluginCreatorV3One
@@ -189,101 +192,22 @@ def make_plugin(creator, fields=None):
         Created plugin, or None when the creator rejects the supplied fields.
     """
 
+    if fields is None:
+        fields = make_fields()
     return creator.create_plugin(
         PLUGIN_NAME,
-        trt.PluginFieldCollection(make_fields() if fields is None else fields),
+        trt.PluginFieldCollection(fields),
         trt.TensorRTPhase.BUILD,
     )
-
-
-def set_profile_shape(
-    profile: trt.IOptimizationProfile,
-    name: str,
-    min_shape: tuple[int, ...],
-    opt_shape: tuple[int, ...],
-    max_shape: tuple[int, ...],
-) -> None:
-    """Set and read back one dynamic profile to reject setup false positives.
-
-    Parameters
-    ----------
-    profile : trt.IOptimizationProfile
-        Profile receiving the bounds, which are read back to verify test setup.
-    name : str
-        Tensor name used for the optimization profile.
-    min_shape : tuple[int, ...]
-        Minimum input shape.
-    opt_shape : tuple[int, ...]
-        Optimum input shape used during tactic selection.
-    max_shape : tuple[int, ...]
-        Maximum input shape.
-    """
-
-    profile.set_shape(name, min_shape, opt_shape, max_shape)
-    assert tuple(map(tuple, profile.get_shape(name))) == (
-        min_shape,
-        opt_shape,
-        max_shape,
-    )
-
-
-def add_feature_plugin_layer(
-    network: trt.INetworkDefinition,
-    creator: trt.IPluginCreatorV3One,
-    extractor: FeatureExtractor,
-    audio: trt.ITensor,
-    audio_lengths: trt.ITensor,
-) -> trt.IPluginV3Layer:
-    """Add one extractor's constant inputs and mark both plugin outputs.
-
-    Parameters
-    ----------
-    network : trt.INetworkDefinition
-        Strongly typed network receiving constants and marked plugin outputs.
-    creator : trt.IPluginCreatorV3One
-        Registered creator used to construct the plugin under test.
-    extractor : FeatureExtractor
-        Eager frontend providing window, mel filterbank, and serialized parameters.
-    audio : trt.ITensor
-        FP32 network input of shape (batch, audio_samples).
-    audio_lengths : trt.ITensor
-        INT64 network input containing valid sample counts.
-
-    Returns
-    -------
-    trt.IPluginV3Layer
-        Added plugin layer with named features and feature_lengths marked as
-        outputs.
-    """
-
-    window_layer = network.add_constant(
-        extractor.window.shape, extractor.window.numpy()
-    )
-    mel_layer = network.add_constant(
-        extractor.mel_filterbank.shape, extractor.mel_filterbank.numpy()
-    )
-    assert window_layer is not None and mel_layer is not None
-    plugin = make_plugin(creator, make_fields(extractor))
-    assert plugin is not None
-    layer = network.add_plugin_v3(
-        [audio, audio_lengths, window_layer.get_output(0), mel_layer.get_output(0)],
-        [],
-        plugin,
-    )
-    assert layer is not None
-    for index, name in enumerate(("features", "feature_lengths")):
-        output = layer.get_output(index)
-        output.name = name
-        network.mark_output(output)
-    return layer
 
 
 def build_feature_engine(
     creator: trt.IPluginCreatorV3One,
     extractor: FeatureExtractor,
-    profile_shapes: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
-) -> tuple[trt.Runtime, trt.ICudaEngine]:
-    """Build and deserialize a dynamic engine for one frontend configuration.
+    profile_shapes: tuple[tuple[int, int], ...],
+    length_batches: tuple[int, ...] | None = None,
+) -> tuple[trt.Runtime, trt.ICudaEngine] | None:
+    """Build a dynamic frontend with its owning runtime, or None on rejection.
 
     Parameters
     ----------
@@ -291,17 +215,20 @@ def build_feature_engine(
         Registered creator used to construct the plugin under test.
     extractor : FeatureExtractor
         Eager frontend providing window, mel filterbank, and serialized parameters.
+        Window and mel weights are constants, matching the exported network.
     profile_shapes : tuple[tuple[int, int], ...]
         Minimum, optimum, and maximum (batch, audio_samples) input shapes.
+    length_batches : tuple[int, ...] or None
+        Independent min/opt/max bounds for the length input's batch dimension;
+        None uses the audio batch bounds.
 
     Returns
     -------
-    tuple[trt.Runtime, trt.ICudaEngine]
-        Deserialized engine with its owning runtime.
+    tuple[trt.Runtime, trt.ICudaEngine] or None
+        Deserialized engine with its owning runtime, or None on build rejection.
     """
 
     logger = trt.Logger(trt.Logger.ERROR)
-    assert trt.init_libnvinfer_plugins(logger, "")
     builder = trt.Builder(logger)
     network = builder.create_network(
         1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
@@ -309,19 +236,38 @@ def build_feature_engine(
     audio = network.add_input("audio", trt.float32, (-1, -1))
     audio_lengths = network.add_input("audio_lengths", trt.int64, (-1,))
     assert audio is not None and audio_lengths is not None
-    add_feature_plugin_layer(network, creator, extractor, audio, audio_lengths)
+    window = network.add_constant(extractor.window.shape, extractor.window.numpy())
+    mel = network.add_constant(
+        extractor.mel_filterbank.shape, extractor.mel_filterbank.numpy()
+    )
+    assert window is not None and mel is not None
+    plugin = make_plugin(creator, make_fields(extractor))
+    assert plugin is not None
+    layer = network.add_plugin_v3(
+        [audio, audio_lengths, window.get_output(0), mel.get_output(0)], [], plugin
+    )
+    assert layer is not None
+    for index, name in enumerate(("features", "feature_lengths")):
+        output = layer.get_output(index)
+        output.name = name
+        network.mark_output(output)
 
     profile = builder.create_optimization_profile()
-    set_profile_shape(profile, "audio", *profile_shapes)
-    set_profile_shape(
-        profile, "audio_lengths", *((shape[0],) for shape in profile_shapes)
-    )
+    if length_batches is None:
+        length_batches = tuple(batch for batch, _ in profile_shapes)
+    for name, shapes in (
+        ("audio", profile_shapes),
+        ("audio_lengths", tuple((batch,) for batch in length_batches)),
+    ):
+        profile.set_shape(name, *shapes)
+        assert tuple(map(tuple, profile.get_shape(name))) == shapes
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
     config.builder_optimization_level = 3
     assert config.add_optimization_profile(profile) == 0
     serialized_engine = builder.build_serialized_network(network, config)
-    assert serialized_engine is not None
+    if serialized_engine is None:
+        return None
 
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(serialized_engine)
@@ -332,10 +278,10 @@ def build_feature_engine(
         "features": (trt.TensorIOMode.OUTPUT, trt.float32),
         "feature_lengths": (trt.TensorIOMode.OUTPUT, trt.int32),
     }
-    assert engine.num_io_tensors == len(expected_io)
-    for name, (mode, dtype) in expected_io.items():
-        assert engine.get_tensor_mode(name) == mode
-        assert engine.get_tensor_dtype(name) == dtype
+    assert {
+        name: (engine.get_tensor_mode(name), engine.get_tensor_dtype(name))
+        for name in engine
+    } == expected_io
     return runtime, engine
 
 
@@ -357,8 +303,9 @@ def feature_engine(plugin_creator):
 
     _, creator = plugin_creator
     extractor = make_extractor()
-    runtime, engine = build_feature_engine(creator, extractor, PROFILE_SHAPES)
-    return runtime, engine, extractor
+    result = build_feature_engine(creator, extractor, PROFILE_SHAPES)
+    assert result is not None
+    return *result, extractor
 
 
 def make_padded_audio(
@@ -418,8 +365,9 @@ def run_engine(
     lengths: np.typing.NDArray[np.int64],
     context: trt.IExecutionContext | None = None,
     stream: cp.cuda.Stream | None = None,
+    execute: bool = True,
 ) -> FeatureRun:
-    """Execute with sentinel outputs on one explicitly ordered CUDA stream.
+    """Bind sentinel outputs and optionally execute on one ordered CUDA stream.
 
     Parameters
     ----------
@@ -435,6 +383,8 @@ def run_engine(
         Context to reuse after prior work completes; None creates a fresh context.
     stream : cp.cuda.Stream or None
         Stream ordering uploads and inference; None creates a nonblocking stream.
+    execute : bool
+        False only prepares bindings, allowing buffer replacement or rejection tests.
 
     Returns
     -------
@@ -446,42 +396,35 @@ def run_engine(
     if context is None:
         context = engine.create_execution_context()
     assert context is not None
-    assert audio.dtype == np.float32
-    assert lengths.dtype == np.int64
-    assert audio.ndim == 2
-    assert lengths.shape == (audio.shape[0],)
+    assert audio.dtype == np.float32 and lengths.dtype == np.int64
+    assert audio.ndim == 2 and lengths.ndim == 1
     assert context.set_input_shape("audio", audio.shape)
     assert context.set_input_shape("audio_lengths", lengths.shape)
+    assert context.infer_shapes() == []
     expected_frames = (
         audio.shape[1] + extractor.left_padding - extractor.frame_length
     ) // extractor.frame_shift + 1
     feature_shape = tuple(context.get_tensor_shape("features"))
-    feature_length_shape = tuple(context.get_tensor_shape("feature_lengths"))
     assert feature_shape == (audio.shape[0], expected_frames, extractor.n_mels)
-    assert feature_length_shape == lengths.shape
+    assert tuple(context.get_tensor_shape("feature_lengths")) == lengths.shape
     if stream is None:
         stream = cp.cuda.Stream(non_blocking=True)
     with stream:
         audio_device = cp.asarray(audio)
         lengths_device = cp.asarray(lengths)
-        features_device = cp.full(feature_shape, cp.nan, dtype=cp.float32)
-        feature_lengths_device = cp.full(
-            feature_length_shape, INT32_SENTINEL, dtype=cp.int32
-        )
-        assert context.set_tensor_address("audio", audio_device.data.ptr)
-        assert context.set_tensor_address("audio_lengths", lengths_device.data.ptr)
-        assert context.set_tensor_address("features", features_device.data.ptr)
-        assert context.set_tensor_address(
-            "feature_lengths", feature_lengths_device.data.ptr
-        )
-        assert context.execute_async_v3(stream.ptr)
+        features = cp.full(feature_shape, cp.nan, dtype=cp.float32)
+        feature_lengths = cp.full(lengths.shape, INT32_SENTINEL, dtype=cp.int32)
+        for name, buffer in (
+            ("audio", audio_device),
+            ("audio_lengths", lengths_device),
+            ("features", features),
+            ("feature_lengths", feature_lengths),
+        ):
+            assert context.set_tensor_address(name, buffer.data.ptr)
+        if execute:
+            assert context.execute_async_v3(stream.ptr)
     return FeatureRun(
-        context,
-        stream,
-        audio_device,
-        lengths_device,
-        features_device,
-        feature_lengths_device,
+        context, stream, audio_device, lengths_device, features, feature_lengths
     )
 
 
@@ -516,6 +459,7 @@ def assert_run_matches_pytorch(
 
     run.stream.synchronize()
     actual, actual_lengths = cp.asnumpy(run.features), cp.asnumpy(run.feature_lengths)
+    assert np.isfinite(actual).all()
     np.testing.assert_array_equal(cp.asnumpy(run.audio), audio)
     np.testing.assert_array_equal(cp.asnumpy(run.lengths), lengths)
     with torch.inference_mode():
@@ -718,7 +662,9 @@ def test_feature_plugin_preserves_nondefault_serialized_parameters(
     )
     extractor.zero_log = -17.25
     profile_shapes = ((1, 1600), (2, 1800), (3, 2200))
-    _runtime, engine = build_feature_engine(creator, extractor, profile_shapes)
+    result = build_feature_engine(creator, extractor, profile_shapes)
+    assert result is not None
+    _, engine = result
     lengths = np.array((1500, 1200), dtype=np.int64)
     audio = make_padded_audio(
         lengths, profile_shapes[1][1], right_padding=extractor.frame_length // 2
@@ -804,40 +750,33 @@ def test_feature_plugin_supports_concurrent_contexts(feature_engine) -> None:
     assert runs[0].context is not runs[1].context
     assert runs[0].stream.ptr != runs[1].stream.ptr
 
+    # Plan creation may synchronize, so warm both contexts before concurrent work.
+    for run in runs:
+        run.stream.synchronize()
+    for run in runs:
+        with run.stream:
+            run.features.fill(cp.nan)
+            run.feature_lengths.fill(INT32_SENTINEL)
+            assert run.context.execute_async_v3(run.stream.ptr)
     for run, (audio, lengths) in zip(runs, host_cases, strict=True):
         assert_run_matches_pytorch(run, extractor, audio, lengths)
 
 
 def test_feature_plugin_rejects_runtime_batch_mismatch(feature_engine) -> None:
-    _, engine, _ = feature_engine
-    context = engine.create_execution_context()
-    assert context is not None
-    assert context.set_input_shape("audio", (2, 3400))
-    assert context.set_input_shape("audio_lengths", (1,))
-    feature_shape = tuple(context.get_tensor_shape("features"))
-    feature_length_shape = tuple(context.get_tensor_shape("feature_lengths"))
-    assert feature_shape == (2, 20, NUM_FEATURES)
-    assert feature_length_shape == (1,)
-    stream = cp.cuda.Stream(non_blocking=True)
-
-    with stream:
-        audio = cp.zeros((2, 3400), dtype=cp.float32)
-        lengths = cp.zeros((1,), dtype=cp.int64)
-        features = cp.full(feature_shape, cp.nan, dtype=cp.float32)
-        feature_lengths = cp.full(feature_length_shape, INT32_SENTINEL, dtype=cp.int32)
-        for name, value in (
-            ("audio", audio),
-            ("audio_lengths", lengths),
-            ("features", features),
-            ("feature_lengths", feature_lengths),
-        ):
-            assert context.set_tensor_address(name, value.data.ptr)
-        executed = context.execute_async_v3(stream.ptr)
-    stream.synchronize()
-
+    _, engine, extractor = feature_engine
+    run = run_engine(
+        engine,
+        extractor,
+        np.zeros((2, 3400), dtype=np.float32),
+        np.zeros(1, dtype=np.int64),
+        execute=False,
+    )
+    with run.stream:
+        executed = run.context.execute_async_v3(run.stream.ptr)
+    run.stream.synchronize()
     assert not executed
-    assert bool(cp.isnan(features).all())
-    assert bool((feature_lengths == INT32_SENTINEL).all())
+    assert bool(cp.isnan(run.features).all())
+    assert bool((run.feature_lengths == INT32_SENTINEL).all())
 
 
 def test_feature_plugin_full_scale_pcm_is_finite(feature_engine) -> None:
@@ -846,14 +785,99 @@ def test_feature_plugin_full_scale_pcm_is_finite(feature_engine) -> None:
     waveform = np.tile(np.array((-1.0, 1.0), dtype=np.float32), 2000)
     audio = np.concatenate((waveform, waveform[-RIGHT_PADDING:][::-1])).reshape(1, -1)
 
-    actual, _ = assert_run_matches_pytorch(
+    assert_run_matches_pytorch(
         run_engine(engine, extractor, audio, lengths),
         extractor,
         audio,
         lengths,
         atol=FULL_SCALE_FEATURE_ATOL,
     )
-    assert np.isfinite(actual).all()
+
+
+def test_feature_plugin_supports_aligned_offset_bindings(feature_engine) -> None:
+    _, engine, extractor = feature_engine
+    lengths = np.array((3200, 1723), dtype=np.int64)
+    audio = make_padded_audio(lengths, 3400)
+    run = run_engine(engine, extractor, audio, lengths, execute=False)
+    guarded = []
+    with run.stream:
+        for name in ("audio", "lengths", "features", "feature_lengths"):
+            original = getattr(run, name)
+            offset = 256 // original.dtype.itemsize
+            allocation = cp.full(original.size + 2 * offset, -37, original.dtype)
+            view = allocation[offset:-offset].reshape(original.shape)
+            assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+            cp.copyto(view, original)
+            setattr(run, name, view)
+            binding = "audio_lengths" if name == "lengths" else name
+            assert run.context.set_tensor_address(binding, view.data.ptr)
+            guarded.extend((allocation[:offset], allocation[-offset:]))
+        assert run.context.execute_async_v3(run.stream.ptr)
+
+    assert_run_matches_pytorch(run, extractor, audio, lengths)
+    for guard in guarded:
+        cp.testing.assert_array_equal(guard, -37)
+
+
+def test_feature_plugin_power_kernel_strides_across_rows(plugin_creator) -> None:
+    _, creator = plugin_creator
+    extractor = make_extractor()
+    # The last utterance requires a second iteration of the 65535-block grid.
+    num_frames, batch = 257, 256
+    samples = (num_frames - 1) * FRAME_SHIFT + FRAME_LENGTH - LEFT_PADDING
+    shape = (batch, samples)
+    result = build_feature_engine(creator, extractor, (shape,) * 3)
+    assert result is not None
+    _, engine = result
+    reference_lengths = np.full(2, samples - RIGHT_PADDING, dtype=np.int64)
+    waveforms = make_padded_audio(reference_lengths, samples)
+    audio = np.tile(waveforms, (batch // 2, 1))
+    lengths = np.tile(reference_lengths, batch // 2)
+    run = run_engine(engine, extractor, audio, lengths)
+    run.stream.synchronize()
+
+    with torch.inference_mode():
+        expected, expected_lengths = extractor(
+            torch.from_numpy(waveforms), torch.from_numpy(reference_lengths)
+        )
+
+    np.testing.assert_allclose(
+        cp.asnumpy(run.features),
+        np.tile(expected.numpy(), (batch // 2, 1, 1)),
+        rtol=FEATURE_RTOL,
+        atol=FEATURE_ATOL,
+    )
+    np.testing.assert_array_equal(
+        cp.asnumpy(run.feature_lengths), np.tile(expected_lengths.numpy(), batch // 2)
+    )
+
+
+@pytest.mark.parametrize(
+    "frame_length,fft_length",
+    ((2, 2), (MAX_FRAME_LENGTH, 2 * (MAX_FREQUENCIES - 1))),
+    ids=("minimum", "maximum-shared-memory"),
+)
+def test_feature_plugin_kernel_boundaries_match_pytorch(
+    plugin_creator, frame_length, fft_length
+) -> None:
+    _, creator = plugin_creator
+    extractor = make_extractor(n_mels=1, min_frames=1)
+    extractor.frame_length = frame_length
+    extractor.frame_shift = 1
+    extractor.left_padding = 0
+    extractor.n_fft = fft_length
+    extractor.window = torch.ones(frame_length)
+    extractor.mel_filterbank = torch.ones(fft_length // 2 + 1, 1)
+    shape = (2, frame_length + 2)
+    result = build_feature_engine(creator, extractor, (shape,) * 3)
+    assert result is not None
+    _, engine = result
+    lengths = np.full(shape[0], shape[1], dtype=np.int64)
+    audio = np.random.default_rng(42).uniform(-1, 1, shape).astype(np.float32)
+
+    assert_run_matches_pytorch(
+        run_engine(engine, extractor, audio, lengths), extractor, audio, lengths
+    )
 
 
 def test_feature_plugin_supports_cuda_graphs(feature_engine) -> None:
@@ -879,7 +903,21 @@ def test_feature_plugin_supports_cuda_graphs(feature_engine) -> None:
             run.feature_lengths.fill(INT32_SENTINEL)
             graph.launch(run.stream)
 
-        assert_run_matches_pytorch(run, extractor, replay_audio, replay_lengths)
+        actual, actual_lengths = assert_run_matches_pytorch(
+            run, extractor, replay_audio, replay_lengths
+        )
+        for _ in range(2):
+            with run.stream:
+                run.features.fill(cp.nan)
+                run.feature_lengths.fill(INT32_SENTINEL)
+                graph.launch(run.stream)
+
+            run.stream.synchronize()
+
+            np.testing.assert_array_equal(cp.asnumpy(run.features), actual)
+            np.testing.assert_array_equal(
+                cp.asnumpy(run.feature_lengths), actual_lengths
+            )
 
 
 @pytest.mark.parametrize(
@@ -983,37 +1021,22 @@ def test_feature_plugin_rejects_workspace_overflow(plugin_creator) -> None:
     assert serialized_engine is None
 
 
-@pytest.mark.parametrize("invalid_endpoint", ("min", "opt", "max"))
+@pytest.mark.parametrize(
+    "length_batches",
+    (
+        pytest.param((2, 2, 256), id="min"),
+        pytest.param((1, 3, 256), id="opt"),
+        pytest.param((1, 2, 255), id="max"),
+    ),
+)
 def test_feature_plugin_rejects_invalid_profile_endpoints(
-    plugin_creator, invalid_endpoint: str
+    plugin_creator, length_batches: tuple[int, ...]
 ) -> None:
     _, creator = plugin_creator
-    extractor = make_extractor()
-    logger = trt.Logger(trt.Logger.ERROR)
-    builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+    result = build_feature_engine(
+        creator, make_extractor(), PROFILE_SHAPES, length_batches
     )
-    audio = network.add_input("audio", trt.float32, (-1, -1))
-    audio_lengths = network.add_input("audio_lengths", trt.int64, (-1,))
-    assert audio is not None and audio_lengths is not None
-    add_feature_plugin_layer(network, creator, extractor, audio, audio_lengths)
-
-    min_batch, opt_batch, max_batch = (shape[0] for shape in PROFILE_SHAPES)
-    length_batches = {
-        "min": (min_batch + 1, opt_batch, max_batch),
-        "opt": (min_batch, opt_batch + 1, max_batch),
-        "max": (min_batch, opt_batch, max_batch - 1),
-    }[invalid_endpoint]
-    profile = builder.create_optimization_profile()
-    set_profile_shape(profile, "audio", *PROFILE_SHAPES)
-    set_profile_shape(
-        profile, "audio_lengths", *((batch_size,) for batch_size in length_batches)
-    )
-    config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
-    assert config.add_optimization_profile(profile) == 0
-    assert builder.build_serialized_network(network, config) is None
+    assert result is None
 
 
 @pytest.mark.parametrize("missing_name", FIELD_NAMES)

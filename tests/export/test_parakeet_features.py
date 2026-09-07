@@ -333,6 +333,26 @@ def test_silence_normalizes_to_zero(
     assert torch.count_nonzero(features) == 0
 
 
+@pytest.mark.parametrize("num_samples", (4000, 640_000))
+def test_quiet_features_are_centered(
+    feature_extractor: FeatureExtractor, num_samples: int
+) -> None:
+    audio = (
+        torch.randn(1, num_samples, generator=torch.Generator().manual_seed(41)) * 5e-6
+    )
+    features, lengths = feature_extractor(
+        audio, torch.tensor([num_samples], dtype=torch.int64)
+    )
+    assert lengths.tolist() == [num_samples // 160]
+    assert torch.isfinite(features).all()
+    assert torch.count_nonzero(features[:, lengths[0] :]) == 0
+    valid = features[0, : lengths[0]].double()
+    assert valid.abs().max() > 0.05
+    torch.testing.assert_close(
+        valid.mean(dim=0), torch.zeros(16, dtype=torch.float64), rtol=0, atol=2e-5
+    )
+
+
 @pytest.mark.parametrize(
     "declared_length,expected_frames",
     [

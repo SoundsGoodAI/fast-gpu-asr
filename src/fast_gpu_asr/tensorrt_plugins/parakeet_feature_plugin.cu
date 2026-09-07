@@ -289,6 +289,16 @@ __global__ void normalizeFeaturesParallel(float* features, int64_t const* audioL
         return;
     }
 
+    // Center before Welford so updates near the log floor remain representable.
+    // Publish the offset before any thread overwrites the first feature value.
+    __shared__ float offset;
+    if (thread == 0)
+    {
+        offset = logf(
+            features[static_cast<int64_t>(batch) * numFrames * numFeatures + feature] + logEps);
+    }
+    __syncthreads();
+
     int32_t localCount = 0;
     float localMean = 0.0F;
     float localM2 = 0.0F;
@@ -296,7 +306,7 @@ __global__ void normalizeFeaturesParallel(float* features, int64_t const* audioL
     {
         int64_t const index =
             (static_cast<int64_t>(batch) * numFrames + frame) * numFeatures + feature;
-        float const value = logf(features[index] + logEps);
+        float const value = logf(features[index] + logEps) - offset;
         features[index] = value;
         ++localCount;
         float const delta = value - localMean;
@@ -374,9 +384,8 @@ __global__ void normalizeFeaturesCoalesced(float* features, int64_t const* audio
         featureLengths[batch] = length;
     }
 
-    // Production validation guarantees at least two valid frames. Keep the
-    // plugin memory-safe and deterministic if a caller supplies malformed
-    // device-side lengths that TensorRT cannot inspect during shape validation.
+    // Profile padding does not extend a waveform's valid length. Fewer than
+    // two frames cannot define a sample standard deviation, so return zeros.
     for (int32_t feature = thread; feature < numFeatures; feature += blockDim.x)
     {
         if (length < 2)
@@ -390,6 +399,8 @@ __global__ void normalizeFeaturesCoalesced(float* features, int64_t const* audio
             continue;
         }
 
+        float const offset = logf(
+            features[static_cast<int64_t>(batch) * numFrames * numFeatures + feature] + logEps);
         int32_t count = 0;
         float mean = 0.0F;
         float m2 = 0.0F;
@@ -397,7 +408,7 @@ __global__ void normalizeFeaturesCoalesced(float* features, int64_t const* audio
         {
             int64_t const index =
                 (static_cast<int64_t>(batch) * numFrames + frame) * numFeatures + feature;
-            float const value = logf(features[index] + logEps);
+            float const value = logf(features[index] + logEps) - offset;
             features[index] = value;
             ++count;
             float const delta = value - mean;
@@ -450,7 +461,7 @@ class ParakeetFeaturePlugin final : public IPluginV3,
             }
         }
         int const timingCacheLength = std::snprintf(mTimingCacheId.data(), mTimingCacheId.size(),
-            "layout=inplace_fft;normalization=adaptive;frame_shift=%d;"
+            "layout=inplace_fft;normalization=centered;frame_shift=%d;"
             "normalization_switch=%d;preemph=%a;log_eps=%a;eps=%a",
             parameters.frameShift, mCoalescedNormalizationMinBatch,
             static_cast<double>(parameters.preemph), static_cast<double>(parameters.logEps),

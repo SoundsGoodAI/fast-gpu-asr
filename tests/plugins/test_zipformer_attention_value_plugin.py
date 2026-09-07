@@ -25,6 +25,7 @@ pytestmark = pytest.mark.cuda
 PLUGIN_NAME = ZIPFORMER_ATTENTION_VALUE_PLUGIN_NAME
 PLUGIN_VERSION = "1"
 DTYPE_CASES = ("float32", "float16", pytest.param("bfloat16", marks=pytest.mark.sm80))
+PROFILE_SHAPES = ((1, 1), (2, 17), (3, 65))
 
 
 @dataclass(frozen=True)
@@ -163,9 +164,7 @@ def make_plugin(creator: trt.IPluginCreatorV3One, value_heads: int) -> trt.IPlug
 def set_profile_shape(
     profile: trt.IOptimizationProfile,
     name: str,
-    min_shape: tuple[int, ...],
-    opt_shape: tuple[int, ...],
-    max_shape: tuple[int, ...],
+    shapes: tuple[tuple[int, ...], ...],
 ) -> None:
     """Set and read back a profile so rejection tests cannot fail at setup.
 
@@ -175,20 +174,12 @@ def set_profile_shape(
         Profile receiving the bounds, which are read back to verify test setup.
     name : str
         Tensor name used for the optimization profile.
-    min_shape : tuple[int, ...]
-        Minimum input shape.
-    opt_shape : tuple[int, ...]
-        Optimum input shape used during tactic selection.
-    max_shape : tuple[int, ...]
-        Maximum input shape.
+    shapes : tuple[tuple[int, ...], ...]
+        Minimum, optimum, and maximum input shapes.
     """
 
-    profile.set_shape(name, min_shape, opt_shape, max_shape)
-    assert tuple(map(tuple, profile.get_shape(name))) == (
-        min_shape,
-        opt_shape,
-        max_shape,
-    )
+    profile.set_shape(name, *shapes)
+    assert tuple(map(tuple, profile.get_shape(name))) == shapes
 
 
 @pytest.fixture(scope="module", params=DTYPE_CASES)
@@ -200,8 +191,8 @@ def attention_engine(
     Parameters
     ----------
     request : pytest.FixtureRequest
-        Parametrized dtype or layout selected for this module-scoped engine.
-    plugin_creator : tuple
+        Parametrized dtype selected for this module-scoped engine.
+    plugin_creator : PluginCreatorFixture
         Compiled library handles and the registered creator; retained for engine
         lifetime.
 
@@ -235,16 +226,12 @@ def attention_engine(
         set_profile_shape(
             profile,
             case.attention_name,
-            (1, case.attention_heads, 1, 1),
-            (2, case.attention_heads, 17, 17),
-            (3, case.attention_heads, 65, 65),
+            tuple((n, case.attention_heads, t, t) for n, t in PROFILE_SHAPES),
         )
         set_profile_shape(
             profile,
             case.value_name,
-            (1, 1, case.channels),
-            (2, 17, case.channels),
-            (3, 65, case.channels),
+            tuple((n, t, case.channels) for n, t in PROFILE_SHAPES),
         )
 
     config = builder.create_builder_config()
@@ -334,29 +321,33 @@ def reference_attention_value(
     ).reshape(value.shape)
 
 
-def prepare_engine_run(
+def run_engine(
     attention_engine: AttentionEngine,
     host_inputs: dict[str, np.typing.NDArray],
     context: trt.IExecutionContext | None = None,
     stream: cp.cuda.Stream | None = None,
+    execute: bool = True,
 ) -> EngineRun:
-    """Resolve shapes and bind NaN-filled outputs without executing the engine.
+    """Bind NaN-filled outputs and optionally enqueue inference on the upload stream.
 
     Parameters
     ----------
     attention_engine : AttentionEngine
-        Engine, owning runtime, and numeric/layout settings.
+        Engine, owning runtime, and numeric dtype.
     host_inputs : dict[str, np.typing.NDArray]
         Host attention/value arrays indexed by the engine's input binding names.
     context : trt.IExecutionContext or None
         Context to reuse after prior work completes; None creates a fresh context.
     stream : cp.cuda.Stream or None
         Stream ordering uploads and inference; None creates a nonblocking stream.
+    execute : bool
+        False only prepares bindings, allowing buffer replacement or rejection tests.
 
     Returns
     -------
     EngineRun
-        Bound buffers and execution state; no inference has been enqueued.
+        Context, stream, and buffers to retain until pending work completes.
+        The caller must synchronize before reading results or reusing the context.
     """
 
     if context is None:
@@ -381,39 +372,9 @@ def prepare_engine_run(
             )
         for name, buffer in buffers.items():
             assert context.set_tensor_address(name, buffer.data.ptr)
+        if execute:
+            assert context.execute_async_v3(stream.ptr)
     return EngineRun(context, stream, buffers)
-
-
-def run_engine(
-    attention_engine: AttentionEngine,
-    host_inputs: dict[str, np.typing.NDArray],
-    context: trt.IExecutionContext | None = None,
-    stream: cp.cuda.Stream | None = None,
-) -> EngineRun:
-    """Enqueue inference; the caller must synchronize before reading the buffers.
-
-    Parameters
-    ----------
-    attention_engine : AttentionEngine
-        Engine, owning runtime, and numeric/layout settings.
-    host_inputs : dict[str, np.typing.NDArray]
-        Host attention/value arrays indexed by the engine's input binding names.
-    context : trt.IExecutionContext or None
-        Context to reuse after prior work completes; None creates a fresh context.
-    stream : cp.cuda.Stream or None
-        Stream ordering uploads and inference; None creates a nonblocking stream.
-
-    Returns
-    -------
-    EngineRun
-        Run state retaining context, stream, and buffers until pending work
-        completes.
-    """
-
-    run = prepare_engine_run(attention_engine, host_inputs, context, stream)
-    with run.stream:
-        assert run.context.execute_async_v3(run.stream.ptr)
-    return run
 
 
 def assert_run_matches_reference(
@@ -462,7 +423,8 @@ def assert_run_matches_reference(
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "sequence_length"), ((1, 1), (1, 3), (2, 17), (3, 65))
+    ("batch_size", "sequence_length"),
+    ((1, 1), (1, 3), (2, 17), (2, 31), (2, 32), (2, 33), (3, 64), (3, 65)),
 )
 def test_attention_value_plugin_matches_reference(
     attention_engine: AttentionEngine, batch_size: int, sequence_length: int
@@ -508,12 +470,40 @@ def test_attention_value_plugin_accumulates_products_in_fp32(
             values_by_key.reshape(1, 4, 1), (1, 4, case.channels)
         ).copy()
     run = run_engine(attention_engine, inputs)
-    run.stream.synchronize()
+    assert_run_matches_reference(run, attention_engine.dtype, inputs, exact=True)
+
+
+def test_attention_value_plugin_ignores_unused_attention_heads(
+    attention_engine: AttentionEngine,
+) -> None:
+    inputs = make_host_inputs(2, 32, seed=2027)
     for case in LAYER_CASES:
-        np.testing.assert_array_equal(
-            cp.asnumpy(run.buffers[case.output_name]).astype(np.float32),
-            np.full((1, 4, case.channels), 2.0, dtype=np.float32),
-        )
+        if case.value_heads == 1:
+            inputs[case.attention_name][:, 1:] = np.nan
+    run = run_engine(attention_engine, inputs)
+    assert_run_matches_reference(run, attention_engine.dtype, inputs)
+
+
+def test_attention_value_plugin_supports_aligned_offset_bindings(
+    attention_engine: AttentionEngine,
+) -> None:
+    inputs = make_host_inputs(2, 32, seed=2028)
+    run = run_engine(attention_engine, inputs, execute=False)
+    guarded = []
+    with run.stream:
+        for name, original in run.buffers.items():
+            offset = 256 // original.dtype.itemsize
+            allocation = cp.full(original.size + 2 * offset, -37, original.dtype)
+            view = allocation[offset:-offset].reshape(original.shape)
+            assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+            cp.copyto(view, original)
+            run.buffers[name] = view
+            assert run.context.set_tensor_address(name, view.data.ptr)
+            guarded.extend((allocation[:offset], allocation[-offset:]))
+        assert run.context.execute_async_v3(run.stream.ptr)
+    assert_run_matches_reference(run, attention_engine.dtype, inputs)
+    for guard in guarded:
+        cp.testing.assert_array_equal(guard, -37)
 
 
 def test_attention_value_plugin_supports_cuda_graph_replay(
@@ -539,6 +529,20 @@ def test_attention_value_plugin_supports_cuda_graph_replay(
                 run.buffers[case.output_name].fill(cp.nan)
             graph.launch(run.stream)
         assert_run_matches_reference(run, attention_engine.dtype, inputs)
+        expected = {
+            case.output_name: cp.asnumpy(run.buffers[case.output_name])
+            for case in LAYER_CASES
+        }
+        for _ in range(2):
+            with run.stream:
+                for case in LAYER_CASES:
+                    run.buffers[case.output_name].fill(cp.nan)
+                graph.launch(run.stream)
+
+            run.stream.synchronize()
+
+            for name, output in expected.items():
+                np.testing.assert_array_equal(cp.asnumpy(run.buffers[name]), output)
 
 
 def test_attention_value_plugin_reuses_context_across_shapes_and_streams(
@@ -564,6 +568,15 @@ def test_attention_value_plugin_supports_concurrent_contexts(
     second = run_engine(attention_engine, second_inputs)
     assert first.context is not second.context
     assert first.stream.ptr != second.stream.ptr
+
+    for run in (first, second):
+        run.stream.synchronize()
+    for run in (first, second):
+        with run.stream:
+            for case in LAYER_CASES:
+                run.buffers[case.output_name].fill(cp.nan)
+            assert run.context.execute_async_v3(run.stream.ptr)
+
     assert_run_matches_reference(first, attention_engine.dtype, first_inputs)
     assert_run_matches_reference(second, attention_engine.dtype, second_inputs)
 
@@ -580,7 +593,8 @@ def test_attention_value_plugin_rejects_runtime_shape_mismatch(
         inputs[case.value_name] = inputs[case.value_name][:, :16]
     else:
         inputs[case.attention_name] = inputs[case.attention_name][..., :16]
-    run = prepare_engine_run(attention_engine, inputs)
+
+    run = run_engine(attention_engine, inputs, execute=False)
     with run.stream:
         executed = run.context.execute_async_v3(run.stream.ptr)
     run.stream.synchronize()
@@ -663,7 +677,7 @@ def build_contract(
     if profiles:
         profile = builder.create_optimization_profile()
         for tensor, shapes in zip(inputs, profiles, strict=True):
-            set_profile_shape(profile, tensor.name, *shapes)
+            set_profile_shape(profile, tensor.name, shapes)
         assert config.add_optimization_profile(profile) == 0
     return builder.build_serialized_network(network, config)
 
@@ -754,8 +768,8 @@ def test_attention_value_plugin_accepts_valid_profile(
     _, creator = plugin_creator
     specs = attention_value_input_specs((-1, 4, -1, -1), (-1, -1, 48))
     profiles = (
-        ((1, 4, 1, 1), (2, 4, 17, 17), (3, 4, 65, 65)),
-        ((1, 1, 48), (2, 17, 48), (3, 65, 48)),
+        tuple((n, 4, t, t) for n, t in PROFILE_SHAPES),
+        tuple((n, t, 48) for n, t in PROFILE_SHAPES),
     )
     assert build_contract(creator, 4, specs, profiles) is not None
 
@@ -766,8 +780,8 @@ def test_attention_value_plugin_rejects_invalid_profile_endpoints(
     plugin_creator: PluginCreatorFixture, endpoint: int, relationship: str
 ) -> None:
     _, creator = plugin_creator
-    attention_shapes = [[1, 4, 1, 1], [2, 4, 17, 17], [3, 4, 65, 65]]
-    value_shapes = [[1, 1, 48], [2, 17, 48], [3, 65, 48]]
+    attention_shapes = [[n, 4, t, t] for n, t in PROFILE_SHAPES]
+    value_shapes = [[n, t, 48] for n, t in PROFILE_SHAPES]
     # Keep each input's profile monotonic; only the shape relationship is invalid.
     if relationship == "non-square-attention":
         attention_shapes[endpoint][3] += 1 if endpoint < 2 else -1
@@ -820,34 +834,23 @@ def test_attention_value_timing_cache_depends_on_head_layout(
 
 
 @pytest.mark.parametrize(
-    ("values", "field_type"),
+    "values",
     (
-        pytest.param(
-            np.array([1.0], dtype=np.float32),
-            trt.PluginFieldType.FLOAT32,
-            id="wrong-type",
-        ),
-        pytest.param(
-            np.array([], dtype=np.int32), trt.PluginFieldType.INT32, id="empty"
-        ),
-        pytest.param(
-            np.array([1, 4], dtype=np.int32), trt.PluginFieldType.INT32, id="multiple"
-        ),
-        pytest.param(
-            np.array([0], dtype=np.int32), trt.PluginFieldType.INT32, id="zero"
-        ),
-        pytest.param(
-            np.array([-1], dtype=np.int32), trt.PluginFieldType.INT32, id="negative"
-        ),
+        pytest.param(np.array([1.0], dtype=np.float32), id="wrong-type"),
+        pytest.param(np.array([], dtype=np.int32), id="empty"),
+        pytest.param(np.array([1, 4], dtype=np.int32), id="multiple"),
+        pytest.param(np.array([0], dtype=np.int32), id="zero"),
+        pytest.param(np.array([-1], dtype=np.int32), id="negative"),
     ),
 )
 def test_attention_value_creator_rejects_malformed_num_heads(
     plugin_creator: PluginCreatorFixture,
     values: np.typing.NDArray,
-    field_type: trt.PluginFieldType,
 ) -> None:
     _, creator = plugin_creator
-    field = trt.PluginField("num_heads", values, field_type)
+    field = trt.PluginField(
+        "num_heads", values, getattr(trt.PluginFieldType, values.dtype.name.upper())
+    )
     plugin = creator.create_plugin(
         PLUGIN_NAME, trt.PluginFieldCollection([field]), trt.TensorRTPhase.BUILD
     )
@@ -873,6 +876,7 @@ def test_attention_value_creator_validates_field_collection(
     valid: bool,
 ) -> None:
     _, creator = plugin_creator
+    # TensorRT's field collection does not retain the NumPy backing arrays.
     values = [np.array([value], dtype=np.int32) for _, value in field_specs]
     fields = trt.PluginFieldCollection(
         [

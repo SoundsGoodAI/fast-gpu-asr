@@ -27,8 +27,10 @@ namespace
 // Fuse padding suppression, depthwise convolution, and Swoosh-R in one
 // Zipformer convolution branch. Inputs and output use contiguous NTC storage;
 // the exporter stores the depthwise weights as (kernel, channel). Valid lengths
-// suppress the padded input suffix before convolution, matching the PyTorch
-// validity-mask multiplication. Output frames are intentionally not re-masked.
+// zero the padded input suffix before convolution. All kernels evaluate zero
+// padding too, so non-finite coefficients propagate consistently across tactics.
+// Output frames are intentionally not re-masked. FP32 accumulates in FP32;
+// packed FP16/BF16 FMAs round after each tap, followed by Swoosh-R in FP32.
 constexpr char const* kPluginName = "zipformer_convolution";
 constexpr char const* kPluginVersion = "1";
 constexpr int32_t kInputCount = 4;
@@ -174,19 +176,20 @@ __global__ void zipformerConvolutionFloat4(float const* __restrict__ x,
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
         {
             int64_t const inputFrame = static_cast<int64_t>(frame) + kernel - padding;
+            float4 inputValue{};
             if (inputFrame >= 0 && inputFrame < validLength)
             {
                 int64_t const inputIndex =
                     (static_cast<int64_t>(batch) * sequenceLength + inputFrame) * numChannels
                     + channel;
-                float4 const inputValue = *reinterpret_cast<float4 const*>(x + inputIndex);
-                float4 const weightValue = *reinterpret_cast<float4 const*>(
-                    weight + static_cast<int64_t>(kernel) * numChannels + channel);
-                value.x = fmaf(inputValue.x, weightValue.x, value.x);
-                value.y = fmaf(inputValue.y, weightValue.y, value.y);
-                value.z = fmaf(inputValue.z, weightValue.z, value.z);
-                value.w = fmaf(inputValue.w, weightValue.w, value.w);
+                inputValue = *reinterpret_cast<float4 const*>(x + inputIndex);
             }
+            float4 const weightValue = *reinterpret_cast<float4 const*>(
+                weight + static_cast<int64_t>(kernel) * numChannels + channel);
+            value.x = fmaf(inputValue.x, weightValue.x, value.x);
+            value.y = fmaf(inputValue.y, weightValue.y, value.y);
+            value.z = fmaf(inputValue.z, weightValue.z, value.z);
+            value.w = fmaf(inputValue.w, weightValue.w, value.w);
         }
         value.x = swooshR(value.x);
         value.y = swooshR(value.y);
@@ -309,16 +312,17 @@ __global__ void zipformerConvolutionPair(T const* __restrict__ x,
         for (int32_t kernel = 0; kernel < kernelSize; ++kernel)
         {
             int64_t const inputFrame = static_cast<int64_t>(frame) + kernel - padding;
+            Pair inputValue{};
             if (inputFrame >= 0 && inputFrame < validLength)
             {
                 int64_t const inputIndex =
                     (static_cast<int64_t>(batch) * sequenceLength + inputFrame) * numChannels
                     + channel;
-                Pair const inputValue = *reinterpret_cast<Pair const*>(x + inputIndex);
-                Pair const weightValue = *reinterpret_cast<Pair const*>(
-                    weight + static_cast<int64_t>(kernel) * numChannels + channel);
-                value = Ops::fma(inputValue, weightValue, value);
+                inputValue = *reinterpret_cast<Pair const*>(x + inputIndex);
             }
+            Pair const weightValue = *reinterpret_cast<Pair const*>(
+                weight + static_cast<int64_t>(kernel) * numChannels + channel);
+            value = Ops::fma(inputValue, weightValue, value);
         }
         *reinterpret_cast<Pair*>(output + frameIndex * numChannels + channel) =
             swooshRPair<T>(value);
@@ -716,8 +720,9 @@ class ZipformerConvolutionPlugin final : public IPluginV3,
     {
         // The plugin has no configurable fields. TensorRT still includes the
         // concrete input profile in its timing key, so equivalent Zipformer
-        // layers can share results without conflating different shapes.
-        return kPluginName;
+        // layers can share results without conflating different shapes. Version
+        // the key when changing the kernels' zero-padding arithmetic.
+        return "zipformer_convolution_zero_padding_v2";
     }
 
     int32_t onShapeChange(PluginTensorDesc const* inputs, int32_t nbInputs,

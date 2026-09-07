@@ -627,6 +627,8 @@ class ZipformerFeaturePlugin final : public IPluginV3,
         mPlanLength = 0;
         mCufftStream = nullptr;
         mCublasWorkspace = nullptr;
+        // Captured graphs must be discarded before replacing this plan: cuFFT
+        // owns scratch referenced by its captured kernels.
         // A cuFFT plan fixes both transform length and batch count. Construct a
         // replacement before publishing its dimensions; a failed plan therefore
         // cannot be mistaken for a valid cached plan by enqueue().

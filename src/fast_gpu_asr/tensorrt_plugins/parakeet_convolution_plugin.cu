@@ -28,6 +28,8 @@ namespace
 // NTC storage; weights are folded by the exporter and stored as (kernel, channel).
 // Valid lengths zero the padded input suffix before convolution, matching the
 // PyTorch masked-fill behavior; output frames are intentionally not re-masked.
+// Folded weights must be finite: skipping a padded zero product is not
+// equivalent to evaluating 0 * weight when that weight is NaN or infinity.
 constexpr char const* kPluginName = "parakeet_conformer_convolution";
 constexpr char const* kPluginVersion = "1";
 constexpr int32_t kInputCount = 4;
@@ -144,9 +146,9 @@ __global__ void parakeetConformerConvolutionFloat4(float const* __restrict__ x,
                 value.w = fmaf(inputValue.w, weightValue.w, value.w);
             }
         }
-        // The convolution accumulates in its storage dtype to preserve the
-        // TensorRT engine's selected precision. SiLU is evaluated in float for
-        // the packed low-precision paths below before converting once at store.
+        // Accumulation deliberately uses storage precision, including each
+        // packed FP16/BF16 FMA below. Intermediate sums can round or overflow
+        // before SiLU, which is evaluated in FP32 and rounded at store.
         value.x /= 1.0F + __expf(-value.x);
         value.y /= 1.0F + __expf(-value.y);
         value.z /= 1.0F + __expf(-value.z);

@@ -284,9 +284,9 @@ class ZipformerModifiedBeamSearchDecoder:
             )
             for launch in (self.register_beam_search, self.shared_beam_search):
                 if launch is not None and launch[1] > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
-                    launch[0].max_dynamic_shared_size_bytes = (
-                        self.device.attributes["MaxSharedMemoryPerBlockOptin"]
-                    )
+                    launch[0].max_dynamic_shared_size_bytes = self.device.attributes[
+                        "MaxSharedMemoryPerBlockOptin"
+                    ]
 
             # Register-local candidate lists favor small grids. Once roughly half
             # the SMs have work, shared candidates preserve occupancy more reliably.

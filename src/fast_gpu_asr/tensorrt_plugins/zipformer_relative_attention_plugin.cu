@@ -34,7 +34,7 @@ constexpr char const* kPluginVersion = "1";
 constexpr int32_t kInputCount = 3;
 constexpr int32_t kOutputCount = 1;
 constexpr char const* kTimingCacheId =
-    "layout=ntc;position_head_dim=4;padded_query_halo=7;softmax=v1";
+    "layout=ntc;position_head_dim=4;padded_query_halo=7;softmax=v2";
 constexpr size_t kCublasWorkspaceBytes = 16U << 20;
 constexpr int32_t kPositionHeadDim = 4;
 constexpr int32_t kPaddedQueryHalo = 7;
@@ -369,9 +369,12 @@ __global__ void softmaxBlockGeneric(T const* projection, T const* position, bool
                                         + query01.y * position01.y + query23.x * position23.x
                                         + query23.y * position23.y
                                   : -FLT_MAX;
-        scores[scoreBase + key] = fromFloat<T>(value);
+        T const stored = fromFloat<T>(value);
+        scores[scoreBase + key] = stored;
+        // Subtract the maximum of the stored logits. Rounding upward can
+        // otherwise make exp(stored - maximum) overflow for finite FP16/BF16 inputs.
         if (valid)
-            maximum = fmaxf(maximum, value);
+            maximum = fmaxf(maximum, toFloat(stored));
     }
     // Keep the two reductions in separate shared arrays. Reusing one array
     // would let a fast warp begin the sum reduction while another warp still

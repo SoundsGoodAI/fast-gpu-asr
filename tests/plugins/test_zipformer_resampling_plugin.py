@@ -23,7 +23,6 @@ from fast_gpu_asr.constants import (
 
 pytestmark = pytest.mark.cuda
 
-
 DOWNSAMPLE_NAME = ZIPFORMER_DOWNSAMPLE_PLUGIN_NAME
 UPSAMPLE_NAME = ZIPFORMER_UPSAMPLE_BYPASS_PLUGIN_NAME
 PLUGIN_VERSION = "1"
@@ -88,18 +87,14 @@ def plugin_creators(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorsF
     )
 
     registry = trt.get_builder_plugin_registry(trt.EngineCapability.STANDARD)
-    downsample_creator = registry.get_creator(
-        DOWNSAMPLE_NAME, PLUGIN_VERSION, TENSORRT_PLUGIN_NAMESPACE
-    )
-    upsample_creator = registry.get_creator(
-        UPSAMPLE_NAME, PLUGIN_VERSION, TENSORRT_PLUGIN_NAMESPACE
-    )
-    assert downsample_creator is not None
-    assert upsample_creator is not None
-    return library, {
-        DOWNSAMPLE_NAME: downsample_creator,
-        UPSAMPLE_NAME: upsample_creator,
+    creators = {
+        name: registry.get_creator(name, PLUGIN_VERSION, TENSORRT_PLUGIN_NAMESPACE)
+        for name in (DOWNSAMPLE_NAME, UPSAMPLE_NAME)
     }
+
+    assert all(creator is not None for creator in creators.values())
+
+    return library, creators
 
 
 def make_plugin(creator: trt.IPluginCreatorV3One, factor: int) -> trt.IPluginV3:
@@ -127,7 +122,13 @@ def make_plugin(creator: trt.IPluginCreatorV3One, factor: int) -> trt.IPluginV3:
     return plugin
 
 
-def set_profile_shape(profile, name, minimum, optimum, maximum) -> None:
+def set_profile_shape(
+    profile: trt.IOptimizationProfile,
+    name: str,
+    minimum: tuple[int, ...],
+    optimum: tuple[int, ...],
+    maximum: tuple[int, ...],
+) -> None:
     """Verify profile bounds without relying on set_shape's version-dependent return.
 
     Parameters
@@ -145,9 +146,7 @@ def set_profile_shape(profile, name, minimum, optimum, maximum) -> None:
     """
 
     profile.set_shape(name, minimum, optimum, maximum)
-    assert tuple(map(tuple, profile.get_shape(name))) == tuple(
-        map(tuple, (minimum, optimum, maximum))
-    )
+    assert tuple(map(tuple, profile.get_shape(name))) == (minimum, optimum, maximum)
 
 
 @pytest.fixture(scope="module", params=DTYPE_CASES, ids=lambda case: case.name)
@@ -205,22 +204,17 @@ def resampling_engine(
                 [],
                 make_plugin(creators[DOWNSAMPLE_NAME], factor),
             )
-            assert downsample is not None
-            downsample_output = downsample.get_output(0)
-            downsample_output.name = f"down_{case_name}_{factor}"
-            network.mark_output(downsample_output)
-            output_names.append(downsample_output.name)
-
             upsample = network.add_plugin_v3(
                 [inputs[input_name], inputs[later_name], inputs[scale_name]],
                 [],
                 make_plugin(creators[UPSAMPLE_NAME], factor),
             )
-            assert upsample is not None
-            upsample_output = upsample.get_output(0)
-            upsample_output.name = f"up_{case_name}_{factor}"
-            network.mark_output(upsample_output)
-            output_names.append(upsample_output.name)
+            for layer, operation in ((downsample, "down"), (upsample, "up")):
+                assert layer is not None
+                output = layer.get_output(0)
+                output.name = f"{operation}_{case_name}_{factor}"
+                network.mark_output(output)
+                output_names.append(output.name)
 
     profile = builder.create_optimization_profile()
     for case_name, channels in CHANNEL_CASES.items():
@@ -250,14 +244,13 @@ def resampling_engine(
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(serialized_engine)
     assert engine is not None
-    expected_io = {
-        **{name: (trt.TensorIOMode.INPUT, dtype) for name in inputs},
-        **{name: (trt.TensorIOMode.OUTPUT, dtype) for name in output_names},
-    }
+    expected_io = dict.fromkeys(inputs, trt.TensorIOMode.INPUT) | dict.fromkeys(
+        output_names, trt.TensorIOMode.OUTPUT
+    )
     assert engine.num_io_tensors == len(expected_io)
-    for name, (mode, tensor_dtype) in expected_io.items():
+    for name, mode in expected_io.items():
         assert engine.get_tensor_mode(name) == mode
-        assert engine.get_tensor_dtype(name) == tensor_dtype
+        assert engine.get_tensor_dtype(name) == dtype
     return ResamplingEngine(runtime, engine, tuple(output_names), dtype_case)
 
 
@@ -465,37 +458,32 @@ def run_engine(
                 size=(batch_size, later_length, channels)
             ).astype(np.float32)
 
-    if input_overrides is not None:
-        unknown_names = input_overrides.keys() - host_inputs.keys()
-        assert not unknown_names
-        for name, values in input_overrides.items():
-            assert values.shape == host_inputs[name].shape
-            host_inputs[name] = np.array(values, dtype=np.float32, copy=True)
+    for name, values in (input_overrides or {}).items():
+        assert name in host_inputs
+        assert values.shape == host_inputs[name].shape
+        host_inputs[name] = np.array(values, dtype=np.float32, copy=True)
 
     if context is None:
         context = engine.create_execution_context()
+
     assert context is not None
-    for case_name in CHANNEL_CASES:
-        assert context.set_input_shape(
-            f"input_{case_name}", host_inputs[f"input_{case_name}"].shape
-        )
-        for factor in FACTORS:
-            name = f"later_{case_name}_{factor}"
-            assert context.set_input_shape(name, host_inputs[name].shape)
+
+    for name, values in host_inputs.items():
+        if values.ndim == 3:
+            assert context.set_input_shape(name, values.shape)
+
     assert context.infer_shapes() == []
 
-    for case_name, channels in CHANNEL_CASES.items():
+    for case_name in CHANNEL_CASES:
         for factor in FACTORS:
-            assert tuple(context.get_tensor_shape(f"down_{case_name}_{factor}")) == (
-                batch_size,
-                (sequence_length + factor - 1) // factor,
-                channels,
-            )
-            assert tuple(context.get_tensor_shape(f"up_{case_name}_{factor}")) == (
-                batch_size,
-                sequence_length,
-                channels,
-            )
+            expected_shapes = {
+                f"down_{case_name}_{factor}": host_inputs[
+                    f"later_{case_name}_{factor}"
+                ].shape,
+                f"up_{case_name}_{factor}": host_inputs[f"input_{case_name}"].shape,
+            }
+            for name, shape in expected_shapes.items():
+                assert tuple(context.get_tensor_shape(name)) == shape, name
 
     if stream is None:
         stream = cp.cuda.Stream(non_blocking=True)
@@ -572,10 +560,7 @@ def test_resampling_plugins_repeat_boundary_frames(
         input_overrides[f"scale_{case_name}"] = scale
 
     run = run_engine(
-        resampling_engine,
-        batch_size=1,
-        sequence_length=sequence_length,
-        input_overrides=input_overrides,
+        resampling_engine, 1, sequence_length, input_overrides=input_overrides
     )
 
     for case_name in CHANNEL_CASES:
@@ -583,13 +568,13 @@ def test_resampling_plugins_repeat_boundary_frames(
             cp.asnumpy(run.device_outputs[f"down_{case_name}_{factor}"]).astype(
                 np.float32
             )[0, :, 0],
-            np.array((85.0, 240.0), dtype=np.float32),
+            (85.0, 240.0),
         )
         np.testing.assert_array_equal(
             cp.asnumpy(run.device_outputs[f"up_{case_name}_{factor}"]).astype(
                 np.float32
             )[0, :, 1],
-            np.array((3.0, 3.0, 3.0, 3.0, 7.0), dtype=np.float32),
+            (3.0, 3.0, 3.0, 3.0, 7.0),
         )
 
 
@@ -615,10 +600,7 @@ def test_resampling_plugins_use_fp32_intermediates(
         input_overrides[f"later_{case_name}_{factor}"] = later
 
     run = run_engine(
-        resampling_engine,
-        batch_size=1,
-        sequence_length=sequence_length,
-        input_overrides=input_overrides,
+        resampling_engine, 1, sequence_length, input_overrides=input_overrides
     )
 
     for case_name in CHANNEL_CASES:
@@ -626,14 +608,82 @@ def test_resampling_plugins_use_fp32_intermediates(
             cp.asnumpy(run.device_outputs[f"down_{case_name}_{factor}"]).astype(
                 np.float32
             )[0, :, 0],
-            np.array([4.0], dtype=np.float32),
+            (4.0,),
         )
         np.testing.assert_array_equal(
             cp.asnumpy(run.device_outputs[f"up_{case_name}_{factor}"]).astype(
                 np.float32
             )[0, :, 1],
-            np.full(sequence_length, -0.5, dtype=np.float32),
+            -0.5,
         )
+
+
+@pytest.mark.parametrize("nonfinite", (False, True), ids=("finite", "nonfinite"))
+def test_resampling_scalar_and_packed_paths_agree(
+    resampling_engine: ResamplingEngine, nonfinite: bool
+) -> None:
+    run = run_engine(resampling_engine, 2, 17)
+    channels = CHANNEL_CASES["odd_multiblock"]
+    for name, values in run.inputs.items():
+        if "even_multiblock" in name:
+            if nonfinite:
+                values[..., :3] = (np.nan, np.inf, -np.inf)
+                values[..., channels] = np.nan
+            odd_name = name.replace("even_multiblock", "odd_multiblock")
+            run.inputs[odd_name][...] = values[..., :channels]
+    if nonfinite:
+        run.inputs["weights_3"][1] = np.nan
+        run.inputs["weights_4"][1] = np.inf
+
+    with run.stream:
+        for name, values in run.inputs.items():
+            device = run.device_inputs[name]
+            cp.copyto(device, cp.asarray(values, dtype=device.dtype))
+        for output in run.device_outputs.values():
+            # A missing write must not pass an expected-NaN comparison.
+            output.fill(123.0)
+        assert run.context.execute_async_v3(run.stream.ptr)
+    run.stream.synchronize()
+
+    with np.errstate(invalid="ignore"):
+        assert_resampling_outputs_match_reference(run, resampling_engine.dtype_case)
+    for operation in ("down", "up"):
+        for factor in FACTORS:
+            even = cp.asnumpy(
+                run.device_outputs[f"{operation}_even_multiblock_{factor}"]
+            )
+            odd = cp.asnumpy(run.device_outputs[f"{operation}_odd_multiblock_{factor}"])
+            np.testing.assert_array_equal(
+                even[..., :channels].astype(np.float32),
+                odd.astype(np.float32),
+                err_msg=f"{operation}, factor={factor}",
+            )
+
+
+def test_resampling_plugins_support_aligned_offset_bindings(
+    resampling_engine: ResamplingEngine,
+) -> None:
+    run = run_engine(resampling_engine, 2, 17)
+    guards = []
+    with run.stream:
+        for bindings in (run.device_inputs, run.device_outputs):
+            for name, device in bindings.items():
+                # TensorRT bindings require 256-byte alignment, including slices.
+                offset = 256 // device.itemsize
+                storage = cp.full(device.size + 2 * offset, 123.0, dtype=device.dtype)
+                view = storage[offset : offset + device.size].reshape(device.shape)
+                assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+                if name in run.device_inputs:
+                    cp.copyto(view, device)
+                assert run.context.set_tensor_address(name, view.data.ptr)
+                bindings[name] = view
+                guards.extend((storage[:offset], storage[storage.size - offset :]))
+        assert run.context.execute_async_v3(run.stream.ptr)
+    run.stream.synchronize()
+
+    assert_resampling_outputs_match_reference(run, resampling_engine.dtype_case)
+    for guard in guards:
+        cp.testing.assert_array_equal(guard, 123.0)
 
 
 def test_resampling_plugins_support_cuda_graphs(
@@ -662,6 +712,22 @@ def test_resampling_plugins_support_cuda_graphs(
         run.stream.synchronize()
         assert_resampling_outputs_match_reference(run, resampling_engine.dtype_case)
 
+        expected = {
+            name: cp.asnumpy(output).view(np.uint8)
+            for name, output in run.device_outputs.items()
+        }
+        with run.stream:
+            for output in run.device_outputs.values():
+                output.fill(np.nan)
+            graph.launch(run.stream)
+
+        run.stream.synchronize()
+
+        for name, output in run.device_outputs.items():
+            np.testing.assert_array_equal(
+                cp.asnumpy(output).view(np.uint8), expected[name], err_msg=name
+            )
+
 
 def test_resampling_plugins_reuse_context_across_dynamic_shapes(
     resampling_engine: ResamplingEngine,
@@ -671,13 +737,12 @@ def test_resampling_plugins_reuse_context_across_dynamic_shapes(
     stream = cp.cuda.Stream(non_blocking=True)
 
     for batch_size, sequence_length in ((1, 1), (2, 17), (1, 5), (3, 65), (2, 6)):
-        run_engine(
-            resampling_engine,
-            batch_size,
-            sequence_length,
-            context=context,
-            stream=stream,
+        run = run_engine(
+            resampling_engine, batch_size, sequence_length, context, stream
         )
+
+        assert run.context is context
+        assert run.stream is stream
 
 
 def test_resampling_plugins_support_concurrent_contexts(
@@ -782,21 +847,24 @@ def test_resampling_creators_ignore_unknown_fields(
     assert (plugin is not None) is include_factor
 
 
-def build_static_contract(
+def build_contract(
     creator: trt.IPluginCreatorV3One,
     shapes: tuple[tuple[int, ...], ...],
     dtypes: tuple[trt.DataType, ...] | None = None,
+    profiles: dict[int, tuple[tuple[int, ...], ...]] | None = None,
 ) -> trt.IHostMemory | None:
-    """Attempt to build a static factor-two plugin, defaulting to FP16 inputs.
+    """Build a factor-two contract with optional profiles and FP16 default inputs.
 
     Parameters
     ----------
     creator : trt.IPluginCreatorV3One
         Registered creator used to construct the plugin under test.
     shapes : tuple[tuple[int, ...], ...]
-        Static input shapes in plugin binding order.
+        Input shapes in plugin binding order; use -1 for profiled dimensions.
     dtypes : tuple[trt.DataType, ...] or None
         Input dtypes in binding order; None selects this helper's default contract.
+    profiles : dict[int, tuple[tuple[int, ...], ...]] or None
+        Input indices mapped to min/opt/max shapes; None selects a static contract.
 
     Returns
     -------
@@ -825,6 +893,13 @@ def build_static_contract(
     network.mark_output(output)
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 28)
+
+    if profiles:
+        profile = builder.create_optimization_profile()
+        for index, bounds in profiles.items():
+            set_profile_shape(profile, inputs[index].name, *bounds)
+        assert config.add_optimization_profile(profile) == 0
+
     return builder.build_serialized_network(network, config)
 
 
@@ -853,7 +928,7 @@ def test_downsample_static_contracts(
     valid: bool,
 ) -> None:
     _, creators = plugin_creators
-    serialized = build_static_contract(creators[DOWNSAMPLE_NAME], shapes)
+    serialized = build_contract(creators[DOWNSAMPLE_NAME], shapes)
     assert (serialized is not None) is valid
 
 
@@ -893,7 +968,7 @@ def test_upsample_static_contracts(
     valid: bool,
 ) -> None:
     _, creators = plugin_creators
-    serialized = build_static_contract(creators[UPSAMPLE_NAME], shapes)
+    serialized = build_contract(creators[UPSAMPLE_NAME], shapes)
     assert (serialized is not None) is valid
 
 
@@ -934,7 +1009,23 @@ def test_resampling_plugins_reject_invalid_dtypes(
         if plugin_name == DOWNSAMPLE_NAME
         else ((2, 5, 7), (2, 3, 7), (7,))
     )
-    assert build_static_contract(creators[plugin_name], shapes, dtypes) is None
+    assert build_contract(creators[plugin_name], shapes, dtypes) is None
+
+
+def test_upsample_plugin_accepts_valid_profile(
+    plugin_creators: PluginCreatorsFixture,
+) -> None:
+    _, creators = plugin_creators
+    profiles = {
+        0: ((1, 1, 7), (2, 17, 7), (3, 65, 7)),
+        1: ((1, 1, 7), (2, 9, 7), (3, 33, 7)),
+    }
+    assert (
+        build_contract(
+            creators[UPSAMPLE_NAME], ((-1, -1, 7), (-1, -1, 7), (7,)), profiles=profiles
+        )
+        is not None
+    )
 
 
 @pytest.mark.parametrize("invalid_endpoint", (0, 1, 2), ids=("min", "opt", "max"))
@@ -946,35 +1037,21 @@ def test_upsample_plugin_rejects_invalid_profile_endpoints(
 ) -> None:
     _, creators = plugin_creators
     channels = 7
-    logger = trt.Logger(trt.Logger.ERROR)
-    builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
-    )
-    early = network.add_input("early", trt.float16, (-1, -1, channels))
-    later = network.add_input("later", trt.float16, (-1, -1, channels))
-    scale = network.add_input("scale", trt.float16, (channels,))
-    assert all(tensor is not None for tensor in (early, later, scale))
-    layer = network.add_plugin_v3(
-        [early, later, scale], [], make_plugin(creators[UPSAMPLE_NAME], factor=2)
-    )
-    assert layer is not None
-    output = layer.get_output(0)
-    output.name = "output"
-    network.mark_output(output)
-
     later_shapes = [[1, 1, channels], [2, 9, channels], [3, 33, channels]]
     axis = 0 if invalid_relationship == "batch" else 1
     later_shapes[invalid_endpoint][axis] += 1 if invalid_endpoint == 0 else -1
-    profile = builder.create_optimization_profile()
-    set_profile_shape(
-        profile, "early", (1, 1, channels), (2, 17, channels), (3, 65, channels)
+    profiles = {
+        0: ((1, 1, channels), (2, 17, channels), (3, 65, channels)),
+        1: tuple(map(tuple, later_shapes)),
+    }
+    assert (
+        build_contract(
+            creators[UPSAMPLE_NAME],
+            ((-1, -1, channels), (-1, -1, channels), (channels,)),
+            profiles=profiles,
+        )
+        is None
     )
-    set_profile_shape(profile, "later", *later_shapes)
-    config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 28)
-    assert config.add_optimization_profile(profile) == 0
-    assert builder.build_serialized_network(network, config) is None
 
 
 @pytest.mark.parametrize("plugin_name", (DOWNSAMPLE_NAME, UPSAMPLE_NAME))
@@ -1045,13 +1122,11 @@ def test_resampling_plugins_match_reference_with_folded_constants(
         [],
         make_plugin(creators[UPSAMPLE_NAME], factor),
     )
-    assert downsample is not None and upsample is not None
-    downsample_output = downsample.get_output(0)
-    downsample_output.name = "constant_down"
-    network.mark_output(downsample_output)
-    upsample_output = upsample.get_output(0)
-    upsample_output.name = "constant_up"
-    network.mark_output(upsample_output)
+    for layer, name in ((downsample, "constant_down"), (upsample, "constant_up")):
+        assert layer is not None
+        output = layer.get_output(0)
+        output.name = name
+        network.mark_output(output)
 
     profile = builder.create_optimization_profile()
     set_profile_shape(
@@ -1074,15 +1149,15 @@ def test_resampling_plugins_match_reference_with_folded_constants(
     engine = runtime.deserialize_cuda_engine(serialized_engine)
     assert engine is not None
     expected_io = {
-        "constant_early": (trt.TensorIOMode.INPUT, dtype),
-        "constant_later": (trt.TensorIOMode.INPUT, dtype),
-        "constant_down": (trt.TensorIOMode.OUTPUT, dtype),
-        "constant_up": (trt.TensorIOMode.OUTPUT, dtype),
+        "constant_early": trt.TensorIOMode.INPUT,
+        "constant_later": trt.TensorIOMode.INPUT,
+        "constant_down": trt.TensorIOMode.OUTPUT,
+        "constant_up": trt.TensorIOMode.OUTPUT,
     }
     assert engine.num_io_tensors == len(expected_io)
-    for name, (mode, tensor_dtype) in expected_io.items():
+    for name, mode in expected_io.items():
         assert engine.get_tensor_mode(name) == mode
-        assert engine.get_tensor_dtype(name) == tensor_dtype
+        assert engine.get_tensor_dtype(name) == dtype
 
     rng = np.random.default_rng(20260901)
     early_source = rng.normal(size=(2, 17, channels)).astype(np.float32)

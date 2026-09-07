@@ -42,6 +42,9 @@ SHAPE_CASES = (
 
 type CuPyDType = type[np.generic] | np.dtype[np.generic]
 type InputSpec = tuple[trt.DataType, tuple[int, ...]]
+type HostInputs = tuple[
+    np.typing.NDArray, np.typing.NDArray, np.typing.NDArray, np.typing.NDArray
+]
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,22 @@ ENGINE_CASES = (
         ),
         marks=pytest.mark.sm80,
         id="bf16",
+    ),
+)
+VECTOR_LAYOUT_CASES = (
+    EngineCase("fp32-vector-boundary", trt.float32, cp.float32, 4, 1, FP32_TOLERANCE),
+    EngineCase("fp16-vector-boundary", trt.float16, cp.float16, 2, 1, FP16_TOLERANCE),
+    pytest.param(
+        EngineCase(
+            "bf16-vector-boundary",
+            trt.bfloat16,
+            cp.dtype("bfloat16"),
+            2,
+            1,
+            BF16_TOLERANCE,
+        ),
+        marks=pytest.mark.sm80,
+        id="bf16-vector-boundary",
     ),
 )
 ADDITIONAL_LAYOUT_CASES = (
@@ -110,20 +129,7 @@ ADDITIONAL_LAYOUT_CASES = (
         marks=pytest.mark.sm80,
         id="bf16-pair-fallback",
     ),
-    EngineCase("fp32-vector-boundary", trt.float32, cp.float32, 4, 1, FP32_TOLERANCE),
-    EngineCase("fp16-vector-boundary", trt.float16, cp.float16, 2, 1, FP16_TOLERANCE),
-    pytest.param(
-        EngineCase(
-            "bf16-vector-boundary",
-            trt.bfloat16,
-            cp.dtype("bfloat16"),
-            2,
-            1,
-            BF16_TOLERANCE,
-        ),
-        marks=pytest.mark.sm80,
-        id="bf16-vector-boundary",
-    ),
+    *VECTOR_LAYOUT_CASES,
 )
 INPUT_NAMES = ("x", "valid_lengths", "weight", "bias")
 VALID_INPUT_SPECS = {
@@ -345,7 +351,7 @@ def make_inputs(
     shape: tuple[int, int, int],
     lengths: tuple[int, ...],
     kernel_size: int = KERNEL_SIZE,
-) -> tuple[np.typing.NDArray, np.typing.NDArray, np.typing.NDArray, np.typing.NDArray]:
+) -> HostInputs:
     """Create deterministic inputs with conspicuous invalid tail values.
 
     Parameters
@@ -366,8 +372,8 @@ def make_inputs(
     rng = np.random.default_rng(1000 + shape[0] * 100 + shape[1])
     x = rng.normal(0.0, 0.4, shape).astype(np.float32)
     lengths_array = np.array(lengths, dtype=np.int32)
-    for index, length in enumerate(lengths_array):
-        x[index, max(0, min(int(length), shape[1])) :] = 10.0
+    for index, length in enumerate(np.clip(lengths_array, 0, shape[1])):
+        x[index, length:] = 10.0
     weight = rng.normal(0.0, 0.2, (kernel_size, shape[2])).astype(np.float32)
     bias = rng.normal(0.0, 0.1, (shape[2],)).astype(np.float32)
     return x, lengths_array, weight, bias
@@ -386,9 +392,7 @@ class ConvolutionRun:
 def run_engine(
     engine: trt.ICudaEngine,
     engine_case: EngineCase,
-    inputs: tuple[
-        np.typing.NDArray, np.typing.NDArray, np.typing.NDArray, np.typing.NDArray
-    ],
+    inputs: HostInputs,
     context: trt.IExecutionContext | None = None,
     stream: cp.cuda.Stream | None = None,
     execute: bool = True,
@@ -426,9 +430,7 @@ def run_engine(
     assert output_shape == inputs[0].shape
     if stream is None:
         stream = cp.cuda.Stream(non_blocking=True)
-    input_names = {
-        engine.get_tensor_name(index) for index in range(engine.num_io_tensors)
-    }
+    binding_names = {engine.get_tensor_name(i) for i in range(engine.num_io_tensors)}
     with stream:
         buffers = {
             name: cp.array(
@@ -436,7 +438,7 @@ def run_engine(
                 dtype=cp.int32 if name == "valid_lengths" else engine_case.cupy_dtype,
             )
             for name, values in zip(INPUT_NAMES, inputs, strict=True)
-            if name in input_names
+            if name in binding_names
         }
         output = cp.full(output_shape, cp.nan, dtype=engine_case.cupy_dtype)
         for name, value in buffers.items():
@@ -525,9 +527,7 @@ def reference_convolution(
 
 def assert_run_matches_reference(
     run: ConvolutionRun,
-    inputs: tuple[
-        np.typing.NDArray, np.typing.NDArray, np.typing.NDArray, np.typing.NDArray
-    ],
+    inputs: HostInputs,
     engine_case: EngineCase,
 ) -> None:
     """Check input immutability and compare with independently rounded host inputs.
@@ -582,6 +582,34 @@ def test_zipformer_convolution_plugin_suppresses_nonfinite_padding(
     assert_run_matches_reference(run_engine(engine, case, inputs), inputs, case)
 
 
+@pytest.mark.parametrize(
+    "case",
+    (*VECTOR_LAYOUT_CASES, *ENGINE_CASES[1:]),
+    ids=lambda case: case.name,
+)
+def test_zipformer_convolution_plugin_propagates_nonfinite_coefficients(
+    plugin_creator, case
+) -> None:
+    *_, creator = plugin_creator
+    result = build_convolution_engine(creator, case)
+    assert result is not None
+    _, engine = result
+    inputs = make_inputs((2, 3, case.channels), (0, 3), case.kernel_size)
+    x, _, weight, bias = inputs
+    x.fill(1.0)
+    x[0] = np.nan
+    weight.fill(0.0)
+    bias.fill(2.0)
+    for coefficient in (np.nan, np.inf, -np.inf):
+        weight[case.kernel_size // 2, 0] = coefficient
+        run = run_engine(engine, case, inputs, execute=False)
+        with run.stream:
+            # Expected NaNs must not accept an unwritten output sentinel.
+            run.output.fill(123.0)
+            assert run.context.execute_async_v3(run.stream.ptr)
+        assert_run_matches_reference(run, inputs, case)
+
+
 def test_zipformer_convolution_plugin_does_not_remask_output_frames(
     convolution_engine,
 ) -> None:
@@ -600,13 +628,11 @@ def test_zipformer_convolution_plugin_handles_activation_extremes(
 ) -> None:
     _, engine, case = convolution_engine
     values = np.array((-100.0, -20.0, -1.0, 0.0, 1.0, 20.0, 100.0), dtype=np.float32)
-    x = np.broadcast_to(
-        values[np.newaxis, :, np.newaxis], (1, len(values), case.channels)
-    )
+    x = np.broadcast_to(values[None, :, None], (1, len(values), case.channels)).copy()
     weight = np.zeros((case.kernel_size, case.channels), dtype=np.float32)
     weight[case.kernel_size // 2] = 1.0
     inputs = (
-        x.copy(),
+        x,
         np.array((len(values),), dtype=np.int32),
         weight,
         np.zeros(case.channels, dtype=np.float32),
@@ -621,7 +647,7 @@ def test_zipformer_convolution_plugin_supports_additional_layouts(
     *_, creator = plugin_creator
     result = build_convolution_engine(creator, case, (1, 129, 685))
     assert result is not None
-    runtime, engine = result
+    _, engine = result
     inputs = make_inputs((3, 685, case.channels), (-4, 343, 999), case.kernel_size)
     inputs[0][0] = np.nan
     inputs[0][1, 343:] = np.inf
@@ -657,11 +683,16 @@ def test_zipformer_convolution_plugin_supports_concurrent_contexts(
         make_inputs((3, 65, case.channels), (65, 34, 1), case.kernel_size),
         make_inputs((2, 17, case.channels), (5, 16), case.kernel_size),
     )
-    runs = [run_engine(engine, case, values, execute=False) for values in inputs]
+    runs = [run_engine(engine, case, values) for values in inputs]
     assert runs[0].context is not runs[1].context
     assert runs[0].stream.ptr != runs[1].stream.ptr
     for run in runs:
-        assert run.context.execute_async_v3(run.stream.ptr)
+        run.stream.synchronize()
+
+    for run in runs:
+        with run.stream:
+            run.output.fill(cp.nan)
+            assert run.context.execute_async_v3(run.stream.ptr)
     for run, values in zip(runs, inputs, strict=True):
         assert_run_matches_reference(run, values, case)
 
@@ -706,6 +737,41 @@ def test_zipformer_convolution_plugin_supports_cuda_graph_replay(
             run.output.fill(cp.nan)
             graph.launch(run.stream)
         assert_run_matches_reference(run, replay_inputs, case)
+
+        expected = cp.asnumpy(run.output).view(np.uint8)
+        with run.stream:
+            run.output.fill(cp.nan)
+            graph.launch(run.stream)
+
+        run.stream.synchronize()
+        np.testing.assert_array_equal(cp.asnumpy(run.output).view(np.uint8), expected)
+
+
+def test_zipformer_convolution_plugin_supports_aligned_offset_bindings(
+    convolution_engine,
+) -> None:
+    _, engine, case = convolution_engine
+    inputs = make_inputs((2, 17, case.channels), (0, 13), case.kernel_size)
+    run = run_engine(engine, case, inputs, execute=False)
+    guards = []
+    with run.stream:
+        for name, values in (*run.inputs.items(), ("output", run.output)):
+            # Preserve TensorRT's 256-byte binding alignment for offset slices.
+            offset = 256 // values.itemsize
+            storage = cp.full(values.size + 2 * offset, 123, dtype=values.dtype)
+            view = storage[offset : offset + values.size].reshape(values.shape)
+            assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+            if name == "output":
+                run.output = view
+            else:
+                cp.copyto(view, values)
+                run.inputs[name] = view
+            assert run.context.set_tensor_address(name, view.data.ptr)
+            guards.extend((storage[:offset], storage[storage.size - offset :]))
+        assert run.context.execute_async_v3(run.stream.ptr)
+    assert_run_matches_reference(run, inputs, case)
+    for guard in guards:
+        cp.testing.assert_array_equal(guard, 123)
 
 
 def test_zipformer_convolution_plugin_accepts_valid_static_contract(
@@ -823,9 +889,8 @@ def test_zipformer_convolution_builds_with_constants(
     plugin_creator, case: EngineCase
 ) -> None:
     *_, creator = plugin_creator
-    rng = np.random.default_rng(20260819)
-    weight = rng.normal(0.0, 0.2, (case.kernel_size, case.channels)).astype(np.float32)
-    bias = rng.normal(0.0, 0.1, (case.channels,)).astype(np.float32)
+    inputs = make_inputs((2, 17, case.channels), (17, 5), case.kernel_size)
+    _, _, weight, bias = inputs
     constants = {
         name: cp.asnumpy(cp.array(values, dtype=case.cupy_dtype))
         for name, values in (("weight", weight), ("bias", bias))
@@ -836,7 +901,5 @@ def test_zipformer_convolution_builds_with_constants(
         )
     result = build_convolution_engine(creator, case, (1, 17, 65), constants=constants)
     assert result is not None
-    runtime, engine = result
-    x, lengths, _, _ = make_inputs((2, 17, case.channels), (17, 5), case.kernel_size)
-    inputs = x, lengths, weight, bias
+    _, engine = result
     assert_run_matches_reference(run_engine(engine, case, inputs), inputs, case)

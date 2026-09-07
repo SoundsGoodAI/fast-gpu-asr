@@ -27,11 +27,7 @@ DEFAULT_QUERY_DIM = 32
 POSITION_DIM = 4
 DEFAULT_PROJECTION_DIM = DEFAULT_NUM_HEADS * (2 * DEFAULT_QUERY_DIM + POSITION_DIM)
 KERNEL_BOUNDARIES = (384, 385, 512, 513, 1024, 1025, 2048, 2049)
-SHAPE_CASES = ((1, 1), (1, 7), (2, 65)) + tuple(
-    (1, length) for length in KERNEL_BOUNDARIES
-)
 MASKING_KERNEL_CASES = (65, 1025, 2049)
-ARCHITECTURE_CASES = ((1, 1), (3, 5), (8, 32))
 
 
 @dataclass(frozen=True)
@@ -75,8 +71,7 @@ def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFix
     Returns
     -------
     PluginCreatorFixture
-        Library handle(s) and the registered creator, retained for dependent
-        engines.
+        Library handle and the registered creator, retained for dependent engines.
     """
 
     library = compile_and_load_plugin(
@@ -124,21 +119,20 @@ def relative_attention_engine(
     Parameters
     ----------
     request : pytest.FixtureRequest
-        Parametrized dtype or layout selected for this module-scoped engine.
-    plugin_creator : tuple
-        Compiled library handles and the registered creator; retained for engine
+        Parametrized dtype selected for this module-scoped engine.
+    plugin_creator : PluginCreatorFixture
+        Compiled library handle and the registered creator; retained for engine
         lifetime.
 
     Returns
     -------
     RelativeAttentionEngine
-        Deserialized engine with its owning runtime.
+        Deserialized engine with its owning runtime and dtype settings.
     """
 
     _, creator = plugin_creator
     dtype_case: DTypeCase = request.param
     logger = trt.Logger(trt.Logger.ERROR)
-    assert trt.init_libnvinfer_plugins(logger, "")
     builder = trt.Builder(logger)
     network = builder.create_network(
         1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
@@ -175,6 +169,7 @@ def relative_attention_engine(
     profile = builder.create_optimization_profile()
     for name, shapes in profile_shapes.items():
         profile.set_shape(name, *shapes)
+        assert tuple(map(tuple, profile.get_shape(name))) == shapes
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
     config.builder_optimization_level = 3
@@ -354,7 +349,7 @@ def run_engine(
     stream : cp.cuda.Stream or None
         Stream ordering uploads and inference; None creates a nonblocking stream.
     execute : bool
-        Whether to enqueue inference after binding; False permits rejection tests.
+        Whether to enqueue after binding; False permits rejection or rebinding tests.
 
     Returns
     -------
@@ -475,7 +470,7 @@ def assert_run_matches_reference(
     return actual
 
 
-def test_relative_attention_plugin_excludes_scores_below_old_sentinel(
+def test_relative_attention_excludes_scores_below_old_sentinel(
     relative_attention_engine: RelativeAttentionEngine,
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
@@ -492,8 +487,11 @@ def test_relative_attention_plugin_excludes_scores_below_old_sentinel(
     np.testing.assert_array_equal(actual[..., 1], 0)
 
 
-@pytest.mark.parametrize("batch_size,sequence_length", SHAPE_CASES)
-def test_relative_attention_plugin_matches_pytorch(
+@pytest.mark.parametrize(
+    "batch_size,sequence_length",
+    ((1, 1), (1, 7), (2, 65)) + tuple((1, length) for length in KERNEL_BOUNDARIES),
+)
+def test_relative_attention_matches_pytorch(
     relative_attention_engine: RelativeAttentionEngine,
     batch_size: int,
     sequence_length: int,
@@ -504,7 +502,32 @@ def test_relative_attention_plugin_matches_pytorch(
     assert_run_matches_reference(run, dtype_case, inputs)
 
 
-def test_relative_attention_plugin_applies_relative_offset(
+@pytest.mark.parametrize("sequence_length", (1024, 1025, 2049))
+def test_relative_attention_normalizes_large_constant_logits(
+    relative_attention_engine: RelativeAttentionEngine, sequence_length: int
+) -> None:
+    _, engine, dtype_case = relative_attention_engine
+    projection, position, mask = make_inputs(1, sequence_length)
+    projection.fill(0)
+    position.fill(0)
+    mask.fill(False)
+    # These products round upward by 16 in FP16 and 128 in BF16 before softmax.
+    query_value, position_value = (
+        (144, 248) if dtype_case.name == "bf16" else (132, 252)
+    )
+    content_dim = DEFAULT_NUM_HEADS * DEFAULT_QUERY_DIM
+    projection[..., 2 * content_dim :: POSITION_DIM] = query_value
+    position[..., 0] = position_value
+
+    run = run_engine(engine, dtype_case, (projection, position, mask))
+    actual = run.host_scores()
+
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, 1 / sequence_length, rtol=5e-3, atol=0)
+    np.testing.assert_allclose(actual.sum(axis=3), 1, rtol=5e-3, atol=0)
+
+
+def test_relative_attention_applies_relative_offset(
     relative_attention_engine: RelativeAttentionEngine,
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
@@ -514,8 +537,7 @@ def test_relative_attention_plugin_applies_relative_offset(
     projection = np.zeros(
         (1, sequence_length, DEFAULT_PROJECTION_DIM), dtype=np.float32
     )
-    for head in range(DEFAULT_NUM_HEADS):
-        projection[:, :, 2 * content_dim + head * POSITION_DIM] = 20.0
+    projection[..., 2 * content_dim :: POSITION_DIM] = 20.0
     position = np.zeros(
         (1, 2 * sequence_length - 1, DEFAULT_NUM_HEADS, POSITION_DIM), dtype=np.float32
     )
@@ -536,7 +558,7 @@ def test_relative_attention_plugin_applies_relative_offset(
 
 
 @pytest.mark.parametrize("sequence_length", KERNEL_BOUNDARIES)
-def test_relative_attention_plugin_exercises_every_kernel_boundary_key(
+def test_relative_attention_exercises_every_kernel_boundary_key(
     relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
@@ -544,10 +566,8 @@ def test_relative_attention_plugin_exercises_every_kernel_boundary_key(
     projection = np.zeros(
         (1, sequence_length, DEFAULT_PROJECTION_DIM), dtype=np.float32
     )
-    for head in range(DEFAULT_NUM_HEADS):
-        channel = head * DEFAULT_QUERY_DIM
-        projection[0, :, channel] = 20.0
-        projection[0, sequence_length - 1, content_dim + channel] = 20.0
+    projection[..., :content_dim:DEFAULT_QUERY_DIM] = 20.0
+    projection[:, -1, content_dim : 2 * content_dim : DEFAULT_QUERY_DIM] = 20.0
     position = np.zeros(
         (1, 2 * sequence_length - 1, DEFAULT_NUM_HEADS, POSITION_DIM), dtype=np.float32
     )
@@ -562,7 +582,7 @@ def test_relative_attention_plugin_exercises_every_kernel_boundary_key(
 
 
 @pytest.mark.parametrize("sequence_length", MASKING_KERNEL_CASES)
-def test_relative_attention_plugin_contains_nonfinite_padding(
+def test_relative_attention_contains_nonfinite_padding(
     relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
@@ -580,16 +600,8 @@ def test_relative_attention_plugin_contains_nonfinite_padding(
     assert_run_matches_reference(run, dtype_case, (projection, position, mask))
 
 
-@pytest.mark.parametrize(
-    ("num_heads", "query_dim"),
-    ARCHITECTURE_CASES,
-    ids=(
-        "minimum-1-head-query-1",
-        "generic-3-head-query-5",
-        "production-8-head-query-32",
-    ),
-)
-def test_relative_attention_plugin_supports_head_layouts(
+@pytest.mark.parametrize("num_heads,query_dim", ((1, 1), (3, 5), (8, 32)))
+def test_relative_attention_supports_head_layouts(
     relative_attention_engine: RelativeAttentionEngine, num_heads: int, query_dim: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
@@ -598,36 +610,58 @@ def test_relative_attention_plugin_supports_head_layouts(
     assert_run_matches_reference(run, dtype_case, inputs)
 
 
-def test_relative_attention_plugin_matches_pytorch_without_padding(
+@pytest.mark.parametrize(
+    "sequence_length,padded", ((385, False), (65, True), (1025, True), (2049, True))
+)
+def test_relative_attention_with_uniform_masks(
     relative_attention_engine: RelativeAttentionEngine,
+    sequence_length: int,
+    padded: bool,
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
-    projection, position, _ = make_inputs(1, 385)
-    mask = np.zeros((1, 385), dtype=np.bool_)
-    run = run_engine(engine, dtype_case, (projection, position, mask))
-
-    assert_run_matches_reference(run, dtype_case, (projection, position, mask))
+    inputs = make_inputs(1, sequence_length)
+    inputs[2].fill(padded)
+    run = run_engine(engine, dtype_case, inputs)
+    assert_run_matches_reference(run, dtype_case, inputs)
 
 
 @pytest.mark.parametrize("sequence_length", MASKING_KERNEL_CASES)
-def test_relative_attention_plugin_handles_fully_padded_sequence(
+def test_relative_attention_supports_aligned_offset_buffers(
     relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
-    projection, position, _ = make_inputs(1, sequence_length)
-    mask = np.ones((1, sequence_length), dtype=np.bool_)
-    run = run_engine(engine, dtype_case, (projection, position, mask))
+    inputs = make_inputs(1, sequence_length)
+    run = run_engine(engine, dtype_case, inputs, execute=False)
+    guarded = []
+    with run.stream:
+        for name in ("projection", "position", "mask", "scores"):
+            buffer = getattr(run, name)
+            # TensorRT requires 256-byte-aligned bindings, including sliced views.
+            padding = 256 // buffer.itemsize
+            storage = cp.full(buffer.size + 2 * padding, 7, dtype=buffer.dtype)
+            view = storage[padding:-padding].reshape(buffer.shape)
+            view[...] = buffer
+            assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+            assert run.context.set_tensor_address(name, view.data.ptr)
+            setattr(run, name, view)
+            guarded.append((storage, padding))
+        assert run.context.execute_async_v3(run.stream.ptr)
+    assert_run_matches_reference(run, dtype_case, inputs)
 
-    assert_run_matches_reference(run, dtype_case, (projection, position, mask))
+    for storage, padding in guarded:
+        sentinel = storage.dtype.type(7)
+        np.testing.assert_array_equal(cp.asnumpy(storage[:padding]), sentinel)
+        np.testing.assert_array_equal(cp.asnumpy(storage[-padding:]), sentinel)
 
 
-def test_relative_attention_plugin_supports_cuda_graphs(
-    relative_attention_engine: RelativeAttentionEngine,
+@pytest.mark.parametrize("sequence_length", MASKING_KERNEL_CASES)
+def test_relative_attention_supports_cuda_graphs(
+    relative_attention_engine: RelativeAttentionEngine, sequence_length: int
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
-    inputs = make_inputs(2, 65)
+    inputs = make_inputs(2, sequence_length)
     run = run_engine(engine, dtype_case, inputs)
-    run.stream.synchronize()
+    assert_run_matches_reference(run, dtype_case, inputs)
     run.stream.begin_capture()
     assert run.context.execute_async_v3(run.stream.ptr)
     graph = run.stream.end_capture()
@@ -647,12 +681,18 @@ def test_relative_attention_plugin_supports_cuda_graphs(
                 (run.projection, run.position, run.mask), replay_inputs, strict=True
             ):
                 cp.copyto(buffer, cp.array(value, dtype=buffer.dtype))
-            run.scores.fill(cp.nan)
-            graph.launch(run.stream)
-        assert_run_matches_reference(run, dtype_case, replay_inputs)
+            assert run.context.execute_async_v3(run.stream.ptr)
+        expected = run.host_scores()
+        assert np.isfinite(expected).all()
+        for _ in range(2):
+            with run.stream:
+                run.scores.fill(cp.nan)
+                graph.launch(run.stream)
+            np.testing.assert_array_equal(run.host_scores(), expected)
+        assert_run_preserves_inputs(run, dtype_case, replay_inputs)
 
 
-def test_relative_attention_plugin_reuses_context_across_dynamic_shapes(
+def test_relative_attention_reuses_context_across_shapes_and_streams(
     relative_attention_engine: RelativeAttentionEngine,
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
@@ -662,41 +702,34 @@ def test_relative_attention_plugin_reuses_context_across_dynamic_shapes(
     for batch_size, sequence_length in ((1, 384), (2, 513), (1, 384)):
         inputs = make_inputs(batch_size, sequence_length)
         run = run_engine(engine, dtype_case, inputs, context, stream)
-        assert run.context is context
+        assert run.context is context and run.stream is stream
         assert_run_matches_reference(run, dtype_case, inputs)
-
-
-def test_relative_attention_plugin_handles_stream_changes(
-    relative_attention_engine: RelativeAttentionEngine,
-) -> None:
-    _, engine, dtype_case = relative_attention_engine
-    context = engine.create_execution_context()
-    assert context is not None
-    inputs = make_inputs(2, 65)
-    first = run_engine(engine, dtype_case, inputs, context)
-    assert_run_matches_reference(first, dtype_case, inputs)
 
     projection, position, mask = inputs
     replay_mask = np.zeros_like(mask)
-    replay_mask[0, 51:] = True
-    replay_mask[1, 39:] = True
+    replay_mask[:, 51:] = True
     replay_inputs = (projection * 1.25 + 0.125, position * -0.75, replay_mask)
-    second = run_engine(engine, dtype_case, replay_inputs, context)
-    assert first.stream.ptr != second.stream.ptr
-    assert second.context is context
-    assert_run_matches_reference(second, dtype_case, replay_inputs)
+    run = run_engine(engine, dtype_case, replay_inputs, context)
+    assert run.stream.ptr != stream.ptr and run.context is context
+    assert_run_matches_reference(run, dtype_case, replay_inputs)
 
 
-def test_relative_attention_plugin_supports_concurrent_contexts(
+def test_relative_attention_supports_concurrent_contexts(
     relative_attention_engine: RelativeAttentionEngine,
 ) -> None:
     _, engine, dtype_case = relative_attention_engine
     inputs = (make_inputs(1, 65), make_inputs(2, 65))
-    runs = [run_engine(engine, dtype_case, values, execute=False) for values in inputs]
+    runs = [run_engine(engine, dtype_case, values) for values in inputs]
+
     assert runs[0].context is not runs[1].context
     assert runs[0].stream.ptr != runs[1].stream.ptr
+
+    # Finish lazy initialization before testing overlapping steady-state execution.
+    for run in runs:
+        run.stream.synchronize()
     for run in runs:
         with run.stream:
+            run.scores.fill(cp.nan)
             assert run.context.execute_async_v3(run.stream.ptr)
     for run, values in zip(runs, inputs, strict=True):
         assert_run_matches_reference(run, dtype_case, values)
@@ -718,7 +751,7 @@ def test_relative_attention_plugin_supports_concurrent_contexts(
         pytest.param(0, (2, 65, 276), id="fractional-query-dimension-longer"),
     ),
 )
-def test_relative_attention_plugin_rejects_runtime_shape_mismatch(
+def test_relative_attention_rejects_runtime_shape_mismatch(
     relative_attention_engine: RelativeAttentionEngine,
     input_index: int,
     shape: tuple[int, ...],
@@ -920,7 +953,7 @@ def test_relative_attention_static_input_count(
         pytest.param({2: (trt.int32, (2, 7))}, id="non-boolean-mask"),
     ),
 )
-def test_relative_attention_plugin_rejects_invalid_contracts(
+def test_relative_attention_rejects_invalid_contracts(
     plugin_creator: PluginCreatorFixture, overrides: dict[int, InputSpec]
 ) -> None:
     _, creator = plugin_creator

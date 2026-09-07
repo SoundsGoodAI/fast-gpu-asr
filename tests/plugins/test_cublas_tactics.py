@@ -246,20 +246,30 @@ using namespace fastgpuasr_tensorrt;
 using nvinfer1::DataType;
 
 int deviceMajor = 7;
+int deviceCalls = 0;
+int attributeCalls = 0;
 cudaError_t deviceStatus = cudaSuccess;
 cudaError_t attributeStatus = cudaSuccess;
 
 extern "C" cudaError_t CUDARTAPI cudaGetDevice(int* device)
 {
-    *device = 3;
+    ++deviceCalls;
+    if (deviceStatus == cudaSuccess)
+    {
+        *device = 3;
+    }
     return deviceStatus;
 }
 
 extern "C" cudaError_t CUDARTAPI cudaDeviceGetAttribute(
     int* value, cudaDeviceAttr attribute, int device)
 {
+    ++attributeCalls;
     assert(device == 3 && attribute == cudaDevAttrComputeCapabilityMajor);
-    *value = deviceMajor;
+    if (attributeStatus == cudaSuccess)
+    {
+        *value = deviceMajor;
+    }
     return attributeStatus;
 }
 
@@ -268,7 +278,9 @@ int main()
     for (int major : {7, 8, 9, 12})
     {
         deviceMajor = major;
+        deviceCalls = attributeCalls = 0;
         bool const ampere = deviceSupportsAmpereCompute();
+        assert(deviceCalls == 1 && attributeCalls == 1);
         assert(ampere == (major >= 8));
         for (DataType type : {DataType::kFLOAT, DataType::kHALF, DataType::kBF16})
         {
@@ -296,11 +308,17 @@ int main()
             }
         }
     }
+    deviceCalls = attributeCalls = 0;
     deviceStatus = cudaErrorInvalidDevice;
     assert(!deviceSupportsAmpereCompute());
+    assert(deviceCalls == 1 && attributeCalls == 0);
     deviceStatus = cudaSuccess;
     attributeStatus = cudaErrorInvalidValue;
     assert(!deviceSupportsAmpereCompute());
+    assert(deviceCalls == 2 && attributeCalls == 1);
+    attributeStatus = cudaSuccess;
+    assert(deviceSupportsAmpereCompute());
+    assert(deviceCalls == 3 && attributeCalls == 2);
 }
 """,
         ),

@@ -5,10 +5,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <algorithm>
 #include <array>
-#include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -47,7 +47,8 @@ namespace
 constexpr char const* kPluginName = "parakeet_flash_attention";
 constexpr char const* kPluginVersion = "1";
 constexpr char const* kScaleField = "scale";
-constexpr char const* kTimingCacheId = "layout=nt3c-ntc;relative=2t-1;queries=fused;softmax=warp4";
+constexpr char const* kTimingCacheId =
+    "layout=nt3c-ntc;relative=2t-1;queries=fused;softmax=warp4-natural";
 constexpr size_t kTimingCacheIdSize = 128;
 constexpr int32_t kInputCount = 5;
 constexpr int32_t kOutputCount = 1;
@@ -209,9 +210,8 @@ bool computeWorkspaceLayout(Dims const& qkv, Dims const& position, Dims const& b
         return false;
     }
     layout.positionScoresOffset = offset;
-    // The two quadratic score matrices are reused across all plugin instances
-    // by TensorRT's workspace planner. Pointer arrays follow them at 256-byte
-    // boundaries, and the final region is handed directly to cuBLAS.
+    // TensorRT's workspace planner can reuse these quadratic score buffers.
+    // The pointer-array region and cuBLAS scratch start at 256-byte boundaries.
     if (!checkedAdd(offset, positionBytes, offset) || !checkedAlignUp(offset, 256, offset))
     {
         return false;
@@ -330,7 +330,9 @@ __global__ void prepareQueriesAndPositionPointers(T const* qkv, T const* positio
         int32_t const batch = static_cast<int32_t>(index / batchStride);
         int64_t const indexInBatch = index - batch * batchStride;
         int32_t const frame = static_cast<int32_t>(indexInBatch / channels);
-        int32_t const channel = static_cast<int32_t>(indexInBatch - frame * channels);
+        // T * C can exceed int32_t even though both dimensions fit individually.
+        int32_t const channel =
+            static_cast<int32_t>(indexInBatch - static_cast<int64_t>(frame) * channels);
         int32_t const head = channel / headDim;
         int32_t const headChannel = channel - head * headDim;
         int64_t const queryOffset =
@@ -450,7 +452,7 @@ template <> __device__ __forceinline__ __nv_bfloat16 floatToScalar<__nv_bfloat16
 template <typename T, int MaxSlots>
 __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* validLengths,
     T const* contentScores, T* attentionWeights, int32_t batchSize, int32_t numHeads,
-    int32_t sequenceLength, int32_t relativeLength, float scaleLog2)
+    int32_t sequenceLength, int32_t relativeLength, float scale)
 {
     int32_t const lane = threadIdx.x & (kWarpSize - 1);
     int32_t const warp = threadIdx.x / kWarpSize;
@@ -469,12 +471,12 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
     int32_t const validLength = validLengths[batch];
     int64_t const outputBase = static_cast<int64_t>(row) * sequenceLength;
     int64_t const positionBase = static_cast<int64_t>(row) * relativeLength;
-    int32_t const numSlots = (sequenceLength + kWarpSize - 1) / kWarpSize;
 
     // One warp owns one query row. Every lane retains up to 16 keys in
     // registers, covering the production limit of 512 frames without shared
-    // memory or an intermediate relative-shift tensor. Matching NeMo, valid
-    // lengths mask keys only. A nonpositive length has no valid softmax domain,
+    // memory or an intermediate relative-shift tensor. The host dispatches
+    // exactly ceil(T / 32) slots per lane. Matching NeMo, lengths mask keys only.
+    // A nonpositive length has no valid softmax domain,
     // so return an all-zero row. Lengths at or above T leave the row unmasked.
     // Query rows remain defined because downstream lengths determine which
     // frames are consumed.
@@ -488,29 +490,25 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
     }
 
     float values[MaxSlots];
-    float localMaximum = -FLT_MAX;
+    float localMaximum = -CUDART_INF_F;
 #pragma unroll
     for (int32_t slot = 0; slot < MaxSlots; ++slot)
     {
         int32_t const key = lane + slot * kWarpSize;
-        // A finite valid score must always outrank padding, even when its value
-        // is below the historical -1000 sentinel. -FLT_MAX also keeps the
-        // subsequent exp2f subtraction well-defined for every nonempty row.
-        float value = -FLT_MAX;
-        if (slot < numSlots && key < sequenceLength && key < validLength)
+        // A finite sentinel would give padding nonzero weight when valid scores
+        // overflow to -inf. Preserve the reference's NaNs for undefined rows.
+        float value = -CUDART_INF_F;
+        if (key < sequenceLength && key < validLength)
         {
             // Transformer-XL relative shift: row q consumes position
             // T - 1 - q + k. Applying it here avoids a T x (2T - 1) shuffle.
             int32_t const relative = sequenceLength - 1 - query + key;
             value = (scalarToFloat(contentScores[outputBase + key])
                         + scalarToFloat(positionScores[positionBase + relative]))
-                    * scaleLog2;
+                    * scale;
         }
         values[slot] = value;
-        if (slot < numSlots && key < sequenceLength)
-        {
-            localMaximum = fmaxf(localMaximum, value);
-        }
+        localMaximum = fmaxf(localMaximum, value);
     }
 
     float const maximum = warpMaximum(localMaximum);
@@ -519,8 +517,9 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
     for (int32_t slot = 0; slot < MaxSlots; ++slot)
     {
         int32_t const key = lane + slot * kWarpSize;
-        float const value =
-            slot < numSlots && key < sequenceLength ? exp2f(values[slot] - maximum) : 0.0F;
+        // Convert to base two only after subtracting the maximum: multiplying
+        // large finite logits by log2(e) first can overflow before normalization.
+        float const value = key < sequenceLength ? exp2f((values[slot] - maximum) * kLog2E) : 0.0F;
         values[slot] = value;
         localSum += value;
     }
@@ -530,7 +529,7 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
     for (int32_t slot = 0; slot < MaxSlots; ++slot)
     {
         int32_t const key = lane + slot * kWarpSize;
-        if (slot < numSlots && key < sequenceLength)
+        if (key < sequenceLength)
         {
             attentionWeights[outputBase + key] =
                 floatToScalar<T>(values[slot] * inverseDenominator);
@@ -543,7 +542,7 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
         parakeetRelativeSoftmax<TYPE, SLOTS><<<blocks, kThreadsPerBlock, 0, stream>>>(             \
             static_cast<TYPE const*>(positionScores), validLengths,                                \
             static_cast<TYPE const*>(contentScores), static_cast<TYPE*>(attentionWeights),         \
-            batchSize, numHeads, sequenceLength, relativeLength, scaleLog2);                       \
+            batchSize, numHeads, sequenceLength, relativeLength, scale);                           \
         break
 
 template <typename T>
@@ -554,7 +553,6 @@ bool launchParakeetSoftmax(void const* positionScores, int32_t const* validLengt
     int32_t const rows = batchSize * numHeads * sequenceLength;
     // Avoid overflowing the validated int32 row count during ceiling division.
     uint32_t const blocks = static_cast<uint32_t>((rows - 1) / kWarpsPerBlock + 1);
-    float const scaleLog2 = scale * kLog2E;
     switch ((sequenceLength + kWarpSize - 1) / kWarpSize)
     {
         LAUNCH_SOFTMAX_CASE(1, T);

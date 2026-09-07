@@ -192,10 +192,8 @@ def build_assembly_engine(
     built = build_engine(creator, specs, profiles)
     assert built is not None
     runtime, engine = built
-    expected_io = {
-        **{f"encoder_{index + 1}": trt.TensorIOMode.INPUT for index in range(6)},
-        "output": trt.TensorIOMode.OUTPUT,
-    }
+    expected_io = {f"encoder_{index + 1}": trt.TensorIOMode.INPUT for index in range(6)}
+    expected_io["output"] = trt.TensorIOMode.OUTPUT
     assert engine.num_io_tensors == len(expected_io)
     for name, mode in expected_io.items():
         assert engine.get_tensor_mode(name) == mode
@@ -315,13 +313,14 @@ class EngineRun:
     output: cp.ndarray
 
 
-def prepare_engine_run(
+def run_engine(
     assembly: AssemblyEngine,
     host_inputs: tuple[np.typing.NDArray, ...],
     context: trt.IExecutionContext | None = None,
     stream: cp.cuda.Stream | None = None,
+    execute: bool = True,
 ) -> EngineRun:
-    """Resolve dynamic shapes and bind buffers with a NaN output sentinel.
+    """Bind NaN-filled output buffers and optionally enqueue inference.
 
     Parameters
     ----------
@@ -333,11 +332,15 @@ def prepare_engine_run(
         Context to reuse after prior work completes; None creates a fresh context.
     stream : cp.cuda.Stream or None
         Stream ordering uploads and inference; None creates a nonblocking stream.
+    execute : bool
+        Whether to enqueue after binding; False permits buffer replacement and
+        rejection tests.
 
     Returns
     -------
     EngineRun
-        Bound buffers and execution state; no inference has been enqueued.
+        Run state retaining context, stream, and buffers until pending work
+        completes. The caller synchronizes before inspecting the buffers.
     """
 
     if context is None:
@@ -356,38 +359,9 @@ def prepare_engine_run(
         for index, values in enumerate(inputs):
             assert context.set_tensor_address(f"encoder_{index + 1}", values.data.ptr)
         assert context.set_tensor_address("output", output.data.ptr)
+        if execute:
+            assert context.execute_async_v3(stream.ptr)
     return EngineRun(context, stream, inputs, output)
-
-
-def run_engine(
-    assembly: AssemblyEngine,
-    host_inputs: tuple[np.typing.NDArray, ...],
-    context: trt.IExecutionContext | None = None,
-    stream: cp.cuda.Stream | None = None,
-) -> EngineRun:
-    """Enqueue inference; the caller synchronizes before inspecting the buffers.
-
-    Parameters
-    ----------
-    assembly : AssemblyEngine
-        Engine, owning runtime, storage dtype, and six stack widths.
-    host_inputs : tuple[np.typing.NDArray, ...]
-        Six host stack outputs in NTC layout, ordered from encoder 1 through 6.
-    context : trt.IExecutionContext or None
-        Context to reuse after prior work completes; None creates a fresh context.
-    stream : cp.cuda.Stream or None
-        Stream ordering uploads and inference; None creates a nonblocking stream.
-
-    Returns
-    -------
-    EngineRun
-        Run state retaining context, stream, and buffers until pending work
-        completes.
-    """
-
-    run = prepare_engine_run(assembly, host_inputs, context, stream)
-    assert run.context.execute_async_v3(run.stream.ptr)
-    return run
 
 
 def assert_run_matches_reference(
@@ -462,7 +436,7 @@ def test_output_assembly_plugin_supports_cuda_graphs(
         graph = run.stream.end_capture()
         graph.upload(run.stream)
 
-    for seed in (1, 2):
+    for seed in (1, 2, 2):
         inputs = make_inputs(2, 17, assembly_engine.encoder_dims, seed)
         with run.stream:
             for destination, source in zip(run.inputs, inputs, strict=True):
@@ -479,9 +453,7 @@ def test_output_assembly_plugin_reuses_context_across_dynamic_shapes(
     assert context is not None
     stream = cp.cuda.Stream(non_blocking=True)
 
-    for seed, (batch, frames) in enumerate(
-        (SHAPE_CASES[0], SHAPE_CASES[-1], SHAPE_CASES[0])
-    ):
+    for seed, (batch, frames) in enumerate(((1, 1), (3, 65), (1, 1))):
         inputs = make_inputs(batch, frames, assembly_engine.encoder_dims, seed)
         run = run_engine(assembly_engine, inputs, context, stream)
         assert run.context is context
@@ -491,15 +463,22 @@ def test_output_assembly_plugin_reuses_context_across_dynamic_shapes(
 def test_output_assembly_plugin_supports_concurrent_contexts(
     assembly_engine: AssemblyEngine,
 ) -> None:
-    first_inputs = make_inputs(1, 3, assembly_engine.encoder_dims, 1)
-    second_inputs = make_inputs(3, 65, assembly_engine.encoder_dims, 2)
-    first = run_engine(assembly_engine, first_inputs)
-    second = run_engine(assembly_engine, second_inputs)
+    inputs = (
+        make_inputs(1, 3, assembly_engine.encoder_dims, 1),
+        make_inputs(3, 65, assembly_engine.encoder_dims, 2),
+    )
+    runs = [run_engine(assembly_engine, values) for values in inputs]
+    assert runs[0].context is not runs[1].context
+    assert runs[0].stream.ptr != runs[1].stream.ptr
 
-    assert first.context is not second.context
-    assert first.stream.ptr != second.stream.ptr
-    assert_run_matches_reference(first, first_inputs)
-    assert_run_matches_reference(second, second_inputs)
+    for run in runs:
+        run.stream.synchronize()
+    for run in runs:
+        with run.stream:
+            run.output.fill(cp.nan)
+            assert run.context.execute_async_v3(run.stream.ptr)
+    for run, values in zip(runs, inputs, strict=True):
+        assert_run_matches_reference(run, values)
 
 
 def test_output_assembly_plugin_output_is_independent_of_dependency_values(
@@ -521,7 +500,7 @@ def test_output_assembly_plugin_preserves_contributor_bit_patterns(
     assembly_engine: AssemblyEngine,
 ) -> None:
     inputs = make_inputs(2, 17, assembly_engine.encoder_dims)
-    run = prepare_engine_run(assembly_engine, inputs)
+    run = run_engine(assembly_engine, inputs, execute=False)
     if run.output.dtype.itemsize == 4:
         bit_dtype = cp.uint32
         patterns = (
@@ -583,7 +562,7 @@ def test_output_assembly_plugin_rejects_runtime_shape_mismatch(
     shape = list(inputs[input_index].shape)
     shape[axis] += delta
     inputs[input_index] = np.zeros(shape, dtype=np.float32)
-    run = prepare_engine_run(alignment_engine, tuple(inputs))
+    run = run_engine(alignment_engine, tuple(inputs), execute=False)
 
     assert not run.context.execute_async_v3(run.stream.ptr)
     run.stream.synchronize()
@@ -596,7 +575,7 @@ def make_misaligned_copy(values: cp.ndarray) -> cp.ndarray:
     Parameters
     ----------
     values : cp.ndarray
-        Input values to round or copy without modifying the original array.
+        Input values to copy without modifying the original array.
 
     Returns
     -------
@@ -616,23 +595,12 @@ def make_misaligned_copy(values: cp.ndarray) -> cp.ndarray:
     return misaligned
 
 
-@pytest.mark.parametrize(
-    "binding",
-    (
-        "encoder_1",
-        "encoder_2",
-        "encoder_3",
-        "encoder_4",
-        "encoder_5",
-        "encoder_6",
-        "output",
-    ),
-)
-def test_output_assembly_plugin_binding_alignment(
+@pytest.mark.parametrize("binding", ("encoder_4", "encoder_5", "encoder_6", "output"))
+def test_output_assembly_plugin_rejects_misaligned_contributors(
     alignment_engine: AssemblyEngine, binding: str
 ) -> None:
     inputs = make_inputs(1, 3, alignment_engine.encoder_dims)
-    run = prepare_engine_run(alignment_engine, inputs)
+    run = run_engine(alignment_engine, inputs, execute=False)
     with run.stream:
         if binding == "output":
             run.output = make_misaligned_copy(run.output)
@@ -641,16 +609,77 @@ def test_output_assembly_plugin_binding_alignment(
             index = int(binding.removeprefix("encoder_")) - 1
             run.inputs[index] = make_misaligned_copy(run.inputs[index])
             buffer = run.inputs[index]
-        assert run.context.set_tensor_address(binding, buffer.data.ptr)
-        executed = run.context.execute_async_v3(run.stream.ptr)
+        bound = run.context.set_tensor_address(binding, buffer.data.ptr)
+        executed = bound and run.context.execute_async_v3(run.stream.ptr)
     run.stream.synchronize()
 
-    if binding in ("encoder_1", "encoder_2", "encoder_3"):
-        assert executed
-        assert_run_matches_reference(run, inputs)
-    else:
-        assert not executed
-        assert bool(cp.isnan(run.output).all())
+    assert not executed
+    assert bool(cp.isnan(run.output).all())
+
+
+def test_output_assembly_plugin_supports_aligned_offset_bindings(
+    assembly_engine: AssemblyEngine,
+) -> None:
+    inputs = make_inputs(2, 17, assembly_engine.encoder_dims)
+    run = run_engine(assembly_engine, inputs, execute=False)
+    guards = []
+    with run.stream:
+        for index, values in enumerate((*run.inputs, run.output)):
+            # TensorRT requires 256-byte-aligned bindings, including dependencies.
+            offset = 256 // values.itemsize
+            storage = cp.full(values.size + 2 * offset, 123.0, dtype=values.dtype)
+            view = storage[offset : offset + values.size].reshape(values.shape)
+            assert view.flags.c_contiguous and view.data.ptr % 256 == 0
+            name = f"encoder_{index + 1}" if index < 6 else "output"
+            if index < 6:
+                cp.copyto(view, values)
+                run.inputs[index] = view
+            else:
+                run.output = view
+            assert run.context.set_tensor_address(name, view.data.ptr)
+            guards.extend((storage[:offset], storage[storage.size - offset :]))
+        assert run.context.execute_async_v3(run.stream.ptr)
+
+    assert_run_matches_reference(run, inputs)
+    for guard in guards:
+        cp.testing.assert_array_equal(guard, 123.0)
+
+
+def test_output_assembly_plugin_covers_capped_grid_tail(
+    plugin_creator: PluginCreatorFixture,
+) -> None:
+    _, creator = plugin_creator
+    frames = 65537
+    channels = (1, 2, 3, 2056, 1032, 520)
+    # Exceed 65535 * 256 vectors and leave a partial final iteration.
+    vectors = frames * channels[3] // 8
+    assert vectors > 65535 * 256 and vectors % 256 != 0
+    specs = tuple((trt.float16, (1, frames, width)) for width in channels)
+    built = build_engine(creator, specs)
+    assert built is not None
+    runtime, engine = built
+    context = engine.create_execution_context()
+    assert context is not None
+    stream = cp.cuda.Stream(non_blocking=True)
+
+    with stream:
+        inputs = [
+            (cp.arange(frames * width, dtype=cp.uint16) + cp.uint16(index * 101))
+            .view(cp.float16)
+            .reshape(1, frames, width)
+            for index, width in enumerate(channels)
+        ]
+        output = cp.empty((1, frames, channels[3]), dtype=cp.float16)
+        output.view(cp.uint8).fill(0xA5)
+        for index, values in enumerate(inputs):
+            assert context.set_tensor_address(f"encoder_{index + 1}", values.data.ptr)
+        assert context.set_tensor_address("output", output.data.ptr)
+        assert context.execute_async_v3(stream.ptr)
+        expected = expected_assembly(tuple(value.view(cp.uint16) for value in inputs))
+
+    stream.synchronize()
+
+    cp.testing.assert_array_equal(output.view(cp.uint16), expected)
 
 
 def test_output_assembly_creator_exposes_parameter_free_contract(
@@ -676,24 +705,28 @@ def test_output_assembly_creator_exposes_parameter_free_contract(
 def test_output_assembly_creator_rejects_unexpected_fields(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
+
     _, creator = plugin_creator
-    value = np.array([1], dtype=np.int32)
-    plugin = creator.create_plugin(
-        PLUGIN_NAME,
-        trt.PluginFieldCollection(
-            [trt.PluginField("unexpected", value, trt.PluginFieldType.INT32)]
-        ),
-        trt.TensorRTPhase.BUILD,
+    field = trt.PluginField(
+        "unexpected", np.array([1], dtype=np.int32), trt.PluginFieldType.INT32
     )
-    assert plugin is None
+
+    assert (
+        creator.create_plugin(
+            PLUGIN_NAME,
+            trt.PluginFieldCollection([field]),
+            trt.TensorRTPhase.BUILD,
+        )
+        is None
+    )
 
 
 def assembly_input_specs(
     encoder_dims: tuple[int, ...] = ENCODER_DIMS,
-    batch_sizes: tuple[int, ...] = (1,) * 6,
-    sequence_lengths: tuple[int, ...] = (3,) * 6,
-    dtypes: tuple[trt.DataType, ...] | None = None,
-    shape_overrides: dict[int, tuple[int, ...]] | None = None,
+    batch_size: int = 1,
+    sequence_length: int = 3,
+    dtype: trt.DataType = trt.float16,
+    overrides: dict[int, InputSpec] | None = None,
 ) -> tuple[InputSpec, ...]:
     """Create one static six-input TensorRT contract.
 
@@ -701,14 +734,14 @@ def assembly_input_specs(
     ----------
     encoder_dims : tuple[int, ...]
         Channel widths of the six consecutive encoder stacks.
-    batch_sizes : tuple[int, ...]
-        Batch dimensions of the six stack inputs.
-    sequence_lengths : tuple[int, ...]
-        Time dimensions of the six stack inputs.
-    dtypes : tuple[trt.DataType, ...] or None
-        Input dtypes in binding order; None selects this helper's default contract.
-    shape_overrides : dict[int, tuple[int, ...]] or None
-        Zero-based input indices whose complete shapes should be replaced.
+    batch_size : int
+        Default batch dimension for all six stack inputs.
+    sequence_length : int
+        Default time dimension for all six stack inputs.
+    dtype : trt.DataType
+        Default storage dtype for all six stack inputs.
+    overrides : dict[int, InputSpec] or None
+        Zero-based input indices whose dtype and shape should be replaced.
 
     Returns
     -------
@@ -716,35 +749,29 @@ def assembly_input_specs(
         Input-ordered dtype/shape pairs, without building or allocating an engine.
     """
 
-    if dtypes is None:
-        dtypes = (trt.float16,) * 6
+    overrides = overrides or {}
     specs = [
-        (dtypes[index], (batch_sizes[index], sequence_lengths[index], channels))
-        for index, channels in enumerate(encoder_dims)
+        (dtype, (batch_size, sequence_length, channels)) for channels in encoder_dims
     ]
-    for index, shape in (shape_overrides or {}).items():
-        specs[index] = (dtypes[index], shape)
+    for index, spec in overrides.items():
+        specs[index] = spec
+
     return tuple(specs)
 
 
 INVALID_CONTRACT_CASES = (
     *(
         pytest.param(
-            assembly_input_specs(shape_overrides={input_index: (1, 3)}),
+            assembly_input_specs(overrides={input_index: (trt.float16, (1, 3))}),
             id=f"encoder-{input_index + 1}-rank",
         )
         for input_index in range(6)
     ),
-    pytest.param(assembly_input_specs(batch_sizes=(0,) * 6), id="empty-batch"),
-    pytest.param(assembly_input_specs(sequence_lengths=(0,) * 6), id="empty-sequence"),
+    pytest.param(assembly_input_specs(batch_size=0), id="empty-batch"),
+    pytest.param(assembly_input_specs(sequence_length=0), id="empty-sequence"),
     *(
         pytest.param(
-            assembly_input_specs(
-                encoder_dims=tuple(
-                    0 if index == input_index else channels
-                    for index, channels in enumerate(ENCODER_DIMS)
-                )
-            ),
+            assembly_input_specs(overrides={input_index: (trt.float16, (1, 3, 0))}),
             id=f"encoder-{input_index + 1}-empty-channels",
         )
         for input_index in range(3)
@@ -762,9 +789,7 @@ INVALID_CONTRACT_CASES = (
         id="empty-encoder6-channels",
     ),
     pytest.param(
-        assembly_input_specs(
-            batch_sizes=(INT32_MAX,) * 6, sequence_lengths=(INT32_MAX,) * 6
-        ),
+        assembly_input_specs(batch_size=INT32_MAX, sequence_length=INT32_MAX),
         id="address-volume-overflow",
     ),
     pytest.param(
@@ -780,21 +805,17 @@ INVALID_CONTRACT_CASES = (
         id="unaligned-encoder6-fp16",
     ),
     pytest.param(
-        assembly_input_specs(
-            encoder_dims=(16, 32, 48, 18, 12, 4), dtypes=(trt.float32,) * 6
-        ),
+        assembly_input_specs(encoder_dims=(16, 32, 48, 18, 12, 4), dtype=trt.float32),
         id="unaligned-output-fp32",
     ),
     pytest.param(
         assembly_input_specs(
-            encoder_dims=ENCODER_DIMS[:4] + (50, 32), dtypes=(trt.float32,) * 6
+            encoder_dims=ENCODER_DIMS[:4] + (50, 32), dtype=trt.float32
         ),
         id="unaligned-encoder5-fp32",
     ),
     pytest.param(
-        assembly_input_specs(
-            encoder_dims=ENCODER_DIMS[:5] + (34,), dtypes=(trt.float32,) * 6
-        ),
+        assembly_input_specs(encoder_dims=ENCODER_DIMS[:5] + (34,), dtype=trt.float32),
         id="unaligned-encoder6-fp32",
     ),
     pytest.param(
@@ -806,29 +827,30 @@ INVALID_CONTRACT_CASES = (
         id="encoder4-narrower-than-encoder5",
     ),
     pytest.param(
-        assembly_input_specs(batch_sizes=(2, 1, 1, 1, 1, 1)), id="dependency-batch"
+        assembly_input_specs(overrides={0: (trt.float16, (2, 3, 16))}),
+        id="dependency-batch",
     ),
     pytest.param(
-        assembly_input_specs(batch_sizes=(1, 1, 1, 2, 1, 1)), id="contributor-batch"
+        assembly_input_specs(overrides={3: (trt.float16, (2, 3, 64))}),
+        id="contributor-batch",
     ),
     pytest.param(
-        assembly_input_specs(sequence_lengths=(3, 4, 3, 3, 3, 3)), id="dependency-time"
+        assembly_input_specs(overrides={1: (trt.float16, (1, 4, 32))}),
+        id="dependency-time",
     ),
     pytest.param(
-        assembly_input_specs(sequence_lengths=(3, 3, 3, 4, 3, 3)), id="contributor-time"
+        assembly_input_specs(overrides={3: (trt.float16, (1, 4, 64))}),
+        id="contributor-time",
     ),
-    pytest.param(assembly_input_specs(dtypes=(trt.int32,) * 6), id="unsupported-dtype"),
+    pytest.param(assembly_input_specs(dtype=trt.int32), id="unsupported-dtype"),
     *(
         pytest.param(
             assembly_input_specs(
-                dtypes=tuple(
-                    trt.float32 if index == input_index else trt.float16
-                    for index in range(6)
-                )
+                overrides={input_index: (trt.float32, (1, 3, channels))}
             ),
             id=f"encoder-{input_index + 1}-mixed-dtype",
         )
-        for input_index in range(6)
+        for input_index, channels in enumerate(ENCODER_DIMS)
     ),
     pytest.param(assembly_input_specs()[:5], id="missing-input"),
     pytest.param(

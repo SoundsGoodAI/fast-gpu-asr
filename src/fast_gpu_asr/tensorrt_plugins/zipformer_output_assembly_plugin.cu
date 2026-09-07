@@ -333,33 +333,20 @@ class OutputAssemblyPlugin final : public IPluginV3,
             return 1;
         }
 
-        int32_t const elementBytes = dataTypeBytes(inputDesc[0].type);
-        int64_t const outputBytes = static_cast<int64_t>(inputDesc[3].dims.d[2]) * elementBytes;
-        int64_t const encoder5Bytes = static_cast<int64_t>(inputDesc[4].dims.d[2]) * elementBytes;
-        int64_t const encoder6Bytes = static_cast<int64_t>(inputDesc[5].dims.d[2]) * elementBytes;
-        int64_t const outputVectorCount = outputBytes / kVectorBytes;
-        int64_t const encoder5VectorCount = encoder5Bytes / kVectorBytes;
-        int64_t const encoder6VectorCount = encoder6Bytes / kVectorBytes;
-        if (outputVectorCount < 1 || outputVectorCount > std::numeric_limits<int32_t>::max()
-            || encoder5VectorCount < 1 || encoder5VectorCount > std::numeric_limits<int32_t>::max()
-            || encoder6VectorCount < 1 || encoder6VectorCount > std::numeric_limits<int32_t>::max())
-        {
-            return 1;
-        }
-        // The kernel keeps per-row vector counts in int32_t. Narrow only after
-        // checking the bounds locally rather than relying on profile validation.
-        int32_t const outputVectors = static_cast<int32_t>(outputVectorCount);
-        int32_t const encoder5Vectors = static_cast<int32_t>(encoder5VectorCount);
-        int32_t const encoder6Vectors = static_cast<int32_t>(encoder6VectorCount);
+        // onShapeChange() proves positive, vector-aligned int32_t channel widths
+        // and int64_t byte counts. Vector counts and their products therefore fit.
+        int32_t const elementsPerVector = kVectorBytes / dataTypeBytes(inputDesc[0].type);
+        int32_t const outputVectors =
+            static_cast<int32_t>(inputDesc[3].dims.d[2] / elementsPerVector);
+        int32_t const encoder5Vectors =
+            static_cast<int32_t>(inputDesc[4].dims.d[2] / elementsPerVector);
+        int32_t const encoder6Vectors =
+            static_cast<int32_t>(inputDesc[5].dims.d[2] / elementsPerVector);
 
         // Batch and time do not affect the band mapping, so launch one
         // grid-stride copy over all 16-byte vectors in all NTC rows.
         int64_t const frames =
             static_cast<int64_t>(inputDesc[3].dims.d[0]) * inputDesc[3].dims.d[1];
-        if (frames > std::numeric_limits<int64_t>::max() / outputVectors)
-        {
-            return 1;
-        }
         int64_t const totalVectors = frames * outputVectors;
         int64_t const requiredBlocks = (totalVectors - 1) / kThreadsPerBlock + 1;
         int32_t const blocks = static_cast<int32_t>(std::min(requiredBlocks, kMaxBlocks));

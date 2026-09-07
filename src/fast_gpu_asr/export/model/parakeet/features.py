@@ -174,12 +174,11 @@ class FeatureExtractor(torch.nn.Module):
         ).unsqueeze(0) >= feature_lengths.unsqueeze(1)
         valid_frames = (~frame_mask).unsqueeze(2).to(features.dtype)
         normalization_lengths = feature_lengths.clamp_min(1).unsqueeze(1).unsqueeze(2)
-        # Center before reducing so a constant feature sequence has an exactly
-        # representable zero mean, matching the plugin's Welford accumulator.
-        offset = features[:, :1]
+        # Keep deviations centered through normalization; adding the offset back
+        # to the mean loses small changes near the log floor in FP32.
+        features = features - features[:, :1]
         means = (
-            offset
-            + torch.sum((features - offset) * valid_frames, dim=1, keepdim=True)
+            torch.sum(features * valid_frames, dim=1, keepdim=True)
             / normalization_lengths
         )
         features = (features - means).masked_fill(frame_mask.unsqueeze(2), 0.0)

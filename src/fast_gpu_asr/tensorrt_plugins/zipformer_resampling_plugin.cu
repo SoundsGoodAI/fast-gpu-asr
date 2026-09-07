@@ -22,7 +22,8 @@ namespace
 // Both operations consume and produce contiguous NTC representations.
 // Downsampling repeats the final input frame to complete a partial group,
 // while upsampling repeats each lower-rate frame and applies a per-channel
-// bypass interpolation.
+// bypass interpolation. All paths use FP32 arithmetic (including FMA) and
+// convert to the output dtype at the store; non-finite inputs are not sanitized.
 constexpr char const* kDownsampleName = "zipformer_downsample";
 constexpr char const* kUpsampleName = "zipformer_upsample_bypass";
 constexpr char const* kPluginVersion = "1";
@@ -93,10 +94,8 @@ bool haveValidDownsampleShapes(Dims const& input, Dims const& weights, Dims cons
 
     int64_t const outputLength = input.d[1] / factor + (input.d[1] % factor != 0);
     return input.d[0] <= kMaxGridDimensionYZ && outputLength <= kMaxGridDimensionYZ
-           && input.d[1] <= std::numeric_limits<int32_t>::max()
-           && input.d[2] <= std::numeric_limits<int32_t>::max() && weights.d[0] == factor
-           && weights.d[1] == 1 && output.d[0] == input.d[0] && output.d[1] == outputLength
-           && output.d[2] == input.d[2];
+           && weights.d[0] == factor && weights.d[1] == 1 && output.d[0] == input.d[0]
+           && output.d[1] == outputLength && output.d[2] == input.d[2];
 }
 
 bool haveValidUpsampleShapes(Dims const& early, Dims const& later, Dims const& scale,
@@ -112,9 +111,9 @@ bool haveValidUpsampleShapes(Dims const& early, Dims const& later, Dims const& s
 
     int64_t const laterLength = early.d[1] / factor + (early.d[1] % factor != 0);
     return early.d[0] <= kMaxGridDimensionYZ && early.d[1] <= kMaxGridDimensionYZ
-           && early.d[2] <= std::numeric_limits<int32_t>::max() && later.d[0] == early.d[0]
-           && later.d[1] == laterLength && later.d[2] == early.d[2] && scale.d[0] == early.d[2]
-           && output.d[0] == early.d[0] && output.d[1] == early.d[1] && output.d[2] == early.d[2];
+           && later.d[0] == early.d[0] && later.d[1] == laterLength && later.d[2] == early.d[2]
+           && scale.d[0] == early.d[2] && output.d[0] == early.d[0] && output.d[1] == early.d[1]
+           && output.d[2] == early.d[2];
 }
 
 bool haveValidShapes(Operation operation, Dims const* inputs, Dims const& output, int32_t factor,
@@ -264,8 +263,8 @@ __global__ void upsampleBypass(T const* early, T const* later, T const* scale, T
 
     int32_t const outputFrame = blockIdx.y;
     int32_t const batch = blockIdx.z;
-    int32_t const candidateFrame = outputFrame / factor;
-    int32_t const laterFrame = candidateFrame < laterLength ? candidateFrame : laterLength - 1;
+    // Shape validation guarantees laterLength == ceil(outputLength / factor).
+    int32_t const laterFrame = outputFrame / factor;
     int64_t const outputIndex =
         (static_cast<int64_t>(batch) * outputLength + outputFrame) * channels + channel;
     int64_t const laterIndex =
@@ -287,8 +286,7 @@ __global__ void upsampleBypassHalf2(half2 const* early, half2 const* later, half
 
     int32_t const outputFrame = blockIdx.y;
     int32_t const batch = blockIdx.z;
-    int32_t const candidateFrame = outputFrame / factor;
-    int32_t const laterFrame = candidateFrame < laterLength ? candidateFrame : laterLength - 1;
+    int32_t const laterFrame = outputFrame / factor;
     int64_t const outputIndex =
         (static_cast<int64_t>(batch) * outputLength + outputFrame) * channelPairs + channelPair;
     int64_t const laterIndex =
@@ -313,8 +311,7 @@ __global__ void upsampleBypassBfloat162(__nv_bfloat162 const* early, __nv_bfloat
 
     int32_t const outputFrame = blockIdx.y;
     int32_t const batch = blockIdx.z;
-    int32_t const candidateFrame = outputFrame / factor;
-    int32_t const laterFrame = candidateFrame < laterLength ? candidateFrame : laterLength - 1;
+    int32_t const laterFrame = outputFrame / factor;
     int64_t const outputIndex =
         (static_cast<int64_t>(batch) * outputLength + outputFrame) * channelPairs + channelPair;
     int64_t const laterIndex =
