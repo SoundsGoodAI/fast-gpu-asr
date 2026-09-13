@@ -36,7 +36,7 @@ PLUGIN_BUILDS = (
     ("zipformer_resampling_plugin.cu", ("cudart",)),
     ("zipformer_output_assembly_plugin.cu", ("cudart",)),
     ("parakeet_feature_plugin.cu", ("cublas", "cufft", "cudart")),
-    ("parakeet_flash_attention_plugin.cu", ("cublas", "cudart")),
+    ("parakeet_relative_attention_plugin.cu", ("cublas", "cudart")),
     ("parakeet_convolution_plugin.cu", ("cudart",)),
 )
 CUDA_BUILD_LIBRARIES = ("cudart", "cublas", "cufft")
@@ -60,8 +60,8 @@ PLUGIN_INITIALIZERS = (
     ),
     ("parakeet_feature_plugin.so", "initFastGpuAsrParakeetFeaturePlugin"),
     (
-        "parakeet_flash_attention_plugin.so",
-        "initFastGpuAsrParakeetFlashAttentionPlugin",
+        "parakeet_relative_attention_plugin.so",
+        "initFastGpuAsrParakeetRelativeAttentionPlugin",
     ),
     ("parakeet_convolution_plugin.so", "initFastGpuAsrParakeetConvolutionPlugin"),
 )

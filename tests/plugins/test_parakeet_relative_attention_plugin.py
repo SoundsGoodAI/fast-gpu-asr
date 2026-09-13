@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 
-"""TensorRT integration tests for the Parakeet flash-attention plugin."""
+"""TensorRT integration tests for the Parakeet relative-attention plugin."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from fast_gpu_asr.constants import TENSORRT_PLUGIN_NAMESPACE
 pytestmark = pytest.mark.cuda
 
 
-PLUGIN_NAME = "parakeet_flash_attention"
+PLUGIN_NAME = "parakeet_relative_attention"
 PLUGIN_VERSION = "1"
 INPUT_NAMES = ("qkv", "position", "content_bias", "position_bias", "valid_lengths")
 DEFAULT_NUM_HEADS = 8
@@ -188,8 +188,8 @@ def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFix
 
     library = compile_and_load_plugin(
         tmp_path_factory,
-        "parakeet_flash_attention_plugin.cu",
-        "initFastGpuAsrParakeetFlashAttentionPlugin",
+        "parakeet_relative_attention_plugin.cu",
+        "initFastGpuAsrParakeetRelativeAttentionPlugin",
         ("cublas", "cudart"),
     )
 
@@ -649,7 +649,7 @@ def assert_run_matches_reference(
 
 
 @pytest.mark.parametrize(("shape", "valid_lengths"), SHAPE_CASES)
-def test_parakeet_flash_attention_plugin_matches_reference(
+def test_parakeet_relative_attention_plugin_matches_reference(
     attention_engine: AttentionEngine,
     shape: tuple[int, int],
     valid_lengths: tuple[int, ...],
@@ -661,7 +661,7 @@ def test_parakeet_flash_attention_plugin_matches_reference(
 
 
 @pytest.mark.parametrize("sequence_length", SOFTMAX_DISPATCH_CASES)
-def test_parakeet_flash_attention_exercises_every_softmax_dispatch_slot(
+def test_parakeet_relative_attention_exercises_every_softmax_dispatch_slot(
     attention_engine: AttentionEngine, sequence_length: int
 ) -> None:
     case = attention_engine.case
@@ -704,7 +704,7 @@ def test_parakeet_flash_attention_exercises_every_softmax_dispatch_slot(
     ),
     ids=lambda case: case.name,
 )
-def test_parakeet_flash_attention_supports_head_layouts_and_scales(
+def test_parakeet_relative_attention_supports_head_layouts_and_scales(
     plugin_creator: PluginCreatorFixture, case: EngineCase
 ) -> None:
     _, creator = plugin_creator
@@ -723,7 +723,7 @@ def test_parakeet_flash_attention_supports_head_layouts_and_scales(
 
 
 @pytest.mark.parametrize(("case", "position_delta"), SCORE_PROMOTION_CASES)
-def test_parakeet_flash_attention_promotes_score_sum_before_softmax(
+def test_parakeet_relative_attention_promotes_score_sum_before_softmax(
     plugin_creator: PluginCreatorFixture, case: EngineCase, position_delta: np.float32
 ) -> None:
     _, creator = plugin_creator
@@ -753,7 +753,7 @@ def test_parakeet_flash_attention_promotes_score_sum_before_softmax(
     np.testing.assert_array_equal(actual[0, 0], (promoted.float().item(), 0.0))
 
 
-def test_parakeet_flash_attention_masks_extreme_valid_logits(
+def test_parakeet_relative_attention_masks_extreme_valid_logits(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -773,7 +773,7 @@ def test_parakeet_flash_attention_masks_extreme_valid_logits(
     (-np.inf, np.inf, np.nan, pytest.param(-65504.0, id="finite-fp16-overflow")),
 )
 @pytest.mark.parametrize("valid_length", (0, 1, 2))
-def test_parakeet_flash_attention_preserves_nonfinite_score_semantics(
+def test_parakeet_relative_attention_preserves_nonfinite_score_semantics(
     attention_engine: AttentionEngine, score: float, valid_length: int
 ) -> None:
     case = attention_engine.case
@@ -802,7 +802,7 @@ def test_parakeet_flash_attention_preserves_nonfinite_score_semantics(
 
 
 @pytest.mark.parametrize("score", (-30.0, 30.0))
-def test_parakeet_flash_attention_does_not_overflow_finite_scaled_logits(
+def test_parakeet_relative_attention_does_not_overflow_finite_scaled_logits(
     plugin_creator: PluginCreatorFixture,
     attention_engine: AttentionEngine,
     score: float,
@@ -821,7 +821,7 @@ def test_parakeet_flash_attention_does_not_overflow_finite_scaled_logits(
     np.testing.assert_array_equal(actual, 1.0)
 
 
-def test_parakeet_flash_attention_applies_content_attention_and_bias(
+def test_parakeet_relative_attention_applies_content_attention_and_bias(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -842,7 +842,7 @@ def test_parakeet_flash_attention_applies_content_attention_and_bias(
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=case.tolerance)
 
 
-def test_parakeet_flash_attention_preserves_head_and_value_layout(
+def test_parakeet_relative_attention_preserves_head_and_value_layout(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -859,7 +859,7 @@ def test_parakeet_flash_attention_preserves_head_and_value_layout(
     )
 
 
-def test_parakeet_flash_attention_ignores_finite_padded_keys_and_values(
+def test_parakeet_relative_attention_ignores_finite_padded_keys_and_values(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -879,7 +879,7 @@ def test_parakeet_flash_attention_ignores_finite_padded_keys_and_values(
     np.testing.assert_array_equal(actual, changed_actual)
 
 
-def test_parakeet_flash_attention_applies_relative_position_shift(
+def test_parakeet_relative_attention_applies_relative_position_shift(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -895,7 +895,7 @@ def test_parakeet_flash_attention_applies_relative_position_shift(
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=case.tolerance)
 
 
-def test_parakeet_flash_attention_supports_cuda_graph_replay(
+def test_parakeet_relative_attention_supports_cuda_graph_replay(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -925,7 +925,7 @@ def test_parakeet_flash_attention_supports_cuda_graph_replay(
             )
 
 
-def test_parakeet_flash_attention_supports_aligned_offset_buffers(
+def test_parakeet_relative_attention_supports_aligned_offset_buffers(
     attention_engine: AttentionEngine,
 ) -> None:
     case = attention_engine.case
@@ -955,7 +955,7 @@ def test_parakeet_flash_attention_supports_aligned_offset_buffers(
         np.testing.assert_array_equal(cp.asnumpy(storage[storage.size - padding :]), 7)
 
 
-def test_parakeet_flash_attention_reuses_context_across_shapes_and_streams(
+def test_parakeet_relative_attention_reuses_context_across_shapes_and_streams(
     attention_engine: AttentionEngine,
 ) -> None:
     context = attention_engine.engine.create_execution_context()
@@ -973,7 +973,7 @@ def test_parakeet_flash_attention_reuses_context_across_shapes_and_streams(
         assert_run_matches_reference(run, attention_engine.case, inputs)
 
 
-def test_parakeet_flash_attention_supports_concurrent_contexts(
+def test_parakeet_relative_attention_supports_concurrent_contexts(
     attention_engine: AttentionEngine,
 ) -> None:
     inputs = (
@@ -1002,7 +1002,7 @@ def test_parakeet_flash_attention_supports_concurrent_contexts(
         pytest.param("valid_lengths", 3, id="length-longer"),
     ),
 )
-def test_parakeet_flash_attention_rejects_runtime_shape_mismatch(
+def test_parakeet_relative_attention_rejects_runtime_shape_mismatch(
     attention_engine: AttentionEngine, name: str, size: int
 ) -> None:
     inputs = make_inputs(attention_engine.case, 2, 17, (17, 5), seed=11000)
@@ -1076,7 +1076,7 @@ def execute_static_contract(
     return executed
 
 
-def test_parakeet_flash_attention_accepts_valid_static_contract(
+def test_parakeet_relative_attention_accepts_valid_static_contract(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
     _, creator = plugin_creator
@@ -1189,7 +1189,7 @@ def test_parakeet_flash_attention_accepts_valid_static_contract(
         ),
     ),
 )
-def test_parakeet_flash_attention_rejects_invalid_contracts(
+def test_parakeet_relative_attention_rejects_invalid_contracts(
     plugin_creator: PluginCreatorFixture, overrides: dict[int, InputSpec]
 ) -> None:
     _, creator = plugin_creator
@@ -1200,7 +1200,7 @@ def test_parakeet_flash_attention_rejects_invalid_contracts(
 
 
 @pytest.mark.parametrize("count", (4, 6), ids=("missing-input", "extra-input"))
-def test_parakeet_flash_attention_rejects_invalid_input_count(
+def test_parakeet_relative_attention_rejects_invalid_input_count(
     plugin_creator: PluginCreatorFixture, count: int
 ) -> None:
     _, creator = plugin_creator
@@ -1208,7 +1208,7 @@ def test_parakeet_flash_attention_rejects_invalid_input_count(
     assert not execute_static_contract(creator, specs)
 
 
-def test_parakeet_flash_attention_rejects_profile_above_capacity(
+def test_parakeet_relative_attention_rejects_profile_above_capacity(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
     _, creator = plugin_creator
@@ -1246,7 +1246,7 @@ def test_parakeet_flash_attention_rejects_profile_above_capacity(
         ),
     ),
 )
-def test_parakeet_flash_attention_creator_rejects_invalid_scale_fields(
+def test_parakeet_relative_attention_creator_rejects_invalid_scale_fields(
     plugin_creator: PluginCreatorFixture,
     specs: tuple[tuple[str, list[float], trt.PluginFieldType], ...],
 ) -> None:
@@ -1274,7 +1274,7 @@ def test_parakeet_flash_attention_creator_rejects_invalid_scale_fields(
     (0.0, -1.0, np.nan, np.inf, np.nextafter(MAXIMUM_VALID_SCALE, np.float32(np.inf))),
     ids=("zero", "negative", "nan", "infinity", "scaled-overflow"),
 )
-def test_parakeet_flash_attention_creator_rejects_invalid_scale_values(
+def test_parakeet_relative_attention_creator_rejects_invalid_scale_values(
     plugin_creator: PluginCreatorFixture, scale: float
 ) -> None:
     _, creator = plugin_creator
@@ -1285,7 +1285,7 @@ def test_parakeet_flash_attention_creator_rejects_invalid_scale_values(
     assert creator.create_plugin(PLUGIN_NAME, fields, trt.TensorRTPhase.BUILD) is None
 
 
-def test_parakeet_flash_attention_creator_exposes_complete_contract(
+def test_parakeet_relative_attention_creator_exposes_complete_contract(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
     _, creator = plugin_creator
@@ -1314,7 +1314,7 @@ def test_parakeet_flash_attention_creator_exposes_complete_contract(
     assert build.num_outputs == 1
 
 
-def test_parakeet_flash_attention_timing_cache_keys_include_scale(
+def test_parakeet_relative_attention_timing_cache_keys_include_scale(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
     _, creator = plugin_creator
@@ -1339,7 +1339,7 @@ def test_parakeet_flash_attention_timing_cache_keys_include_scale(
         pytest.param(MAXIMUM_VALID_SCALE, id="largest-scaled-finite"),
     ),
 )
-def test_parakeet_flash_attention_creator_accepts_positive_scale_boundaries(
+def test_parakeet_relative_attention_creator_accepts_positive_scale_boundaries(
     plugin_creator: PluginCreatorFixture, scale: float
 ) -> None:
     _, creator = plugin_creator

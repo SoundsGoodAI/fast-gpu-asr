@@ -389,7 +389,7 @@ jobs:
           expected_libraries = {
               "parakeet_convolution_plugin.so",
               "parakeet_feature_plugin.so",
-              "parakeet_flash_attention_plugin.so",
+              "parakeet_relative_attention_plugin.so",
               "zipformer_attention_value_plugin.so",
               "zipformer_convolution_plugin.so",
               "zipformer_feature_plugin.so",
@@ -435,7 +435,7 @@ jobs:
           expected_creators = {
               "parakeet_conformer_convolution",
               "parakeet_feature_extractor",
-              "parakeet_flash_attention",
+              "parakeet_relative_attention",
               "zipformer_attention_value",
               "zipformer_convolution",
               "zipformer_downsample",

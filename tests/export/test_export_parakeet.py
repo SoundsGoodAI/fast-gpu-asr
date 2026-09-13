@@ -1455,7 +1455,7 @@ def test_validate_parakeet_positional_capacity_boundary() -> None:
         validate_parakeet(model_config, args)
 
 
-def test_validate_parakeet_flash_attention_capacity_boundary() -> None:
+def test_validate_parakeet_relative_attention_capacity_boundary() -> None:
     args = make_export_args()
     args.max_audio_seconds = 655_359 / 16_000
 

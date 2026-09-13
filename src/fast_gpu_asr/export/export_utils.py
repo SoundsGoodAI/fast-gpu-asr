@@ -440,7 +440,7 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
     if encoder_frames > PARAKEET_MAX_ENCODER_FRAMES:
         raise ValueError(
             f"The maximum profile produces {encoder_frames} encoder frames, but "
-            "the Parakeet FlashAttention plugin supports at most "
+            "the Parakeet relative-attention plugin supports at most "
             f"{PARAKEET_MAX_ENCODER_FRAMES}."
         )
     if encoder_frames > model_config.encoder.pos_emb_max_len:

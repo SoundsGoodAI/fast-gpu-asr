@@ -8,11 +8,11 @@
 [![Lint: Ruff](https://img.shields.io/badge/lint-Ruff-30203d?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
 [![License: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-blue)](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/LICENSE)
 
-**Zipformer and Parakeet. Built for speed.**
+### **Zipformer and Parakeet. Built for speed.**
 
 Batched offline speech recognition for NVIDIA GPUs. Raw audio in, text and word
 timestamps out, through one Python API. TensorRT engines, native CUDA plugins,
-and GPU beam search handle inference; no NeMo or K2 installation is needed.
+and GPU beam search handle inference; no NeMo or k2 installation is needed.
 
 <!-- benchmark-results:start -->
 
@@ -21,8 +21,8 @@ and GPU beam search handle inference; no NeMo or K2 installation is needed.
 <table>
   <tbody>
     <tr>
-      <th width="50%"><div align="center"><big>Zipformer CR-CTC-transducer (decoder beam 6)</big></div></th>
-      <th width="50%"><div align="center"><big>Parakeet V3 (decoder beam 6)</big></div></th>
+      <th width="50%"><div align="center"><big>Zipformer CR-CTC Transducer (decoder beam 6)</big></div></th>
+      <th width="50%"><div align="center"><big>Parakeet V3 TDT (decoder beam 6)</big></div></th>
     </tr>
     <tr>
       <td width="50%"><a href="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/zipformer-fp16-bf16-fp32.svg"><img src="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/zipformer-fp16-bf16-fp32.svg" width="100%" alt="Zipformer CR-CTC-transducer, FP16 / BF16 / FP32" /></a></td>
@@ -48,11 +48,11 @@ We reproduced the [Open ASR Leaderboard](https://github.com/huggingface/open_asr
 
 ### Key Observations
 
-- **Batching matters.** On B300 with FP16, batch 256 versus batch 1 delivers 28.5x for Zipformer CR-CTC-transducer and 21.6x for Parakeet V3.
-- **Gains taper.** On that same GPU with FP16, doubling capacity from 128 to 256 changes throughput by +25.1% for Zipformer CR-CTC-transducer and +23.0% for Parakeet V3.
-- **BF16 is supported too.** At B300/batch 256, BF16 throughput is slightly higher for Zipformer CR-CTC-transducer and Parakeet V3 than FP16. WER is recorded for every configuration; precision can marginally change outputs.
-- **FP16 vs. FP32.** At B300/batch 128, FP16 changes throughput by +22.2% for Zipformer CR-CTC-transducer and +58.5% for Parakeet V3 relative to FP32.
-- **Mean-WER is consistent across precisions and batches.** On B300, the recorded mean-WER span across all measured precisions and batches is 0.014% for Zipformer CR-CTC-transducer and 0.034% for Parakeet V3.
+- **Batching matters.** On B300 with FP16, batch 256 versus batch 1 delivers 28.5x for Zipformer CR-CTC Transducer and 21.6x for Parakeet V3 TDT.
+- **Gains taper.** On that same GPU with FP16, doubling capacity from 128 to 256 changes throughput by +25.1% for Zipformer CR-CTC Transducer and +23.0% for Parakeet V3.
+- **BF16 is supported too.** At B300/batch 256, BF16 throughput is slightly higher for Zipformer CR-CTC Transducer and Parakeet V3 than FP16. WER is recorded for every configuration; precision can marginally change outputs.
+- **FP16 vs. FP32.** At B300/batch 128, FP16 changes throughput by +22.2% for Zipformer CR-CTC Transducer and +58.5% for Parakeet V3 relative to FP32.
+- **Mean-WER is consistent across precisions and batches.** On B300, the recorded mean-WER span across all measured precisions and batches is 0.014% for Zipformer CR-CTC Transducer and 0.034% for Parakeet V3.
 
 [All results](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md) | [Download CSV](https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/measurements.csv)
 
@@ -63,7 +63,7 @@ We reproduced the [Open ASR Leaderboard](https://github.com/huggingface/open_asr
 **Requirements:** Linux x86-64, Python 3.12-3.14, an NVIDIA GPU, and
 [NVIDIA driver 580 or newer](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 The package uses CUDA 13 and TensorRT.
-The wheel includes all nine native plugins; no local plugin compilation or TensorRT development headers are needed.
+The wheel includes all nine TensorRT custom plugins; no local compilation or TensorRT development headers are needed.
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -75,7 +75,7 @@ provide GPU inference; PyTorch does not need CUDA support. Package metadata cann
 select PyTorch's CPU index for pip automatically.
 
 **Supported families: Parakeet TDT/CTC and Zipformer Transducer/CTC.**
-You can export compatible checkpoints and fine-tunes, not just the models
+You can export compatible checkpoints and finetuned models, not just the models
 shown below. Checkpoints must match the exporters' supported architectures and
 checkpoint/configuration formats.
 
@@ -89,10 +89,9 @@ as inference. **Export deletes and recreates its output directory.** Keep
 checkpoints and unrelated files outside it. Building engines takes time and
 requires additional host/GPU memory for tactic selection.
 
-### Zipformer CR-CTC-transducer
+### Zipformer CR-CTC Transducer
 
-[Zipformer CR-CTC-transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M)
-checkpoint.
+[Zipformer CR-CTC Transducer XL 290M checkpoint.](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M)
 
 ```bash
 mkdir -p checkpoints/zipformer
@@ -111,7 +110,7 @@ fast-gpu-asr-export-zipformer \
 
 #### CTC Decoding
 
-Export the same CR-CTC checkpoint's CTC head instead of its transducer head:
+Export the same CR-CTC checkpoint's CTC head instead of its Transducer head:
 
 ```bash
 fast-gpu-asr-export-zipformer \
@@ -128,8 +127,7 @@ above use transducer decoding, not CTC.
 
 ### Parakeet V3
 
-[Parakeet TDT 0.6B V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
-checkpoint.
+[Parakeet TDT 0.6B V3 checkpoint.](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
 
 ```bash
 mkdir -p checkpoints/parakeet
@@ -167,9 +165,8 @@ fast-gpu-asr-export-parakeet \
   --optimization-level 5
 ```
 
-CTC uses one encoder engine with an integrated CTC head and GPU greedy decoding;
-there is no TDT decoder engine. These checkpoints are separate from the TDT
-models used in the benchmarks above.
+CTC uses one encoder engine with an integrated CTC head and GPU greedy decoding.
+These checkpoints are separate from the TDT models used in the benchmarks above.
 
 ### Transcribe
 
@@ -192,7 +189,7 @@ for path in paths:
         sample_rate = wav.getframerate()
         if (channels, sample_width, sample_rate) != (1, 2, 16000):
             raise ValueError(f"Expected a mono PCM16 WAV at 16 kHz: {path}")
-        samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+        samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
     audios.append(samples.astype(np.float32) / 32768.0)
 
 # Or use "exported/zipformer-ctc" or "exported/parakeet".
@@ -204,54 +201,191 @@ for path, text, words in zip(paths, texts, timestamps, strict=True):
         print(f"  {start:.2f}-{end:.2f}: {word}")
 ```
 
-Pass a nonempty list of nonempty, one-dimensional NumPy `float32` waveforms,
-normalized to `[-1, 1]`, at the bundle's sample rate. **Partial batches work**:
-you can pass fewer clips than the exported capacity, but not more. Each clip
-must fit the maximum duration; short clips are padded internally while retaining
-their valid lengths. Resample and segment longer recordings before calling `ASR`.
+Pass one or more nonempty 1D NumPy `float32` waveforms as a list, normalized to
+`[-1, 1]` at the bundle's sample rate. **Partial batches work**; short clips are
+padded internally. Stay within the exported batch and duration limits; resample
+or split audio beforehand.
 
-The return value contains one transcript and one list of `(word, start, end)`
-tuples per input, with times in seconds. Word boundaries are derived from decoder
-token times, not a separate forced aligner; the final word ends at the audio
-duration. Select a GPU with `ASR(..., device_id=0)`.
+`ASR` returns a transcript and a list of `(word, start, end)` tuples per clip,
+with times in seconds. Timestamps come from decoder tokens; the final word ends
+at the clip's duration. Select a GPU with `ASR(..., device_id=0)`.
 
-## Why It Is Fast
-
-The contribution is the inference pipeline: taking these trained architectures
-from raw waveforms to batched transcripts without requiring their training stacks.
-
-- **Features stay with the encoder.** Waveform framing, FFT, mel projection, and
-  feature normalization run on the GPU inside the acoustic encoder engine.
-- **Native operators where they matter.** Nine TensorRT plugins implement
-  feature extraction, relative-attention operations, convolution, and Zipformer
-  resampling/output assembly, using CUDA, cuFFT, and cuBLAS.
-- **Search stays on the GPU.** Beam scores, hypothesis merging before pruning,
-  and token histories stay in device memory. Parakeet's search also tracks
-  durations and recurrent predictor states.
-- **Reuse instead of repeated work.** Zipformer precomputes its finite predictor
-  context table. Reusable device buffers and CUDA graph replay for supported
-  recurring shapes reduce allocation and launch work.
-
-These are implementation choices, not independently measured speedup factors.
-Audio staging and text/timestamp postprocessing still involve the CPU.
-
-## Models and Precision
+### Models and Inference Precision
 
 | Family | Example checkpoints | Decoder modes |
 |---|---|---|
-| Zipformer transducer/CTC | [CR-CTC/transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M), [transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M) | Transducer modified beam search; CTC greedy when a CTC head is present |
-| Parakeet TDT | 0.6B [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) | TDT modified beam search |
+| Zipformer Transducer / CTC | [CR-CTC / Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M), [Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M) | Transducer modified beam search; CTC greedy |
+| Parakeet TDT | [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) | TDT modified beam search |
 | Parakeet CTC | [0.6B](https://huggingface.co/nvidia/parakeet-ctc-0.6b), [1.1B](https://huggingface.co/nvidia/parakeet-ctc-1.1b) | CTC greedy |
 
 **FP32, FP16, and BF16** are supported. BF16 requires Ampere or newer.
 Published measurements cover A100, H200, and B300 with Zipformer
-CR-CTC-transducer and Parakeet V3, using beam 6 and English audio.
-Compilation support for other architectures is not a performance measurement.
+CR-CTC Transducer and Parakeet V3 TDT, using beam 6 and English audio.
 
-This is an **offline inference library**, not a streaming server, VAD, or
-diarization pipeline. Engines have fixed batch capacity and dynamic audio length
-within their exported profiles. Choose smaller capacities or separate duration
+This is an **offline batch inference library**, not a streaming server.
+Engines have fixed batch capacity and dynamic audio length
+within their exported profiles. Choose smaller batch size or separate duration
 profiles when memory or latency matters more than aggregate throughput.
+
+## Implementation Details
+
+### Zipformer and Parakeet FastConformer Encoder
+
+A single TensorRT engine turns raw waveforms into decoder-ready outputs.
+Features and activations stay on the GPU, and the decoder consumes the outputs
+directly, without a round trip through CPU memory.
+
+- **GPU-native audio frontend.** Batched cuFFT transforms, cuBLAS mel projection,
+  and custom framing, windowing, and normalization kernels keep feature extraction
+  inside the encoder. There is no CPU feature-extraction stage or feature upload.
+- **Fused, layout-aware kernels.** Nine native TensorRT plugin libraries across
+  both model families combine operations such as relative-position alignment, masking,
+  and softmax, or depthwise convolution and activation. Attention reads projection
+  layouts directly where possible, avoiding explicit transpose buffers; dedicated
+  Zipformer kernels handle resampling and output assembly.
+- **Optimizations at export time.** Parakeet combines query, key, and value into
+  one projection, folds evaluation-mode BatchNorm into convolution weights and
+  biases, and absorbs constant feed-forward scaling into its output projections.
+  This reduces projection launches and removes separate BatchNorm and scaling
+  operations at inference.
+- **Tuned for the target GPU.** TensorRT selects implementations for the exported
+  batch size, duration profile, and precision, including eligible CUDA and cuBLAS
+  tactics exposed by the plugins. Tactic selection happens during engine building.
+- **Reuse memory, replay execution.** Pinned host staging, asynchronous transfers,
+  and reusable device buffers and workspaces reduce setup work. Consecutive batches
+  with the same shape can use CUDA graph replay to reduce kernel-launch overhead.
+
+### Beam Search Decoder
+
+Both transducer decoders keep scores, candidate selection, and token histories
+on the GPU. Backpointers avoid copying histories; reusable buffers and CUDA graphs
+reduce allocation and launch overhead. Final selection uses length-normalized
+log probability.
+
+#### Zipformer RNN-T
+
+Like k2/Icefall's Zipformer reference
+[`modified_beam_search`](https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/pruned_transducer_stateless2/beam_search.py),
+our search emits at most one nonblank token per encoder frame. Key differences:
+
+- **Merge first, then prune.** Icefall selects the top `beam` candidates before
+  merging duplicate histories. We combine their scores with log-sum-exp first,
+  then retain the top `beam` **unique hypotheses**. Duplicates cannot waste beam
+  slots, and combined scores can rescue histories that early pruning would lose.
+- **Precompute the predictor.** GPU table lookups replace per-frame stateless
+  predictor evaluation; only the joiner runs at each step. Export precomputes
+  projected outputs for contexts of up to two tokens, trading memory for less work.
+- **Specialize the search.** CUDA kernels tailored to beam, vocabulary, and
+  context size replace Python lists and ragged bookkeeping. Prefix checks find
+  possible duplicates; exact history comparisons guard against hash collisions.
+
+#### Parakeet TDT
+
+Like NeMo's batched
+[`ModifiedALSDBatchedTDTComputer`](https://github.com/NVIDIA-NeMo/Speech/blob/main/nemo/collections/asr/parts/submodules/tdt_malsd_batched_computer.py)
+implementation, our decoder supports batched hypotheses, GPU-resident LSTM
+states, reusable buffers, and CUDA graphs. Key differences:
+
+- **Merge before pruning.** NeMo selects the top `beam` candidates, then
+  recombines survivors. We merge candidates first, checking exact token histories,
+  encoder positions, and zero-duration emission counts, then retain the top
+  `beam` unique states.
+- **Search duration alternatives.** NeMo pairs each parent's top token candidates
+  with its most probable duration, forcing zero-duration blanks to advance. We expand
+  each parent's top `beam` nonblank tokens over **all configured durations**,
+  plus blanks over every positive duration, before merging and pruning.
+- **Advance differently at the symbol limit.** NeMo forces a blank when its
+  emission cap is reached. Our `max_symbols_per_timestep` advances one frame
+  after the capped zero-duration token without adding a blank transition.
+- **TensorRT and custom CUDA kernels.** Our predictor/joiner runs in TensorRT;
+  CuPy-launched kernels handle search and state routing. NeMo uses PyTorch and
+  supports a full conditional CUDA-graph loop; ours replays fixed search chunks
+  with periodic host completion checks.
+
+For both models, these search changes can affect transcripts; they do not
+guarantee better WER or identical upstream results. These are implementation
+comparisons, not matched speedup measurements against upstream decoders.
+
+#### Decoder Settings
+
+`transducer_modified_beam_search` uses the exported beam width;
+`transducer_greedy_search` just simply forces `beam=1` on the same beam search, not a separate
+greedy algorithm. `ctc_greedy_search` requires a CTC head and uses neither a
+transducer decoder engine nor a predictor table.
+
+Both exporters accept `--blank-penalty` (default `0.0`), subtracted from blank log
+probabilities after normalization. Positive values discourage blanks in every
+mode, including beam one. `k2` applies its penalty before softmax, so equal
+nonzero settings are not equivalent. Mode, beam, and penalty are saved in
+`model_config.yaml`.
+
+### Export and Runtime Notes
+
+`--encoder-precision` and `--decoder-precision` default to `fp32`. Waveform
+frontends and CTC heads remain FP32 in both models. Changing precision can change
+transcripts: check WER alongside throughput.
+
+- **Zipformer precision.** The final encoder projection and transducer log
+  probabilities remain FP32. BF16 exports use FP16 for the first subsampling
+  convolution.
+- **Parakeet precision.** When input scaling is enabled,
+  FP16 exports rescale the first block's output weights, biases, and LayerNorm
+  epsilons to keep residuals in range while retaining FP16 subsampling and
+  Conformer layers. FP32/BF16 exports instead fold the scale into the subsampling
+  projection's weights and bias.
+- **Export.** Parakeet profiles are limited to 512 encoder frames by the attention
+  plugin. Build engines for the target GPU and matching TensorRT/plugin versions.
+  Use `--debug` to keep intermediate ONNX files; successful exports otherwise
+  remove them.
+- **Runtime.** Each `ASR` instance reuses buffers and serializes calls with a lock.
+  Model-bundle validation is enabled by default (`validate=True`).
+
+### Build From Source
+
+Provide a CUDA-compatible C++20 host compiler and TensorRT development headers
+(`NvInfer.h`) matching the runtime in `uv.lock`. If the headers are outside the
+compiler's search paths, set `CPLUS_INCLUDE_PATH` to their directory. From the
+repository root:
+
+```bash
+uv sync --frozen --extra dev
+uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
+```
+
+`uv` installs `nvcc`, CUDA headers/libraries, TensorRT, and CPU-only PyTorch.
+PyTorch handles ONNX export. Prefix exporter
+commands with `uv run --frozen` when using the checkout. For TensorRT headers,
+[CI](https://github.com/SoundsGoodAI/fast-gpu-asr/actions/workflows/ci.yml)
+uses GitHub releases, with a checksum-verified NVIDIA fallback when the tag is
+unavailable.
+
+**Native targets:** `sm_75`, `sm_80`, `sm_86`, `sm_87`, `sm_88`, `sm_89`, `sm_90`,
+`sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121`, plus a `compute_80` PTX
+fallback. Verify execution and memory requirements on your GPU.
+
+### Tests and Packaging
+
+After the source-build setup above, run from the repository root:
+
+```bash
+uv run --frozen pytest
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+uv run --frozen python src/fast_gpu_asr/decoder/lint_gpu_kernels.py --check
+```
+
+GPU tests skip when CUDA is unavailable; BF16 tests require SM80 (Ampere) or newer.
+Tests check decoder behavior and numerical tolerances, not identical transcripts
+across precisions. Formatting limits are 88 columns for Python and 100 for CUDA/C++.
+
+**Build a wheel:** `scripts/build_wheel.sh` rebuilds plugins and produces a repaired
+`manylinux_2_27_x86_64` wheel in `dist/`. Pass an output directory to override it.
+CUDA and TensorRT remain external dependencies. Source distributions are unsupported.
+
+**CI:** The [workflow](https://github.com/SoundsGoodAI/fast-gpu-asr/actions/workflows/ci.yml)
+runs Python 3.12-3.14 CPU checks on pushes to `main` and pull requests. Manual
+dispatch with `run_gpu_tests=true` adds native tests and wheel smoke tests on the
+separately billed `gpu-t4` runner; SM80-only cases skip there.
 
 ## Reproduce the Measurements
 
@@ -261,9 +395,7 @@ profiles when memory or latency matters more than aggregate throughput.
 
 The CSV regenerates the published tables and plots on a CPU-only host. Collecting
 new measurements requires the datasets, checkpoints, and a target GPU. The
-published campaign pins its source and scorer revisions; the current collection
-CLI uses an upstream `main` checkout, so a fresh campaign is not an exact replay.
-The repeated-waveform microbenchmark is separate from these full-corpus results.
+published campaign pins its source and scorer revisions.
 
 ### Rebuild Published Plots
 
@@ -279,100 +411,12 @@ Skip browser installation when Chrome/Chromium is already available, or set
 `BROWSER_PATH` to its executable. This regenerates two SVGs, `results.md`, and
 only the marked performance block in this README from `measurements.csv`.
 
-<details>
-<summary><strong>Advanced configuration, source builds, and development</strong></summary>
-
-### Decoder and Export Settings
-
-Despite its name, `transducer_greedy_search` selects modified beam search with
-`beam=1`, not a separate greedy algorithm, and overrides a supplied wider beam.
-`ctc_greedy_search` requires a Zipformer or Parakeet CTC head and needs neither a
-transducer decoder engine nor a predictor table.
-The mode, beam, and blank penalty are saved in `model_config.yaml`. Both exporters
-accept `--blank-penalty`, defaulting to `0.0`. Positive values discourage blanks
-in all decoder types, including beam-one transducer decoding.
-
-Both precision arguments default to `fp32`. Waveform frontends stay FP32.
-Zipformer's final encoder projection and transducer log probabilities stay FP32;
-its BF16 path uses FP16 for the first subsampling convolution. Parakeet CTC's head
-stays FP32. With FP16 and input scaling enabled, Parakeet rescales the first
-block's output weights and normalization epsilons to keep its residual in range;
-subsampling and Conformer layers stay FP16. FP32/BF16 exports fold input scaling
-into the subsampling projection's weights and bias. Changing precision can
-change outputs: check WER for your workload, not just speed.
-
-Parakeet's profile must fit its attention plugin's limit of 512 encoder frames.
-Zipformer's precomputed predictor table uses additional GPU memory and supports
-context sizes up to two. Other noncausal, six-stack Icefall Zipformer checkpoints
-must satisfy the exporter's configuration and checkpoint-layout checks.
-Use `--debug` to retain intermediate ONNX files; otherwise successful export
-removes them. Engines depend on the GPU architecture, TensorRT version, and plugin
-binaries used to build them.
-
-An `ASR` instance reuses mutable buffers and serializes calls with a lock.
-Validation is enabled by default. For advanced composition, the package also
-exports `Encoder`, `CTCGreedyDecoder`, `ZipformerModifiedBeamSearchDecoder`,
-`ParakeetModifiedBeamSearchDecoder`, and `PostProcessor`.
-
-### Build From Source
-
-From a checkout, provide a CUDA-compatible C++20 host compiler and TensorRT
-development headers matching the locked runtime, including `NvInfer.h`:
-
-```bash
-uv sync --frozen --extra dev
-uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
-```
-
-Python dependencies provide `nvcc`, CUDA headers, cuBLAS, cuFFT, CUDA runtime
-libraries, and TensorRT. The builder uses those wheel-provided libraries.
-CI obtains matching TensorRT headers from GitHub, falling back to NVIDIA's
-checksum-verified header package if the release tag is unavailable.
-CPU-only PyTorch remains a dependency for export and loading the predictor table.
-This checkout's `uv` configuration selects it automatically; pip users must follow
-the CPU-first installation commands above. Prefix exporter commands with
-`uv run --frozen` when using the checkout.
-
-Native targets are `sm_75`, `sm_80`, `sm_86`, `sm_87`, `sm_88`, `sm_89`, `sm_90`,
-`sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121`, with a `compute_80` PTX
-fallback. Verify execution and resource requirements on your GPU.
-
-### Tests and Packaging
-
-```bash
-uv run --frozen pytest
-uv run --frozen ruff check src tests scripts benchmarks docs/benchmarks/render.py
-uv run --frozen ruff format --check src tests scripts benchmarks docs/benchmarks/render.py
-uv run --frozen python src/fast_gpu_asr/decoder/lint_gpu_kernels.py --check
-```
-
-Ruff uses 88 columns; CUDA/C++ formatting uses 100. CPU-only hosts skip device
-tests. Full runtime/plugin coverage needs a supported GPU, including Ampere or
-newer for BF16 cases. GPU/reference tests cover numerical tolerances and decoder
-behavior, not a blanket promise of identical transcripts at every precision.
-
-`scripts/build_wheel.sh` rebuilds the plugins and repairs a
-`manylinux_2_27_x86_64` wheel. Its optional argument selects an output directory;
-the default is `dist`. CUDA and TensorRT remain dependencies rather than copied
-libraries inside the wheel. Source distributions are not supported.
-
-[CI](https://github.com/SoundsGoodAI/fast-gpu-asr/actions/workflows/ci.yml) runs
-Python 3.12-3.14 CPU checks on pushes and pull requests. Manual `run_gpu_tests`
-dispatch uses the separately billed `gpu-t4` runner for native tests and wheel
-smoke tests; SM80-only cases skip there. Publishing is disabled by default.
-Configure a PyPI Trusted Publisher for this repository's `ci.yml` workflow and
-`pypi` environment before publishing; use a separate `testpypi` publisher for a
-trial release. Dispatch from the tag matching `pyproject.toml`, with
-`run_gpu_tests=true` and the appropriate `publish_to` destination.
-
-</details>
-
 ## License and Acknowledgments
 
 Code is [Apache-2.0](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/LICENSE). **Model weights and datasets retain their own
 licenses**; the code license does not grant commercial rights to noncommercial
 checkpoints.
 
-Built on the work of [K2](https://github.com/k2-fsa),
+Built on the work of [k2](https://github.com/k2-fsa),
 [NeMo](https://github.com/NVIDIA/NeMo), and their contributors, with NVIDIA
 TensorRT and CUDA libraries. See [NOTICE](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/NOTICE) for component attribution.

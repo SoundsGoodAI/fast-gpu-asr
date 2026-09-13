@@ -17,7 +17,7 @@ from fast_gpu_asr.constants import (
     ONNX_OPSET_VERSION,
     PARAKEET_CONFORMER_CONVOLUTION_PLUGIN_NAME,
     PARAKEET_FEATURE_PLUGIN_NAME,
-    PARAKEET_FLASH_ATTENTION_PLUGIN_NAME,
+    PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME,
     TENSORRT_PLUGIN_NAMESPACE,
     ZIPFORMER_ATTENTION_VALUE_PLUGIN_NAME,
     ZIPFORMER_CONVOLUTION_PLUGIN_NAME,
@@ -860,7 +860,7 @@ def test_parakeet_conformer_convolution_exports_exact_folded_plugin_inputs(
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=FLOAT_DTYPE_IDS)
-def test_parakeet_flash_attention_exports_as_tensorrt_plugin(
+def test_parakeet_relative_attention_exports_as_tensorrt_plugin(
     tmp_path: Path, dtype: torch.dtype
 ) -> None:
     attention = RelPositionMultiHeadAttention(3, 12, use_bias=False).eval().to(dtype)
@@ -874,7 +874,7 @@ def test_parakeet_flash_attention_exports_as_tensorrt_plugin(
         make_random_tensor((1, 13, 12), 35, dtype),
         torch.full((2,), 7, dtype=torch.int32),
     )
-    onnx_path = tmp_path / f"parakeet_flash_attention_{dtype}.onnx"
+    onnx_path = tmp_path / f"parakeet_relative_attention_{dtype}.onnx"
     torch.onnx.export(
         attention,
         inputs,
@@ -886,12 +886,12 @@ def test_parakeet_flash_attention_exports_as_tensorrt_plugin(
 
     model = onnx.shape_inference.infer_shapes(onnx.load(onnx_path))
     check_onnx_model_with_custom_plugins(
-        model, {PARAKEET_FLASH_ATTENTION_PLUGIN_NAME: 1}
+        model, {PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME: 1}
     )
     (custom_node,) = (
         node
         for node in model.graph.node
-        if node.op_type == PARAKEET_FLASH_ATTENTION_PLUGIN_NAME
+        if node.op_type == PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME
     )
     assert len(custom_node.input) == 5
     attributes = {
@@ -968,7 +968,7 @@ def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(
         model,
         {
             PARAKEET_FEATURE_PLUGIN_NAME: 1,
-            PARAKEET_FLASH_ATTENTION_PLUGIN_NAME: 2,
+            PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME: 2,
             PARAKEET_CONFORMER_CONVOLUTION_PLUGIN_NAME: 2,
         },
     )

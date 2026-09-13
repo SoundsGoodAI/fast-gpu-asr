@@ -9,7 +9,7 @@ import torch
 
 from ....constants import (
     ONNX_OPSET_VERSION,
-    PARAKEET_FLASH_ATTENTION_PLUGIN_NAME,
+    PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME,
     TENSORRT_PLUGIN_NAMESPACE,
 )
 
@@ -66,7 +66,7 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
             the same dtype as ``x``. Eager execution converts the content and
             position scores to ``torch.float32`` before combining and normalizing
             them. ONNX export replaces relative scoring, masking, softmax, and
-            value aggregation with one native TensorRT FlashAttention plugin node.
+            value aggregation with one native TensorRT relative-attention plugin node.
         """
 
         batch_size, num_frames, _ = x.size()
@@ -76,7 +76,7 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
 
         if torch.onnx.is_in_onnx_export():
             x = torch.onnx.ops.symbolic(
-                PARAKEET_FLASH_ATTENTION_PLUGIN_NAME,
+                PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME,
                 (qkv, p, self.pos_bias_u, self.pos_bias_v, output_lengths),
                 {
                     "scale": 1.0 / self.s_d_k,

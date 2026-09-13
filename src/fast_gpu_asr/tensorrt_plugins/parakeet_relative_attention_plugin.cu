@@ -41,10 +41,9 @@ namespace
 // relative positions remain in their original projection buffers and are read
 // with strided leading dimensions. The output is contiguous [N, T, C].
 // Relative alignment and masked softmax are fused in one warp-row CUDA kernel.
-// Unlike online FlashAttention, this implementation materializes both score
-// matrices in TensorRT-owned workspace; the plugin name refers to the fused
-// relative-attention execution path.
-constexpr char const* kPluginName = "parakeet_flash_attention";
+// Content and position score matrices are materialized in TensorRT-owned
+// workspace.
+constexpr char const* kPluginName = "parakeet_relative_attention";
 constexpr char const* kPluginVersion = "1";
 constexpr char const* kScaleField = "scale";
 constexpr char const* kTimingCacheId =
@@ -578,19 +577,19 @@ bool launchParakeetSoftmax(void const* positionScores, int32_t const* validLengt
 
 #undef LAUNCH_SOFTMAX_CASE
 
-struct ParakeetFlashAttentionParameters
+struct ParakeetRelativeAttentionParameters
 {
     float scale{};
 };
 
-class ParakeetFlashAttentionPlugin final : public IPluginV3,
-                                           public IPluginV3OneCore,
-                                           public IPluginV3OneBuild,
-                                           public IPluginV3OneRuntime
+class ParakeetRelativeAttentionPlugin final : public IPluginV3,
+                                              public IPluginV3OneCore,
+                                              public IPluginV3OneBuild,
+                                              public IPluginV3OneRuntime
 {
   public:
-    explicit ParakeetFlashAttentionPlugin(
-        ParakeetFlashAttentionParameters parameters, int32_t tactic = kStrictComputeTactic) noexcept
+    explicit ParakeetRelativeAttentionPlugin(ParakeetRelativeAttentionParameters parameters,
+        int32_t tactic = kStrictComputeTactic) noexcept
         : mParameters(parameters), mTactic(tactic)
     {
         int const timingCacheLength = std::snprintf(mTimingCacheId.data(), mTimingCacheId.size(),
@@ -601,7 +600,7 @@ class ParakeetFlashAttentionPlugin final : public IPluginV3,
         initializeFields();
     }
 
-    ~ParakeetFlashAttentionPlugin() override
+    ~ParakeetRelativeAttentionPlugin() override
     {
         if (mCublas != nullptr)
         {
@@ -622,7 +621,7 @@ class ParakeetFlashAttentionPlugin final : public IPluginV3,
 
     IPluginV3* clone() noexcept override
     {
-        auto* plugin = new (std::nothrow) ParakeetFlashAttentionPlugin(mParameters, mTactic);
+        auto* plugin = new (std::nothrow) ParakeetRelativeAttentionPlugin(mParameters, mTactic);
         if (plugin == nullptr || !plugin->mInitialized)
         {
             delete plugin;
@@ -1033,7 +1032,7 @@ class ParakeetFlashAttentionPlugin final : public IPluginV3,
     PluginFieldCollection const* getFieldsToSerialize() noexcept override { return &mFields; }
 
   private:
-    friend class ParakeetFlashAttentionPluginCreator;
+    friend class ParakeetRelativeAttentionPluginCreator;
 
     void initializeFields() noexcept
     {
@@ -1041,7 +1040,7 @@ class ParakeetFlashAttentionPlugin final : public IPluginV3,
         mFields = {static_cast<int32_t>(mSerializedFields.size()), mSerializedFields.data()};
     }
 
-    ParakeetFlashAttentionParameters mParameters{};
+    ParakeetRelativeAttentionParameters mParameters{};
     cublasHandle_t mCublas{nullptr};
     cudaStream_t mStream{nullptr};
     void* mWorkspace{nullptr};
@@ -1053,10 +1052,10 @@ class ParakeetFlashAttentionPlugin final : public IPluginV3,
     PluginFieldCollection mFields{};
 };
 
-class ParakeetFlashAttentionPluginCreator final : public IPluginCreatorV3One
+class ParakeetRelativeAttentionPluginCreator final : public IPluginCreatorV3One
 {
   public:
-    ParakeetFlashAttentionPluginCreator() noexcept
+    ParakeetRelativeAttentionPluginCreator() noexcept
     {
         mAttributes[0] = {kScaleField, nullptr, PluginFieldType::kFLOAT32, 1};
         mFields = {static_cast<int32_t>(mAttributes.size()), mAttributes.data()};
@@ -1080,7 +1079,7 @@ class ParakeetFlashAttentionPluginCreator final : public IPluginCreatorV3One
             return nullptr;
         }
 
-        ParakeetFlashAttentionParameters parameters{};
+        ParakeetRelativeAttentionParameters parameters{};
         auto const& field = fields->fields[0];
         if (field.name == nullptr || std::string_view(field.name) != kScaleField
             || field.type != PluginFieldType::kFLOAT32 || field.length != 1
@@ -1094,7 +1093,7 @@ class ParakeetFlashAttentionPluginCreator final : public IPluginCreatorV3One
         {
             return nullptr;
         }
-        auto* plugin = new (std::nothrow) ParakeetFlashAttentionPlugin(parameters);
+        auto* plugin = new (std::nothrow) ParakeetRelativeAttentionPlugin(parameters);
         if (plugin == nullptr || !plugin->mInitialized)
         {
             delete plugin;
@@ -1110,16 +1109,16 @@ class ParakeetFlashAttentionPluginCreator final : public IPluginCreatorV3One
 } // namespace
 } // namespace fastgpuasr_tensorrt
 
-extern "C" bool initFastGpuAsrParakeetFlashAttentionPlugin() noexcept
+extern "C" bool initFastGpuAsrParakeetRelativeAttentionPlugin() noexcept
 {
     using namespace fastgpuasr_tensorrt;
 
     // Builder and runtime use distinct registries. Treat an existing matching
     // creator as success so repeated package imports remain idempotent.
-    static ParakeetFlashAttentionPluginCreator runtimeCreator;
-    static ParakeetFlashAttentionPluginCreator builderCreator;
+    static ParakeetRelativeAttentionPluginCreator runtimeCreator;
+    static ParakeetRelativeAttentionPluginCreator builderCreator;
     auto ensureRegistered =
-        [](IPluginRegistry* registry, ParakeetFlashAttentionPluginCreator& creator) noexcept
+        [](IPluginRegistry* registry, ParakeetRelativeAttentionPluginCreator& creator) noexcept
     {
         if (registry == nullptr)
         {

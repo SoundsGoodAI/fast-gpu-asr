@@ -25,9 +25,9 @@ from fast_gpu_asr.constants import (
     PARAKEET_DECODER_ONNX_FILE,
     PARAKEET_DECODER_TENSORRT_FILE,
     PARAKEET_FEATURE_PLUGIN_NAME,
-    PARAKEET_FLASH_ATTENTION_PLUGIN_NAME,
     PARAKEET_MAX_ENCODER_FRAMES,
     PARAKEET_ONNX_FILE,
+    PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME,
     PARAKEET_TENSORRT_FILE,
     PRECISION_DTYPES,
     TDT_BEAM_SEARCH_CHUNK_STEPS,
@@ -77,7 +77,7 @@ PLUGIN_NAMES_BY_SOURCE = {
     ),
     "zipformer_output_assembly_plugin.cu": (ZIPFORMER_OUTPUT_ASSEMBLY_PLUGIN_NAME,),
     "parakeet_feature_plugin.cu": (PARAKEET_FEATURE_PLUGIN_NAME,),
-    "parakeet_flash_attention_plugin.cu": (PARAKEET_FLASH_ATTENTION_PLUGIN_NAME,),
+    "parakeet_relative_attention_plugin.cu": (PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME,),
     "parakeet_convolution_plugin.cu": (PARAKEET_CONFORMER_CONVOLUTION_PLUGIN_NAME,),
 }
 
@@ -162,7 +162,7 @@ def test_plugin_identifiers_are_stable() -> None:
         "zipformer_upsample_bypass",
         "zipformer_output_assembly",
         "parakeet_feature_extractor",
-        "parakeet_flash_attention",
+        "parakeet_relative_attention",
         "parakeet_conformer_convolution",
     )
 
@@ -230,7 +230,7 @@ def test_plugin_dependencies() -> None:
         "zipformer_resampling_plugin.cu": ("cudart",),
         "zipformer_output_assembly_plugin.cu": ("cudart",),
         "parakeet_feature_plugin.cu": ("cublas", "cufft", "cudart"),
-        "parakeet_flash_attention_plugin.cu": ("cublas", "cudart"),
+        "parakeet_relative_attention_plugin.cu": ("cublas", "cudart"),
         "parakeet_convolution_plugin.cu": ("cudart",),
     }
 
@@ -311,7 +311,7 @@ int main()
 
 
 def test_parakeet_encoder_frame_limit_matches_cpp_plugin() -> None:
-    source = (PLUGIN_DIR / "parakeet_flash_attention_plugin.cu").read_text(
+    source = (PLUGIN_DIR / "parakeet_relative_attention_plugin.cu").read_text(
         encoding="utf8"
     )
     declarations = re.findall(
