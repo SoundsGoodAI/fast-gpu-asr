@@ -17,6 +17,7 @@ from omegaconf.errors import OmegaConfBaseException
 from .constants import (
     CUDA_DEFAULT_SHARED_MEMORY_BYTES,
     DECODER_TYPES,
+    FLOAT32_MAX,
     INT32_MAX,
     MODEL_TYPE_PARAKEET,
     MODEL_TYPE_ZIPFORMER,
@@ -251,8 +252,6 @@ def validate_model_config(model_config: DictConfig) -> None:
         raise ASRInitializationError(
             f"Expected decoder_type to be one of {DECODER_TYPES}, got {decoder_type}."
         )
-    if model_type == MODEL_TYPE_PARAKEET and decoder_type == "ctc_greedy_search":
-        raise ASRInitializationError("Parakeet TDT models do not contain a CTC head.")
 
     required_fields = (
         "model_samplerate",
@@ -272,14 +271,17 @@ def validate_model_config(model_config: DictConfig) -> None:
         required_fields += (
             "audio_encoder_params.model_dim",
             "audio_encoder_params.n_layers",
-            "decoder_params.decoder_dim",
-            "decoder_params.encoder_dim",
-            "decoder_params.joiner_dim",
-            "decoder_params.max_symbols_per_timestep",
-            "decoder_params.num_extra_outputs",
-            "decoder_params.pred_rnn_layers",
-            "decoder_params.tdt_durations",
         )
+        if decoder_type != "ctc_greedy_search":
+            required_fields += (
+                "decoder_params.decoder_dim",
+                "decoder_params.encoder_dim",
+                "decoder_params.joiner_dim",
+                "decoder_params.max_symbols_per_timestep",
+                "decoder_params.num_extra_outputs",
+                "decoder_params.pred_rnn_layers",
+                "decoder_params.tdt_durations",
+            )
     else:
         required_fields += (
             "audio_encoder_params.downsampling_factors",
@@ -335,22 +337,25 @@ def validate_model_config(model_config: DictConfig) -> None:
                 "audio_encoder_params.n_layers",
                 model_config.audio_encoder_params.n_layers,
             ),
-            ("decoder_params.encoder_dim", model_config.decoder_params.encoder_dim),
-            ("decoder_params.decoder_dim", model_config.decoder_params.decoder_dim),
-            ("decoder_params.joiner_dim", model_config.decoder_params.joiner_dim),
-            (
-                "decoder_params.pred_rnn_layers",
-                model_config.decoder_params.pred_rnn_layers,
-            ),
-            (
-                "decoder_params.num_extra_outputs",
-                model_config.decoder_params.num_extra_outputs,
-            ),
-            (
-                "decoder_params.max_symbols_per_timestep",
-                model_config.decoder_params.max_symbols_per_timestep,
-            ),
         )
+        if decoder_type != "ctc_greedy_search":
+            positive_integer_values += (
+                ("decoder_params.encoder_dim", model_config.decoder_params.encoder_dim),
+                ("decoder_params.decoder_dim", model_config.decoder_params.decoder_dim),
+                ("decoder_params.joiner_dim", model_config.decoder_params.joiner_dim),
+                (
+                    "decoder_params.pred_rnn_layers",
+                    model_config.decoder_params.pred_rnn_layers,
+                ),
+                (
+                    "decoder_params.num_extra_outputs",
+                    model_config.decoder_params.num_extra_outputs,
+                ),
+                (
+                    "decoder_params.max_symbols_per_timestep",
+                    model_config.decoder_params.max_symbols_per_timestep,
+                ),
+            )
     else:
         positive_integer_values += (
             (
@@ -368,8 +373,8 @@ def validate_model_config(model_config: DictConfig) -> None:
             "downsampling_factors",
             "feedforward_dims",
         ):
-            values = tuple(model_config.audio_encoder_params[name])
-            if len(values) != 6:
+            values = model_config.audio_encoder_params[name]
+            if not OmegaConf.is_list(values) or len(values) != 6:
                 raise ASRInitializationError(
                     f"Expected audio_encoder_params.{name} to contain six positive "
                     f"integers, got {values}."
@@ -379,7 +384,7 @@ def validate_model_config(model_config: DictConfig) -> None:
                 for index, value in enumerate(values)
             )
             if name == "encoder_dims":
-                zipformer_encoder_dims = values
+                zipformer_encoder_dims = tuple(values)
 
         if model_config.decoder_type != "ctc_greedy_search":
             positive_integer_values += (
@@ -484,10 +489,9 @@ def validate_model_config(model_config: DictConfig) -> None:
         )
 
     blank_penalty = model_config.decoder_params.blank_penalty
-    max_float32 = torch.finfo(torch.float32).max
     if (
         not isinstance(blank_penalty, float)
-        or not -max_float32 <= blank_penalty <= max_float32
+        or not -FLOAT32_MAX <= blank_penalty <= FLOAT32_MAX
     ):
         raise ASRInitializationError(
             "Expected decoder_params.blank_penalty to be a finite float32 value, "
@@ -500,46 +504,55 @@ def validate_model_config(model_config: DictConfig) -> None:
             raise ASRInitializationError(
                 f"Expected blank_id={model_config.vocab_size}, got {blank_id}."
             )
-        if (
-            model_config.audio_encoder_params.model_dim
-            != model_config.decoder_params.encoder_dim
-        ):
+        if model_config.vocab_size + 1 > INT32_MAX:
             raise ASRInitializationError(
-                "audio_encoder_params.model_dim and decoder_params.encoder_dim "
-                "must match."
+                "Parakeet vocabulary plus blank exceeds signed 32-bit indexing."
             )
+        if decoder_type != "ctc_greedy_search":
+            if (
+                model_config.audio_encoder_params.model_dim
+                != model_config.decoder_params.encoder_dim
+            ):
+                raise ASRInitializationError(
+                    "audio_encoder_params.model_dim and decoder_params.encoder_dim "
+                    "must match."
+                )
 
-        durations = tuple(model_config.decoder_params.tdt_durations)
-        if not durations or any(
-            not isinstance(duration, int) or not 0 <= duration <= INT32_MAX
-            for duration in durations
-        ):
-            raise ASRInitializationError(
-                "decoder_params.tdt_durations must contain non-negative signed "
-                "32-bit integers."
-            )
-        if len(durations) != len(set(durations)):
-            raise ASRInitializationError(
-                "decoder_params.tdt_durations must contain unique values."
-            )
-        if len(durations) != model_config.decoder_params.num_extra_outputs:
-            raise ASRInitializationError(
-                "The number of decoder_params.tdt_durations must match "
-                "decoder_params.num_extra_outputs."
-            )
-        if 0 not in durations or all(duration <= 0 for duration in durations):
-            raise ASRInitializationError(
-                "decoder_params.tdt_durations must contain zero and at least one "
-                "positive duration."
-            )
+            durations = model_config.decoder_params.tdt_durations
+            if (
+                not OmegaConf.is_list(durations)
+                or not durations
+                or any(
+                    not isinstance(duration, int) or not 0 <= duration <= INT32_MAX
+                    for duration in durations
+                )
+            ):
+                raise ASRInitializationError(
+                    "decoder_params.tdt_durations must contain non-negative signed "
+                    "32-bit integers."
+                )
+            if len(durations) != len(set(durations)):
+                raise ASRInitializationError(
+                    "decoder_params.tdt_durations must contain unique values."
+                )
+            if len(durations) != model_config.decoder_params.num_extra_outputs:
+                raise ASRInitializationError(
+                    "The number of decoder_params.tdt_durations must match "
+                    "decoder_params.num_extra_outputs."
+                )
+            if 0 not in durations or all(duration <= 0 for duration in durations):
+                raise ASRInitializationError(
+                    "decoder_params.tdt_durations must contain zero and at least one "
+                    "positive duration."
+                )
 
-        positive_duration_count = sum(duration > 0 for duration in durations)
-        candidate_count = beam * (len(durations) * beam + positive_duration_count)
-        if candidate_count > INT32_MAX:
-            raise ASRInitializationError(
-                "The Parakeet per-utterance search table exceeds signed 32-bit "
-                f"indexing: {candidate_count} candidates, limit={INT32_MAX}."
-            )
+            positive_duration_count = sum(duration > 0 for duration in durations)
+            candidate_count = beam * (len(durations) * beam + positive_duration_count)
+            if candidate_count > INT32_MAX:
+                raise ASRInitializationError(
+                    "The Parakeet per-utterance search table exceeds signed 32-bit "
+                    f"indexing: {candidate_count} candidates, limit={INT32_MAX}."
+                )
     else:
         if not isinstance(blank_id, int) or not 0 <= blank_id < model_config.vocab_size:
             raise ASRInitializationError(
@@ -669,11 +682,14 @@ def validate_encoder_engine(engine: trt.ICudaEngine, model_config: DictConfig) -
             f"got {lengths_profile}."
         )
 
-    encoder_dim = (
-        model_config.audio_encoder_params.output_dim
-        if model_config.model_type == MODEL_TYPE_ZIPFORMER
-        else model_config.audio_encoder_params.model_dim
-    )
+    if model_config.model_type == MODEL_TYPE_ZIPFORMER:
+        encoder_dim = model_config.audio_encoder_params.output_dim
+    else:
+        if model_config.decoder_type == "ctc_greedy_search":
+            encoder_dim = model_config.vocab_size + 1
+        else:
+            encoder_dim = model_config.audio_encoder_params.model_dim
+
     expected_shapes = {
         "audio": (batch_size, -1),
         "audio_lengths": (batch_size,),
@@ -697,11 +713,8 @@ def validate_encoder_engine(engine: trt.ICudaEngine, model_config: DictConfig) -
             f"Expected encoder audio_lengths dtype {trt.int64}, "
             f"got {engine.get_tensor_dtype('audio_lengths')}."
         )
-    if engine.get_tensor_dtype("encoder_output") not in (
-        trt.float32,
-        trt.float16,
-        trt.bfloat16,
-    ):
+    tensor_dtypes = (trt.float32, trt.float16, trt.bfloat16)
+    if engine.get_tensor_dtype("encoder_output") not in tensor_dtypes:
         raise ASRInitializationError(
             "Expected encoder_output dtype to be FP32, FP16, or BF16, got "
             f"{engine.get_tensor_dtype('encoder_output')}."

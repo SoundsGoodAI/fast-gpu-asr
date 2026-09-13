@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
-"""Export NVIDIA Parakeet TDT checkpoints for batched TensorRT inference.
+
+"""Export NVIDIA Parakeet TDT and CTC checkpoints for batched TensorRT inference.
 
 The exporter reads a model archive, reconstructs the condensed Parakeet encoder
-and TDT decoder, exports fixed-batch ONNX graphs, and builds TensorRT engines.
+and the selected TDT decoder or CTC head, exports ONNX graphs, and builds engines.
 Only audio duration is dynamic; batch size and decoder hypothesis capacity
 are fixed when the engines are built.
 """
@@ -20,6 +21,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from ..constants import (
+    DECODER_TYPES,
     MODEL_CONFIG_FILE,
     MODEL_TYPE_PARAKEET,
     ONNX_OPSET_VERSION,
@@ -29,7 +31,6 @@ from ..constants import (
     PARAKEET_TENSORRT_FILE,
     PRECISION_DTYPES,
     TOKENIZER_FILE,
-    TRANSDUCER_DECODER_TYPES,
 )
 from ..utils import validate_model, validate_model_config
 from .export_utils import (
@@ -38,7 +39,7 @@ from .export_utils import (
     validate_parakeet,
 )
 from .model.parakeet.decoder import Decoder
-from .model.parakeet.parakeet import ParakeetTDTEncoder
+from .model.parakeet.parakeet import ParakeetEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +54,14 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(
-        description="Export an NVIDIA Parakeet TDT .nemo model to TensorRT.",
+        description="Export an NVIDIA Parakeet TDT or CTC .nemo model to TensorRT.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model-path",
         type=Path,
         required=True,
-        help="Path to the source Parakeet TDT .nemo archive.",
+        help="Path to the source Parakeet TDT or CTC .nemo archive.",
     )
     parser.add_argument(
         "--output-dir",
@@ -78,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         "--decoder-type",
         type=str,
         required=True,
-        choices=TRANSDUCER_DECODER_TYPES,
+        choices=DECODER_TYPES,
         help="Decoder included in the exported Parakeet bundle.",
     )
     parser.add_argument(
@@ -86,8 +87,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         required=True,
         help=(
-            "Beam width used by modified beam search; transducer_greedy_search "
-            "forces beam 1."
+            "Beam width used by modified beam search; greedy-search decoders "
+            "force beam 1."
+        ),
+    )
+    parser.add_argument(
+        "--blank-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Value subtracted from blank-token log probabilities during CTC or "
+            "TDT decoding. Positive values discourage blanks; zero leaves "
+            "scores unchanged. Must be a finite float32 value."
         ),
     )
     parser.add_argument(
@@ -97,7 +108,9 @@ def parse_args() -> argparse.Namespace:
         default="fp32",
         help=(
             "Floating-point precision used by Parakeet subsampling and Conformer "
-            "layers; feature extraction remains fp32."
+            "layers; features and CTC logits remain fp32. With input scaling, "
+            "fp16 rescales the first block's weights and normalization epsilon "
+            "to keep its residual in range."
         ),
     )
     parser.add_argument(
@@ -107,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         default="fp32",
         help=(
             "Floating-point precision used internally by the Parakeet prediction "
-            "network and joiner."
+            "network and joiner; unused for CTC."
         ),
     )
     parser.add_argument(
@@ -240,14 +253,16 @@ def adjust_state_dict(
     Prediction-network and joiner prefixes are renamed to match :class:`Decoder`.
     Pointwise Conv1d weights are squeezed to the matrix shape expected by the
     equivalent linear layers in the condensed encoder. Attention query, key,
-    and value weights are concatenated for one fused projection. The Macaron
-    FFN output factor is folded into each second projection to remove runtime
-    scaling.
+    and value weights and biases are concatenated for one fused projection.
+    The Macaron FFN output factor is folded into each second projection to
+    remove runtime scaling.
 
     Parameters
     ----------
     state_dict : OrderedDict[str, torch.Tensor]
-        State dictionary extracted from ``model_weights.ckpt``.
+        State dictionary extracted from ``model_weights.ckpt``. FFN output
+        weights and biases are scaled in place; convert each loaded checkpoint
+        only once.
 
     Returns
     -------
@@ -271,13 +286,16 @@ def adjust_state_dict(
             .replace("joint.pred", "decoder_proj")
             .replace("joint.enc", "encoder_proj")
             .replace("joint.joint_net.2", "output_proj")
+            .replace("decoder.decoder_layers.0", "projection_output")
             .replace("encoder.pre_encode.conv.0", "encoder.pre_encode.conv1")
             .replace("encoder.pre_encode.conv.2", "encoder.pre_encode.conv2")
             .replace("encoder.pre_encode.conv.3", "encoder.pre_encode.pointwise_conv1")
             .replace("encoder.pre_encode.conv.5", "encoder.pre_encode.conv3")
             .replace("encoder.pre_encode.conv.6", "encoder.pre_encode.pointwise_conv2")
         )
-        if key.endswith(("conv.pointwise_conv1.weight", "conv.pointwise_conv2.weight")):
+        if key == "projection_output.weight" or key.endswith(
+            ("conv.pointwise_conv1.weight", "conv.pointwise_conv2.weight")
+        ):
             if value.ndim != 3 or value.size(2) != 1:
                 raise ValueError(
                     f"Expected pointwise Conv1d weight {key} to have shape "
@@ -285,9 +303,14 @@ def adjust_state_dict(
                 )
             value = value.squeeze(2)
         if key.endswith(
-            ("feed_forward1.linear2.weight", "feed_forward2.linear2.weight")
+            (
+                "feed_forward1.linear2.weight",
+                "feed_forward2.linear2.weight",
+                "feed_forward1.linear2.bias",
+                "feed_forward2.linear2.bias",
+            )
         ):
-            value = value * 0.5
+            value *= 0.5
 
         if key in adjusted_state_dict:
             raise ValueError(
@@ -298,61 +321,65 @@ def adjust_state_dict(
         adjusted_state_dict[key] = value
         adjusted_sources[key] = source_key
 
-    projection_suffixes = {
-        "query": ".self_attn.linear_q.weight",
-        "key": ".self_attn.linear_k.weight",
-        "value": ".self_attn.linear_v.weight",
-    }
-    projection_prefixes = {
-        key.removesuffix(suffix)
-        for key in adjusted_state_dict
-        for suffix in projection_suffixes.values()
-        if key.endswith(suffix)
-    }
-    for prefix in sorted(projection_prefixes):
-        query_key = f"{prefix}{projection_suffixes['query']}"
-        key_key = f"{prefix}{projection_suffixes['key']}"
-        value_key = f"{prefix}{projection_suffixes['value']}"
-        qkv_key = f"{prefix}.self_attn.linear_qkv.weight"
+    for parameter in ("weight", "bias"):
+        projection_suffixes = {
+            "query": f".self_attn.linear_q.{parameter}",
+            "key": f".self_attn.linear_k.{parameter}",
+            "value": f".self_attn.linear_v.{parameter}",
+        }
+        projection_prefixes = {
+            key.removesuffix(suffix)
+            for key in adjusted_state_dict
+            for suffix in projection_suffixes.values()
+            if key.endswith(suffix)
+        }
+        for prefix in sorted(projection_prefixes):
+            query_key = f"{prefix}{projection_suffixes['query']}"
+            key_key = f"{prefix}{projection_suffixes['key']}"
+            value_key = f"{prefix}{projection_suffixes['value']}"
+            qkv_key = f"{prefix}.self_attn.linear_qkv.{parameter}"
 
-        missing_keys = tuple(
-            key
-            for key in (query_key, key_key, value_key)
-            if key not in adjusted_state_dict
-        )
-        if missing_keys:
-            raise ValueError(
-                f"Missing attention projection companions {missing_keys} for {prefix}."
+            missing_keys = tuple(
+                key
+                for key in (query_key, key_key, value_key)
+                if key not in adjusted_state_dict
             )
-        if qkv_key in adjusted_state_dict:
-            raise ValueError(
-                f"Checkpoint contains both split attention projections and {qkv_key}."
-            )
+            if missing_keys:
+                raise ValueError(
+                    f"Missing attention projection companions {missing_keys} for "
+                    f"{prefix}."
+                )
+            if qkv_key in adjusted_state_dict:
+                raise ValueError(
+                    "Checkpoint contains both split attention projections and "
+                    f"{qkv_key}."
+                )
 
-        projections = (
-            adjusted_state_dict[query_key],
-            adjusted_state_dict[key_key],
-            adjusted_state_dict[value_key],
-        )
-        if any(projection.ndim != 2 for projection in projections) or any(
-            projection.shape != projections[0].shape
-            or projection.dtype != projections[0].dtype
-            or projection.device != projections[0].device
-            for projection in projections[1:]
-        ):
-            projection_metadata = tuple(
-                (tuple(projection.shape), projection.dtype, projection.device)
-                for projection in projections
+            projections = (
+                adjusted_state_dict[query_key],
+                adjusted_state_dict[key_key],
+                adjusted_state_dict[value_key],
             )
-            raise ValueError(
-                "Expected matching rank-2 query, key, and value projection "
-                f"weights for {prefix}, got {projection_metadata}."
-            )
+            rank = 2 if parameter == "weight" else 1
+            if any(projection.ndim != rank for projection in projections) or any(
+                projection.shape != projections[0].shape
+                or projection.dtype != projections[0].dtype
+                or projection.device != projections[0].device
+                for projection in projections[1:]
+            ):
+                projection_metadata = tuple(
+                    (tuple(projection.shape), projection.dtype, projection.device)
+                    for projection in projections
+                )
+                raise ValueError(
+                    f"Expected matching rank-{rank} query, key, and value projection "
+                    f"{parameter}s for {prefix}, got {projection_metadata}."
+                )
 
-        for projection_key in (query_key, key_key, value_key):
-            del adjusted_state_dict[projection_key]
+            for projection_key in (query_key, key_key, value_key):
+                del adjusted_state_dict[projection_key]
 
-        adjusted_state_dict[qkv_key] = torch.cat(projections, dim=0)
+            adjusted_state_dict[qkv_key] = torch.cat(projections, dim=0)
 
     return adjusted_state_dict
 
@@ -363,8 +390,16 @@ def make_model(
     subsampling_batch_partitions: int,
     encoder_dtype: torch.dtype,
     decoder_dtype: torch.dtype,
-) -> tuple[ParakeetTDTEncoder, Decoder]:
+    decoder_type: str,
+) -> tuple[ParakeetEncoder, Decoder | None]:
     """Construct condensed Parakeet modules and load checkpoint weights.
+
+    For FP32/BF16, checkpoint input scaling is folded into the subsampling
+    projection's weights and bias. FP16 instead divides the first block's branch
+    output weights/biases by the input scale and its LayerNorm epsilons by the
+    squared scale. This keeps the residual unscaled and avoids FP16 overflow
+    without an FP32 first block. Weight scaling happens in place before dtype
+    conversion; construct each model from a freshly loaded checkpoint.
 
     Parameters
     ----------
@@ -372,6 +407,7 @@ def make_model(
         Validated Parakeet model configuration.
     state_dict : OrderedDict[str, torch.Tensor]
         Converted checkpoint state dictionary from :func:`adjust_state_dict`.
+        Input-scaling weights and biases are modified in place when enabled.
     subsampling_batch_partitions : int
         Number of batch partitions used across the three-convolution
         subsampling frontend to avoid TensorRT's CASK ``int32`` element limit.
@@ -379,11 +415,13 @@ def make_model(
         Floating-point dtype used internally by the encoder.
     decoder_dtype : torch.dtype
         Floating-point dtype used internally by the prediction network and joiner.
+    decoder_type : str
+        Export CTC log probabilities or TDT encoder embeddings and decoder.
 
     Returns
     -------
-    tuple[ParakeetTDTEncoder, Decoder]
-        Evaluation-mode waveform encoder and TDT decoder.
+    tuple[ParakeetEncoder, Decoder | None]
+        Evaluation-mode waveform encoder and optional TDT decoder.
 
     Raises
     ------
@@ -392,7 +430,7 @@ def make_model(
         reconstructed architecture.
     """
 
-    encoder = ParakeetTDTEncoder(
+    encoder = ParakeetEncoder(
         samp_freq=model_config.preprocessor.sample_rate,
         frame_shift_ms=round(model_config.preprocessor.window_stride * 1000),
         frame_length_ms=round(model_config.preprocessor.window_size * 1000),
@@ -411,12 +449,49 @@ def make_model(
         conv_kernel_size=model_config.encoder.conv_kernel_size,
         subsampling_batch_partitions=subsampling_batch_partitions,
         dtype=encoder_dtype,
+        use_bias=model_config.encoder.get("use_bias", True),
+        vocab_size=(
+            model_config.decoder.num_classes
+            if decoder_type == "ctc_greedy_search"
+            else None
+        ),
     )
+    encoder_prefixes = ("encoder.",)
+    if decoder_type == "ctc_greedy_search":
+        encoder_prefixes += ("projection_output.",)
+
     encoder_state_dict = OrderedDict(
-        (key, value) for key, value in state_dict.items() if key.startswith("encoder.")
+        (key, value)
+        for key, value in state_dict.items()
+        if key.startswith(encoder_prefixes)
     )
+    if model_config.encoder.get("xscaling", True):
+        xscale = model_config.encoder.d_model**0.5
+        if encoder_dtype == torch.float16:
+            # LN(s*x, eps) = LN(x, eps/s**2). Scale each residual branch by 1/s;
+            # the final norm_out restores the original block output scale.
+            for projection in (
+                "feed_forward1.linear2",
+                "self_attn.linear_out",
+                "conv.pointwise_conv2",
+                "feed_forward2.linear2",
+            ):
+                for parameter in ("weight", "bias"):
+                    key = f"encoder.layers.0.{projection}.{parameter}"
+                    if key in encoder_state_dict:
+                        encoder_state_dict[key] /= xscale
+
+            for module in encoder.encoder.layers[0].modules():
+                if isinstance(module, torch.nn.LayerNorm):
+                    module.eps /= xscale**2
+        else:
+            for key in ("encoder.pre_encode.out.weight", "encoder.pre_encode.out.bias"):
+                encoder_state_dict[key] *= xscale
     encoder.load_state_dict(encoder_state_dict, strict=True)
     encoder.eval()
+
+    if decoder_type == "ctc_greedy_search":
+        return encoder, None
 
     decoder = Decoder(
         vocab_size=model_config.decoder.vocab_size,
@@ -500,6 +575,9 @@ def make_runtime_config(
 ) -> DictConfig:
     """Build the compact runtime configuration stored in a Parakeet bundle.
 
+    Beam width and blank penalty are saved for both CTC and TDT decoding.
+    The penalty is applied by the runtime, not baked into the TensorRT engines.
+
     Parameters
     ----------
     model_config : DictConfig
@@ -513,13 +591,30 @@ def make_runtime_config(
         Runtime configuration consumed by :class:`fast_gpu_asr.ASR`.
     """
 
+    use_ctc = args.decoder_type == "ctc_greedy_search"
+    vocab_size = (
+        model_config.decoder.num_classes if use_ctc else model_config.decoder.vocab_size
+    )
+    decoder_params = {"beam": args.beam, "blank_penalty": args.blank_penalty}
+    if not use_ctc:
+        decoder_params.update(
+            {
+                "encoder_dim": model_config.joint.jointnet.encoder_hidden,
+                "decoder_dim": model_config.decoder.prednet.pred_hidden,
+                "joiner_dim": model_config.joint.jointnet.joint_hidden,
+                "pred_rnn_layers": model_config.decoder.prednet.pred_rnn_layers,
+                "num_extra_outputs": model_config.joint.num_extra_outputs,
+                "max_symbols_per_timestep": model_config.decoding.greedy.max_symbols,
+                "tdt_durations": list(model_config.model_defaults.tdt_durations),
+            }
+        )
     runtime_config = OmegaConf.create(
         {
             "model_type": MODEL_TYPE_PARAKEET,
             "decoder_type": args.decoder_type,
             "model_samplerate": model_config.sample_rate,
-            "vocab_size": model_config.decoder.vocab_size,
-            "blank_id": model_config.decoder.vocab_size,
+            "vocab_size": vocab_size,
+            "blank_id": vocab_size,
             "audio_encoder_params": {
                 "feature_dim": model_config.preprocessor.features,
                 "frame_shift_ms": round(model_config.preprocessor.window_stride * 1000),
@@ -531,17 +626,7 @@ def make_runtime_config(
                 "opt_audio_seconds": args.opt_audio_seconds,
                 "max_audio_seconds": args.max_audio_seconds,
             },
-            "decoder_params": {
-                "encoder_dim": model_config.joint.jointnet.encoder_hidden,
-                "decoder_dim": model_config.decoder.prednet.pred_hidden,
-                "joiner_dim": model_config.joint.jointnet.joint_hidden,
-                "pred_rnn_layers": model_config.decoder.prednet.pred_rnn_layers,
-                "num_extra_outputs": model_config.joint.num_extra_outputs,
-                "beam": args.beam,
-                "blank_penalty": 0.0,
-                "max_symbols_per_timestep": model_config.decoding.greedy.max_symbols,
-                "tdt_durations": list(model_config.model_defaults.tdt_durations),
-            },
+            "decoder_params": decoder_params,
         }
     )
     validate_model_config(runtime_config)
@@ -549,11 +634,11 @@ def make_runtime_config(
 
 
 def export_model_to_onnx(
-    encoder: ParakeetTDTEncoder,
-    decoder: Decoder,
+    encoder: ParakeetEncoder,
+    decoder: Decoder | None,
     model_config: DictConfig,
     args: argparse.Namespace,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path | None]:
     """Export fixed-batch Parakeet encoder and decoder ONNX graphs.
 
     The encoder accepts a fixed number of padded waveforms and their valid sample
@@ -562,10 +647,10 @@ def export_model_to_onnx(
 
     Parameters
     ----------
-    encoder : ParakeetTDTEncoder
+    encoder : ParakeetEncoder
         Loaded waveform-to-encoder model.
-    decoder : Decoder
-        Loaded TDT prediction-network and joiner model.
+    decoder : Decoder | None
+        Loaded TDT prediction-network and joiner model, or None for CTC.
     model_config : DictConfig
         Validated Parakeet model configuration.
     args : argparse.Namespace
@@ -574,8 +659,9 @@ def export_model_to_onnx(
 
     Returns
     -------
-    tuple[Path, Path]
-        Paths to the encoder and decoder ONNX graphs.
+    tuple[Path, Path | None]
+        Encoder ONNX path and optional TDT decoder ONNX path. CTC exports only
+        the encoder with its projection and log-softmax head.
     """
 
     encoder_path = args.output_dir / PARAKEET_ONNX_FILE
@@ -602,6 +688,11 @@ def export_model_to_onnx(
             output_names=("encoder_output", "encoder_output_lengths"),
             opset_version=ONNX_OPSET_VERSION,
         )
+
+    if args.decoder_type == "ctc_greedy_search":
+        return encoder_path, None
+    if decoder is None:
+        raise RuntimeError("The Parakeet TDT decoder was not initialized.")
 
     decoder_batch = args.batch_size * args.beam
     pred_rnn_layers = model_config.decoder.prednet.pred_rnn_layers
@@ -645,9 +736,10 @@ def export_model_to_onnx(
 def export_parakeet(args: argparse.Namespace) -> None:
     """Run the complete offline Parakeet TensorRT export.
 
-    The source archive is extracted into a temporary directory. Its tokenizer
-    and a compact runtime configuration are written to the output directory,
-    while the checkpoint is converted into encoder and decoder ONNX graphs.
+    The output directory is deleted and recreated before the source archive is
+    extracted into a temporary directory. Its tokenizer and a compact runtime
+    configuration are written to the output directory, while the checkpoint is
+    converted into an encoder ONNX graph and, for TDT, a separate decoder graph.
     TensorRT engines are then built using the requested fixed batch and
     duration profile. Intermediate ONNX artifacts are retained only in debug
     mode.
@@ -662,13 +754,14 @@ def export_parakeet(args: argparse.Namespace) -> None:
     FileNotFoundError
         Raised when the Parakeet archive or a required archive member is missing.
     ValueError
-        Raised when the model configuration or TensorRT profile is unsupported.
+        Raised when the model configuration, decoding settings, or TensorRT
+        profile is unsupported, or the output directory contains the archive.
     RuntimeError
         Raised when checkpoint loading, ONNX conversion, or TensorRT engine
         construction fails.
     """
 
-    if args.decoder_type == "transducer_greedy_search":
+    if args.decoder_type in ("transducer_greedy_search", "ctc_greedy_search"):
         if args.beam != 1:
             logger.warning(
                 "Overriding beam=%s with beam=1 because %s requires beam 1.",
@@ -718,6 +811,7 @@ def export_parakeet(args: argparse.Namespace) -> None:
             subsampling_batch_partitions,
             PRECISION_DTYPES[args.encoder_precision],
             PRECISION_DTYPES[args.decoder_precision],
+            args.decoder_type,
         )
         del state_dict
 
@@ -745,16 +839,18 @@ def export_parakeet(args: argparse.Namespace) -> None:
         encoder_profiles,
         args.optimization_level,
     )
-    build_tensorrt_engine(
-        decoder_onnx_path,
-        args.output_dir / PARAKEET_DECODER_TENSORRT_FILE,
-        {},
-        args.optimization_level,
-    )
+    if decoder_onnx_path is not None:
+        build_tensorrt_engine(
+            decoder_onnx_path,
+            args.output_dir / PARAKEET_DECODER_TENSORRT_FILE,
+            {},
+            args.optimization_level,
+        )
 
     if not args.debug:
         remove_onnx_artifacts(encoder_onnx_path)
-        remove_onnx_artifacts(decoder_onnx_path)
+        if decoder_onnx_path is not None:
+            remove_onnx_artifacts(decoder_onnx_path)
 
     validate_model(args.output_dir, OmegaConf.load(args.output_dir / MODEL_CONFIG_FILE))
 

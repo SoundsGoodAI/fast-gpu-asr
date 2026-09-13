@@ -19,12 +19,10 @@ from .constants import (
     ZIPFORMER_DECODER_TENSORRT_FILE,
     ZIPFORMER_TENSORRT_FILE,
 )
-from .decoder.parakeet_decoder import ParakeetModifiedBeamSearchDecoder
+from .decoder.ctc_decoder import CTCGreedyDecoder
+from .decoder.parakeet_tdt_decoder import ParakeetModifiedBeamSearchDecoder
 from .decoder.postprocessor import PostProcessor
-from .decoder.zipformer_decoder import (
-    CTCGreedyDecoder,
-    ZipformerModifiedBeamSearchDecoder,
-)
+from .decoder.zipformer_rnnt_decoder import ZipformerModifiedBeamSearchDecoder
 from .encoder.encoder import Encoder
 from .utils import validate_model
 
@@ -71,8 +69,9 @@ class ASR:
             else:
                 encoder_file = PARAKEET_TENSORRT_FILE
                 right_padding_samples = 0
-                tdt_durations = tuple(decoder_params.tdt_durations)
-                max_symbols_per_timestep = decoder_params.max_symbols_per_timestep
+                if model_config.decoder_type != "ctc_greedy_search":
+                    tdt_durations = tuple(decoder_params.tdt_durations)
+                    max_symbols_per_timestep = decoder_params.max_symbols_per_timestep
 
             self.stream = cp.cuda.Stream(null=False, non_blocking=True, ptds=False)
 

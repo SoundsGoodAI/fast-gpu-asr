@@ -32,7 +32,7 @@ from fast_gpu_asr.export.model.parakeet.parakeet import (
     ConformerConvolution,
     ConvSubsampling,
     FastConformer,
-    ParakeetTDTEncoder,
+    ParakeetEncoder,
 )
 from fast_gpu_asr.export.model.zipformer.activation import SwooshL, SwooshR
 from fast_gpu_asr.export.model.zipformer.subsampling import BiasNorm
@@ -338,6 +338,7 @@ def make_fast_conformer(subsampling_batch_partitions: int = 1) -> FastConformer:
         pos_emb_max_len=64,
         conv_kernel_size=3,
         subsampling_batch_partitions=subsampling_batch_partitions,
+        use_bias=False,
     ).eval()
 
 
@@ -394,22 +395,27 @@ def reference_parakeet_subsampling(
     )
 
 
-def make_parakeet_encoder(dtype: torch.dtype = torch.float16) -> ParakeetTDTEncoder:
+def make_parakeet_encoder(
+    dtype: torch.dtype = torch.float16, use_ctc: bool = False, n_layers: int = 1
+) -> ParakeetEncoder:
     """Build a compact Parakeet encoder with production frontend settings.
 
     Parameters
     ----------
     dtype : torch.dtype
         Precision passed to the encoder constructor.
+    use_ctc : bool
+        Include a CTC projection and enable legacy encoder biases.
+    n_layers : int
+        Number of Conformer blocks.
 
     Returns
     -------
-    ParakeetTDTEncoder
-        One-layer CPU model in evaluation mode, initialized using the test's
-        isolated generator.
+    ParakeetEncoder
+        CPU model in evaluation mode, initialized using the test's isolated generator.
     """
 
-    return ParakeetTDTEncoder(
+    return ParakeetEncoder(
         samp_freq=16000,
         frame_shift_ms=10,
         frame_length_ms=25,
@@ -417,7 +423,7 @@ def make_parakeet_encoder(dtype: torch.dtype = torch.float16) -> ParakeetTDTEnco
         preemph=0.97,
         low_freq=0,
         high_freq=8000,
-        n_layers=1,
+        n_layers=n_layers,
         model_dim=16,
         subsampling_conv_channels=4,
         feed_forward_expansion_factor=2,
@@ -426,6 +432,8 @@ def make_parakeet_encoder(dtype: torch.dtype = torch.float16) -> ParakeetTDTEnco
         conv_kernel_size=3,
         subsampling_batch_partitions=1,
         dtype=dtype,
+        use_bias=use_ctc,
+        vocab_size=5 if use_ctc else None,
     ).eval()
 
 
@@ -510,6 +518,40 @@ def test_zipformer_precision_policy(dtype: torch.dtype) -> None:
         else:
             expected_dtype = dtype
         assert tensor.dtype == expected_dtype, name
+
+
+@pytest.mark.parametrize("use_ctc", (False, True), ids=("transducer", "ctc"))
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=FLOAT_DTYPE_IDS)
+def test_parakeet_output_projection(dtype: torch.dtype, use_ctc: bool) -> None:
+    encoder = make_parakeet_encoder(dtype=dtype, use_ctc=use_ctc)
+    # Changing internal precision must preserve the configured output contract.
+    encoder.encoder.float()
+    embeddings: list[torch.Tensor] = []
+    with (
+        encoder.encoder.register_forward_hook(
+            lambda _module, _inputs, output: embeddings.append(output[0])
+        ),
+        torch.inference_mode(),
+    ):
+        output, lengths = encoder(
+            make_random_tensor((2, 3200), 16), torch.tensor([3200, 1600])
+        )
+
+    (encoded,) = embeddings
+    if use_ctc:
+        with torch.no_grad():
+            expected = torch.nn.functional.linear(
+                encoded,
+                encoder.projection_output.weight,
+                encoder.projection_output.bias,
+            ).log_softmax(dim=2)
+    else:
+        expected = encoded.to(dtype)
+    assert output.dtype == (torch.float32 if use_ctc else dtype)
+    assert output.shape == (2, 3, 6 if use_ctc else 16)
+    assert lengths.dtype == torch.int32
+    assert lengths.tolist() == [3, 2]
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("use_ctc", (False, True), ids=("transducer", "ctc"))
@@ -665,7 +707,8 @@ def test_convolution_exports_as_tensorrt_plugin(
     plugin_name: str,
     length_name: str,
 ) -> None:
-    convolution = convolution_type(8, 5).eval().to(dtype)
+    args = (8, 5, False) if convolution_type is ConformerConvolution else (8, 5)
+    convolution = convolution_type(*args).eval().to(dtype)
     if convolution_type is ConvolutionModule:
         with torch.no_grad():
             convolution.depthwise_conv.weight.copy_(
@@ -729,7 +772,7 @@ def test_parakeet_conformer_convolution_matches_depthwise_convolution(
     dtype: torch.dtype,
 ) -> None:
     torch.default_generator.manual_seed(5)
-    convolution = ConformerConvolution(8, 5).eval().to(dtype)
+    convolution = ConformerConvolution(8, 5, use_bias=False).eval().to(dtype)
     x = make_random_tensor((3, 17, 8), 32, dtype)
     output_lengths = torch.tensor((17, 13, 9), dtype=torch.int32)
     padding_mask = torch.zeros(3, 17, dtype=torch.bool)
@@ -754,14 +797,18 @@ def test_parakeet_conformer_convolution_matches_depthwise_convolution(
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("use_bias", (False, True))
 def test_parakeet_conformer_convolution_exports_exact_folded_plugin_inputs(
     tmp_path: Path,
+    use_bias: bool,
 ) -> None:
-    convolution = ConformerConvolution(8, 5).eval()
+    convolution = ConformerConvolution(8, 5, use_bias).eval()
     with torch.no_grad():
         convolution.depthwise_conv.weight.copy_(
             torch.arange(40, dtype=torch.float32).reshape(8, 1, 5) / 20.0 - 0.5
         )
+        if use_bias:
+            convolution.depthwise_conv.bias.copy_(torch.linspace(-0.4, 0.3, 8))
         convolution.batch_norm.weight.copy_(torch.linspace(0.5, 1.2, 8))
         convolution.batch_norm.bias.copy_(torch.linspace(-0.3, 0.4, 8))
         convolution.batch_norm.running_mean.copy_(torch.linspace(-0.2, 0.2, 8))
@@ -801,6 +848,8 @@ def test_parakeet_conformer_convolution_exports_exact_folded_plugin_inputs(
     expected_bias = convolution.batch_norm.bias - (
         convolution.batch_norm.running_mean * batch_norm_scale
     )
+    if use_bias:
+        expected_bias += convolution.depthwise_conv.bias * batch_norm_scale
 
     assert exported_weight.shape == (5, 8)
     assert exported_bias.shape == (8,)
@@ -814,7 +863,7 @@ def test_parakeet_conformer_convolution_exports_exact_folded_plugin_inputs(
 def test_parakeet_flash_attention_exports_as_tensorrt_plugin(
     tmp_path: Path, dtype: torch.dtype
 ) -> None:
-    attention = RelPositionMultiHeadAttention(3, 12).eval().to(dtype)
+    attention = RelPositionMultiHeadAttention(3, 12, use_bias=False).eval().to(dtype)
     with torch.no_grad():
         attention.pos_bias_u.copy_(torch.arange(12, dtype=torch.float32).reshape(3, 4))
         attention.pos_bias_v.copy_(
@@ -895,8 +944,12 @@ def test_parakeet_flash_attention_exports_as_tensorrt_plugin(
     assert get_onnx_shape(model, "output") == (2, 7, 12)
 
 
-def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(tmp_path: Path) -> None:
-    encoder = make_parakeet_encoder()
+@pytest.mark.parametrize("use_ctc", (False, True))
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=FLOAT_DTYPE_IDS)
+def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(
+    tmp_path: Path, use_ctc: bool, dtype: torch.dtype
+) -> None:
+    encoder = make_parakeet_encoder(dtype=dtype, use_ctc=use_ctc, n_layers=2)
     audio = torch.zeros(2, 8000)
     audio_lengths = torch.full((2,), 8000, dtype=torch.int64)
     onnx_path = tmp_path / "parakeet_encoder.onnx"
@@ -915,8 +968,8 @@ def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(tmp_path: Path) 
         model,
         {
             PARAKEET_FEATURE_PLUGIN_NAME: 1,
-            PARAKEET_FLASH_ATTENTION_PLUGIN_NAME: 1,
-            PARAKEET_CONFORMER_CONVOLUTION_PLUGIN_NAME: 1,
+            PARAKEET_FLASH_ATTENTION_PLUGIN_NAME: 2,
+            PARAKEET_CONFORMER_CONVOLUTION_PLUGIN_NAME: 2,
         },
     )
     feature_node = next(
@@ -961,7 +1014,27 @@ def test_parakeet_encoder_exports_fixed_batch_with_dynamic_time(tmp_path: Path) 
         (4, 1, 3, 3)
     }
 
-    assert_encoder_onnx_interface(model, 16, onnx.TensorProto.FLOAT16)
+    assert_encoder_onnx_interface(
+        model,
+        6 if use_ctc else 16,
+        onnx.TensorProto.FLOAT if use_ctc else ONNX_DTYPES[dtype],
+    )
+    floating_casts = Counter(
+        (
+            get_onnx_element_type(model, node.input[0]),
+            get_onnx_element_type(model, node.output[0]),
+        )
+        for node in model.graph.node
+        if node.op_type == "Cast"
+        and get_onnx_element_type(model, node.output[0]) in ONNX_DTYPES.values()
+    )
+    expected_casts = {}
+    if dtype != torch.float32:
+        # Only features and positions enter low precision; CTC logits return to FP32.
+        expected_casts[(onnx.TensorProto.FLOAT, ONNX_DTYPES[dtype])] = 2
+        if use_ctc:
+            expected_casts[(ONNX_DTYPES[dtype], onnx.TensorProto.FLOAT)] = 1
+    assert floating_casts == expected_casts
 
 
 def test_zipformer_encoder_exports_dynamic_plugin_contract(tmp_path: Path) -> None:

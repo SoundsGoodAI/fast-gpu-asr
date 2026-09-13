@@ -115,7 +115,7 @@ def make_config(model_type: str, decoder_type: str) -> DictConfig:
     decoder_params: dict[str, float | int | list[int]] = {"blank_penalty": 0.25}
     if model_type == "zipformer_asr" and decoder_type != "ctc_greedy_search":
         decoder_params["context_size"] = 2
-    elif model_type == "parakeet_asr":
+    elif model_type == "parakeet_asr" and decoder_type != "ctc_greedy_search":
         decoder_params.update(
             {"max_symbols_per_timestep": 10, "tdt_durations": [0, 1, 2, 3, 4]}
         )
@@ -362,6 +362,7 @@ def test_asr_propagates_cuda_device_failure(
     ),
     (
         ("zipformer_asr", "ctc_greedy_search", "zipformer.trt", "ctc", None, 0.04),
+        ("parakeet_asr", "ctc_greedy_search", "parakeet.trt", "ctc", None, 0.08),
         (
             "zipformer_asr",
             "transducer_greedy_search",
@@ -434,7 +435,13 @@ def test_asr_routes_model_components(
     assert isinstance(model.postprocessor, asr_module.PostProcessor)
 
     if decoder_filename is None:
-        expected_decoder_args = (0, frame_shift_sec, 0.25, 3, runtime.stream)
+        expected_decoder_args = (
+            32 if model_type == "parakeet_asr" else 0,
+            frame_shift_sec,
+            0.25,
+            3,
+            runtime.stream,
+        )
     elif decoder_call == "zipformer":
         expected_decoder_args = (
             tmp_path / decoder_filename,

@@ -16,7 +16,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 import fast_gpu_asr.export.export_zipformer as zipformer_exporter
-from fast_gpu_asr.constants import INT32_MAX
+from fast_gpu_asr.constants import DECODER_TYPES, INT32_MAX
 from fast_gpu_asr.export.export_utils import validate_zipformer
 from fast_gpu_asr.export.export_zipformer import (
     adjust_state_dict,
@@ -205,6 +205,7 @@ def make_export_args(
     return argparse.Namespace(
         batch_size=1,
         beam=6,
+        blank_penalty=0.0,
         debug=False,
         decoder_type=decoder_type,
         decoder_precision="fp32",
@@ -382,6 +383,7 @@ def test_export_zipformer_validates_exact_published_artifacts(
     args.output_dir = tmp_path / "nested/bundle"
     args.batch_size = 3
     args.beam = 4
+    args.blank_penalty = 0.25
     args.debug = debug
     args.encoder_precision = "fp16"
     args.decoder_precision = "bf16"
@@ -565,6 +567,7 @@ def test_export_zipformer_validates_exact_published_artifacts(
     ]
     published = loaded_configs[-1][1]
     assert published == make_runtime_config(source_config, 4, 0, 6001, args)
+    assert published.decoder_params.blank_penalty == args.blank_penalty
     assert args.beam == (4 if decoder_type == "transducer_modified_beam_search" else 1)
     validate.assert_called_once_with(args.output_dir, published)
     expected_builds = [
@@ -755,6 +758,8 @@ def test_parse_args(monkeypatch: pytest.MonkeyPatch, overrides: bool) -> None:
             "transducer_modified_beam_search",
             "--beam",
             "6",
+            "--blank-penalty",
+            "-0.2",
             "--encoder-precision",
             "bf16",
             "--decoder-precision",
@@ -769,6 +774,7 @@ def test_parse_args(monkeypatch: pytest.MonkeyPatch, overrides: bool) -> None:
             batch_size=256,
             decoder_type="transducer_modified_beam_search",
             beam=6,
+            blank_penalty=-0.2,
             encoder_precision="bf16",
             decoder_precision="fp16",
             opt_audio_seconds=8.0,
@@ -778,6 +784,16 @@ def test_parse_args(monkeypatch: pytest.MonkeyPatch, overrides: bool) -> None:
     monkeypatch.setattr(sys, "argv", argv)
 
     assert vars(parse_args()) == expected
+
+
+def test_parse_args_rejects_nonnumeric_blank_penalty(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["export", "--blank-penalty", "invalid"])
+    with pytest.raises(SystemExit) as error:
+        parse_args()
+    assert error.value.code == 2
+    assert "argument --blank-penalty: invalid float value" in capsys.readouterr().err
 
 
 def test_main_configures_logging_and_runs_export(
@@ -816,6 +832,42 @@ def test_validate_zipformer_accepts_supported_decoder(decoder_type: str) -> None
         512,
         make_export_args(decoder_type),
     )
+
+
+@pytest.mark.parametrize("decoder_type", DECODER_TYPES)
+@pytest.mark.parametrize(
+    "blank_penalty",
+    (-torch.finfo(torch.float32).max, -0.25, 0.0, 0.25, torch.finfo(torch.float32).max),
+)
+def test_zipformer_preserves_valid_blank_penalty(
+    decoder_type: str, blank_penalty: float
+) -> None:
+    config = make_model_config()
+    args = make_export_args(decoder_type)
+    args.beam = 6 if decoder_type == "transducer_modified_beam_search" else 1
+    args.blank_penalty = blank_penalty
+
+    validate_zipformer(config, make_state_dict(decoder_type), 512, args)
+    runtime_config = make_runtime_config(config, 512, 0, 6000, args)
+    assert runtime_config.decoder_params.blank_penalty == blank_penalty
+
+
+@pytest.mark.parametrize("decoder_type", DECODER_TYPES)
+@pytest.mark.parametrize(
+    "blank_penalty",
+    (False, 0, "0.25", None, float("nan"), float("inf"), -float("inf"), 1e39, -1e39),
+)
+def test_validate_zipformer_rejects_invalid_blank_penalty(
+    decoder_type: str, blank_penalty: object
+) -> None:
+    args = make_export_args(decoder_type)
+    args.blank_penalty = blank_penalty
+    with pytest.raises(
+        ValueError, match="blank_penalty must be a finite float32 value"
+    ):
+        validate_zipformer(
+            make_model_config(), make_state_dict(decoder_type), 512, args
+        )
 
 
 def test_validate_zipformer_rejects_unsupported_decoder() -> None:
@@ -1271,10 +1323,11 @@ def test_make_zipformer_runtime_config(
 ) -> None:
     args = make_export_args(decoder_type)
     args.beam = beam
+    args.blank_penalty = 0.25
     validate = Mock(wraps=zipformer_exporter.validate_model_config)
     monkeypatch.setattr(zipformer_exporter, "validate_model_config", validate)
     runtime_config = make_runtime_config(make_model_config(), 257, 0, 6000, args)
-    expected_decoder_params = {"beam": beam, "blank_penalty": 0.0}
+    expected_decoder_params = {"beam": beam, "blank_penalty": 0.25}
     if not use_ctc:
         expected_decoder_params.update(
             {"context_size": 2, "decoder_dim": 512, "joiner_dim": 512}

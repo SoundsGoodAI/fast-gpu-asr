@@ -9,6 +9,7 @@ import re
 import sys
 import tarfile
 from collections import OrderedDict
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import Mock, call
 
@@ -30,6 +31,15 @@ from fast_gpu_asr.export.export_parakeet import (
     parse_args,
 )
 from fast_gpu_asr.export.export_utils import validate_parakeet
+
+
+@pytest.fixture(autouse=True)
+def isolate_torch_rng() -> Iterator[None]:
+    """Seed CPU model initialization and restore the caller's RNG afterward."""
+
+    with torch.random.fork_rng(devices=[]):
+        torch.default_generator.manual_seed(0)
+        yield
 
 
 def make_model_config() -> DictConfig:
@@ -107,6 +117,7 @@ def make_export_args() -> argparse.Namespace:
     return argparse.Namespace(
         batch_size=1,
         beam=6,
+        blank_penalty=0.0,
         debug=False,
         decoder_precision="fp32",
         decoder_type="transducer_modified_beam_search",
@@ -118,6 +129,300 @@ def make_export_args() -> argparse.Namespace:
         optimization_level=5,
         output_dir=Path("output"),
     )
+
+
+def make_ctc_config(n_layers: int = 24) -> DictConfig:
+    """Match the legacy 80-mel, biased Parakeet CTC checkpoint configuration."""
+
+    config = make_model_config()
+    config.preprocessor.features = 80
+    config.encoder.n_layers = n_layers
+    config.encoder.xscaling = True
+    del config.encoder.use_bias
+    config.decoder = {"feat_in": 1024, "num_classes": 1024}
+    for name in ("joint", "model_defaults", "decoding"):
+        del config[name]
+    return config
+
+
+@pytest.mark.parametrize("n_layers", (24, 42), ids=("ctc-0.6b", "ctc-1.1b"))
+def test_parakeet_ctc_configuration_and_runtime_metadata(n_layers: int) -> None:
+    config = make_ctc_config(n_layers)
+    args = make_export_args()
+    args.decoder_type = "ctc_greedy_search"
+    args.beam = 1
+    validate_parakeet(config, args)
+    runtime = make_runtime_config(config, args)
+    assert runtime.vocab_size == runtime.blank_id == 1024
+    assert runtime.audio_encoder_params.n_layers == n_layers
+    assert runtime.audio_encoder_params.feature_dim == 80
+    assert runtime.decoder_params == {"beam": 1, "blank_penalty": 0.0}
+
+
+@pytest.mark.parametrize("ctc_checkpoint", (False, True))
+def test_parakeet_rejects_mismatched_checkpoint_head(ctc_checkpoint: bool) -> None:
+    config = make_ctc_config() if ctc_checkpoint else make_model_config()
+    args = make_export_args()
+    if not ctc_checkpoint:
+        args.decoder_type = "ctc_greedy_search"
+    with pytest.raises(ValueError, match="does not contain the requested"):
+        validate_parakeet(config, args)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    (
+        ("decoder.num_classes", 0, "positive integer"),
+        ("decoder.feat_in", 512, "decoder.feat_in"),
+        ("encoder.causal_downsampling", True, "noncausal"),
+        ("encoder.conv_context_size", [8, 0], "symmetric"),
+        ("encoder.feat_out", 512, "output projection"),
+    ),
+)
+def test_parakeet_ctc_rejects_incompatible_configuration(
+    field: str, value: int | bool | list[int], message: str
+) -> None:
+    config = make_ctc_config()
+    OmegaConf.update(config, field, value)
+    args = make_export_args()
+    args.decoder_type = "ctc_greedy_search"
+    args.beam = 1
+    with pytest.raises(ValueError, match=message):
+        validate_parakeet(config, args)
+
+
+def test_ctc_conversion_preserves_projection_and_folds_ffn_biases() -> None:
+    head = torch.arange(15, dtype=torch.float32).reshape(5, 3, 1)
+    state = OrderedDict(
+        {
+            "decoder.decoder_layers.0.weight": head,
+            "decoder.decoder_layers.0.bias": torch.arange(5, dtype=torch.float32),
+            "encoder.layers.0.feed_forward1.linear2.bias": torch.tensor([2.0, -4.0]),
+            "encoder.layers.0.feed_forward2.linear2.bias": torch.tensor([6.0, 8.0]),
+            **{
+                f"encoder.layers.0.self_attn.linear_{name}.bias": torch.full(
+                    (3,), value
+                )
+                for name, value in (("q", 1.0), ("k", 2.0), ("v", 3.0))
+            },
+        }
+    )
+    original = {name: value.clone() for name, value in state.items()}
+    adjusted = adjust_state_dict(state)
+    torch.testing.assert_close(
+        adjusted["projection_output.weight"],
+        original["decoder.decoder_layers.0.weight"].squeeze(2),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        adjusted["projection_output.bias"],
+        original["decoder.decoder_layers.0.bias"],
+        rtol=0,
+        atol=0,
+    )
+    for name in ("feed_forward1", "feed_forward2"):
+        key = f"encoder.layers.0.{name}.linear2.bias"
+        torch.testing.assert_close(adjusted[key], original[key] * 0.5, rtol=0, atol=0)
+        assert adjusted[key] is state[key]
+    torch.testing.assert_close(
+        adjusted["encoder.layers.0.self_attn.linear_qkv.bias"],
+        torch.tensor([1.0] * 3 + [2.0] * 3 + [3.0] * 3),
+    )
+    assert set(adjusted) == {
+        "projection_output.weight",
+        "projection_output.bias",
+        "encoder.layers.0.feed_forward1.linear2.bias",
+        "encoder.layers.0.feed_forward2.linear2.bias",
+        "encoder.layers.0.self_attn.linear_qkv.bias",
+    }
+
+
+def test_tdt_onnx_export_rejects_missing_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = make_export_args()
+    args.output_dir = tmp_path
+    monkeypatch.setattr(torch.onnx, "export", Mock())
+    with pytest.raises(RuntimeError, match="TDT decoder was not initialized"):
+        export_model_to_onnx(torch.nn.Identity(), None, make_model_config(), args)
+
+
+def make_small_ctc_model(
+    use_bias: bool = True,
+) -> tuple[DictConfig, parakeet_exporter.ParakeetEncoder]:
+    """Return a two-block CTC model and matching config for weight-folding tests."""
+
+    config = make_ctc_config(2)
+    config.preprocessor.features = 16
+    config.encoder.update(
+        {
+            "d_model": 16,
+            "subsampling_conv_channels": 4,
+            "ff_expansion_factor": 2,
+            "n_heads": 4,
+            "pos_emb_max_len": 64,
+            "conv_kernel_size": 3,
+            "use_bias": use_bias,
+        }
+    )
+    config.decoder = {"feat_in": 16, "num_classes": 5}
+    source = parakeet_exporter.ParakeetEncoder(
+        samp_freq=16000,
+        frame_shift_ms=10,
+        frame_length_ms=25,
+        feature_dim=16,
+        preemph=0.97,
+        low_freq=0,
+        high_freq=8000,
+        n_layers=2,
+        model_dim=16,
+        subsampling_conv_channels=4,
+        feed_forward_expansion_factor=2,
+        n_heads=4,
+        pos_emb_max_len=64,
+        conv_kernel_size=3,
+        subsampling_batch_partitions=1,
+        dtype=torch.float32,
+        use_bias=use_bias,
+        vocab_size=5,
+    ).eval()
+    return config, source
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("xscaling", (False, True))
+@pytest.mark.parametrize("use_bias", (False, True))
+def test_ctc_model_loads_biases_and_folds_input_scaling(
+    dtype: torch.dtype, xscaling: bool, use_bias: bool
+) -> None:
+    config, source = make_small_ctc_model(use_bias)
+    config.encoder.xscaling = xscaling
+    with torch.no_grad():
+        source.encoder.pre_encode.out.bias.fill_(17000.0)
+    state = source.state_dict()
+    original = OrderedDict((name, value.clone()) for name, value in state.items())
+    encoder, decoder = make_model(config, state, 1, dtype, dtype, "ctc_greedy_search")
+    assert decoder is None
+    projection = encoder.encoder.pre_encode.out
+    reparam_half = xscaling and dtype == torch.float16
+    scale = 4.0 if xscaling and not reparam_half else 1.0
+    for parameter in ("weight", "bias"):
+        expected = (original[f"encoder.pre_encode.out.{parameter}"] * scale).to(
+            projection.weight.dtype
+        )
+        torch.testing.assert_close(
+            getattr(projection, parameter), expected, rtol=0, atol=0
+        )
+    for index, layer in enumerate(encoder.encoder.layers):
+        for name in (
+            "feed_forward1.linear2",
+            "self_attn.linear_out",
+            "conv.pointwise_conv2",
+            "feed_forward2.linear2",
+        ):
+            for parameter in ("weight", "bias"):
+                value = getattr(layer.get_submodule(name), parameter)
+                assert (value is not None) == (parameter == "weight" or use_bias)
+                if value is not None:
+                    expected = original[f"encoder.layers.{index}.{name}.{parameter}"]
+                    if reparam_half and index == 0:
+                        expected = expected / 4.0
+                    torch.testing.assert_close(
+                        value, expected.to(dtype), rtol=0, atol=0
+                    )
+        for module in layer.modules():
+            if isinstance(module, torch.nn.LayerNorm):
+                assert module.eps == (
+                    1e-5 / 16 if reparam_half and index == 0 else 1e-5
+                )
+    assert encoder.projection_output.weight.dtype == torch.float32
+    for name, value in encoder.projection_output.state_dict().items():
+        torch.testing.assert_close(
+            value, original[f"projection_output.{name}"], rtol=0, atol=0
+        )
+    assert all(parameter.dtype == dtype for parameter in encoder.encoder.parameters())
+    with torch.inference_mode():
+        output, lengths = encoder(torch.zeros(2, 3200), torch.tensor([3200, 1600]))
+    assert output.dtype == torch.float32
+    assert lengths.dtype == torch.int32
+    assert lengths.tolist() == [3, 2]
+    assert output.shape == (2, 3, 6)
+    assert output.isfinite().all()
+    torch.testing.assert_close(output.exp().sum(dim=2), torch.ones(2, 3))
+
+
+def test_ctc_model_uses_legacy_encoder_defaults() -> None:
+    config, source = make_small_ctc_model()
+    del config.encoder.use_bias
+    del config.encoder.xscaling
+    state = source.state_dict()
+    expected = {
+        name: state[f"encoder.pre_encode.out.{name}"].clone() * 4
+        for name in ("weight", "bias")
+    }
+
+    encoder, decoder = make_model(
+        config, state, 1, torch.float32, torch.float32, "ctc_greedy_search"
+    )
+
+    assert decoder is None
+    torch.testing.assert_close(encoder.encoder.pre_encode.out.state_dict(), expected)
+    assert encoder.encoder.layers[0].self_attn.linear_qkv.bias is not None
+
+
+@pytest.mark.parametrize(
+    ("key", "shape"),
+    (
+        ("projection_output.weight", None),
+        ("projection_output.bias", None),
+        ("projection_output.weight", (6, 15)),
+    ),
+    ids=("missing-weight", "missing-bias", "wrong-width"),
+)
+def test_ctc_model_rejects_incompatible_projection(
+    key: str, shape: tuple[int, ...] | None
+) -> None:
+    config, source = make_small_ctc_model()
+    state = source.state_dict()
+    if shape is None:
+        del state[key]
+    else:
+        state[key] = torch.zeros(shape)
+    with pytest.raises(RuntimeError, match=re.escape(key)):
+        make_model(config, state, 1, torch.float32, torch.float32, "ctc_greedy_search")
+
+
+@pytest.mark.parametrize("amplitude", (0.001, 1.0, 100.0))
+@pytest.mark.parametrize("use_bias", (False, True))
+def test_fp16_reparameterization_matches_explicit_input_scaling(
+    amplitude: float, use_bias: bool
+) -> None:
+    config, source = make_small_ctc_model(use_bias)
+    # Exactly representable weights isolate the reparameterization from FP16 rounding.
+    with torch.no_grad():
+        for parameter in source.parameters():
+            parameter.copy_((parameter * 64).round() / 64)
+    encoder, _ = make_model(
+        config,
+        OrderedDict(
+            (name, value.clone()) for name, value in source.state_dict().items()
+        ),
+        1,
+        torch.float16,
+        torch.float16,
+        "ctc_greedy_search",
+    )
+    encoder.float()  # Compare the algebra; the full-model test covers FP16 execution.
+    inputs = (
+        torch.randn(2, 5, 16, generator=torch.Generator().manual_seed(1)) * amplitude
+    )
+    lengths = torch.tensor([5, 3], dtype=torch.int32)
+    position = source.encoder.pos_enc(inputs)
+    with torch.inference_mode():
+        actual = encoder.encoder.layers[0](inputs, position, lengths)
+        expected = source.encoder.layers[0](inputs * 4, position, lengths)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("use_symlink", (False, True), ids=("direct", "symlink"))
@@ -214,6 +519,8 @@ def test_export_parakeet_replaces_output_before_extraction(
     (
         pytest.param("transducer_greedy_search", 1, 1, False, id="greedy-already-one"),
         pytest.param("transducer_greedy_search", 6, 1, True, id="greedy-override"),
+        pytest.param("ctc_greedy_search", 1, 1, False, id="ctc-already-one"),
+        pytest.param("ctc_greedy_search", 6, 1, True, id="ctc-override"),
         pytest.param(
             "transducer_modified_beam_search", 6, 6, False, id="modified-beam-preserved"
         ),
@@ -285,11 +592,13 @@ def test_export_parakeet_applies_decoder_beam_policy(
         pytest.param(
             "export --model-path model.nemo --output-dir output --batch-size 256 "
             "--decoder-type transducer_modified_beam_search --beam 6 "
+            "--blank-penalty 0.2 "
             "--encoder-precision bf16 --decoder-precision fp16 "
             "--min-audio-seconds 0.1 --opt-audio-seconds 8 --max-audio-seconds 40 "
             "--optimization-level 3 --debug",
             {
                 "batch_size": 256,
+                "blank_penalty": 0.2,
                 "encoder_precision": "bf16",
                 "decoder_precision": "fp16",
                 "min_audio_seconds": 0.1,
@@ -298,6 +607,13 @@ def test_export_parakeet_applies_decoder_beam_policy(
                 "debug": True,
             },
             id="overrides",
+        ),
+        pytest.param(
+            "export --model-path model.nemo --output-dir output --batch-size 1 "
+            "--decoder-type ctc_greedy_search --beam 1 --blank-penalty -0.2 "
+            "--min-audio-seconds 0.5 --opt-audio-seconds 15 --max-audio-seconds 40",
+            {"decoder_type": "ctc_greedy_search", "beam": 1, "blank_penalty": -0.2},
+            id="ctc-negative-penalty",
         ),
     ),
 )
@@ -311,6 +627,16 @@ def test_parse_args(
     vars(expected).update(overrides)
 
     assert parse_args() == expected
+
+
+def test_parse_args_rejects_nonnumeric_blank_penalty(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["export", "--blank-penalty", "invalid"])
+    with pytest.raises(SystemExit) as error:
+        parse_args()
+    assert error.value.code == 2
+    assert "argument --blank-penalty: invalid float value" in capsys.readouterr().err
 
 
 def test_main_configures_logging_and_runs_export(
@@ -334,8 +660,9 @@ def test_main_configures_logging_and_runs_export(
     )
 
 
-def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("use_ctc", (False, True), ids=("tdt", "ctc"))
+def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_ctc: bool
 ) -> None:
     def record_export(module, inputs, path, **kwargs) -> None:
         """Check the inference context while Mock records the ONNX arguments.
@@ -361,25 +688,31 @@ def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
     args.batch_size = 3
     args.beam = 4
     args.opt_audio_seconds = 2.75
-    model_config = make_model_config()
+    model_config = make_ctc_config() if use_ctc else make_model_config()
     model_config.encoder.d_model = 384
-    model_config.decoder.prednet.pred_hidden = 192
-    model_config.decoder.prednet.pred_rnn_layers = 3
-    model_config.joint.jointnet.encoder_hidden = 384
     encoder = torch.nn.Identity()
-    decoder = torch.nn.Module()
-    decoder.output_proj = torch.nn.Linear(1, 1, dtype=torch.float16, device="meta")
+    decoder = None
+    if use_ctc:
+        args.decoder_type = "ctc_greedy_search"
+        args.beam = 1
+        model_config.decoder.feat_in = 384
+    else:
+        model_config.decoder.prednet.pred_hidden = 192
+        model_config.decoder.prednet.pred_rnn_layers = 3
+        model_config.joint.jointnet.encoder_hidden = 384
+        decoder = torch.nn.Module()
+        decoder.output_proj = torch.nn.Linear(1, 1, dtype=torch.float16, device="meta")
 
     paths = export_model_to_onnx(encoder, decoder, model_config, args)
 
-    assert paths == (tmp_path / "parakeet.onnx", tmp_path / "tdt_decoder.onnx")
-    assert export.call_count == 2
-    encoder_call, decoder_call = export.call_args_list
-    for export_call, module, path in zip(
-        export.call_args_list, (encoder, decoder), paths, strict=True
-    ):
-        assert export_call.args[0] is module
-        assert export_call.args[2] == path
+    assert paths == (
+        tmp_path / "parakeet.onnx",
+        None if use_ctc else tmp_path / "tdt_decoder.onnx",
+    )
+    assert export.call_count == (1 if use_ctc else 2)
+    encoder_call = export.call_args_list[0]
+    assert encoder_call.args[0] is encoder
+    assert encoder_call.args[2] == paths[0]
 
     torch.testing.assert_close(
         encoder_call.args[1],
@@ -393,6 +726,12 @@ def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
         "dynamic_shapes": {"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
         "opset_version": parakeet_exporter.ONNX_OPSET_VERSION,
     }
+    if use_ctc:
+        return
+
+    decoder_call = export.call_args_list[1]
+    assert decoder_call.args[0] is decoder
+    assert decoder_call.args[2] == paths[1]
     torch.testing.assert_close(
         decoder_call.args[1],
         (
@@ -423,16 +762,19 @@ def test_export_parakeet_onnx_uses_fixed_decoder_capacity(
 
 @pytest.mark.parametrize("debug", (False, True))
 @pytest.mark.parametrize(("batch_size", "partitions"), ((3, 1), (128, 2)))
+@pytest.mark.parametrize("use_ctc", (False, True))
 def test_export_parakeet_validates_exact_published_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     debug: bool,
     batch_size: int,
     partitions: int,
+    use_ctc: bool,
 ) -> None:
     args = make_export_args()
     args.batch_size = batch_size
     args.beam = 4
+    args.blank_penalty = -0.25 if use_ctc else 0.25
     args.debug = debug
     args.encoder_precision = "fp16"
     args.decoder_precision = "bf16"
@@ -440,10 +782,20 @@ def test_export_parakeet_validates_exact_published_artifacts(
     args.model_path = tmp_path / "model.nemo"
     args.output_dir = tmp_path / "nested" / "bundle"
     source_config = make_model_config()
+    if use_ctc:
+        args.decoder_type = "ctc_greedy_search"
+        source_config = make_ctc_config()
     source_config.tokenizer = {"model_path": "nemo:artifacts/source.model"}
     weight = torch.arange(4, dtype=torch.float32)
+    if use_ctc:
+        source_key, adjusted_key = (
+            "decoder.decoder_layers.0.bias",
+            "projection_output.bias",
+        )
+    else:
+        source_key, adjusted_key = "decoder.prediction.embed.weight", "embedding.weight"
     checkpoint = io.BytesIO()
-    torch.save(OrderedDict({"decoder.prediction.embed.weight": weight}), checkpoint)
+    torch.save(OrderedDict({source_key: weight}), checkpoint)
     with tarfile.open(args.model_path, "w") as archive:
         add_archive_member(
             archive, "model_config.yaml", OmegaConf.to_yaml(source_config).encode()
@@ -451,21 +803,24 @@ def test_export_parakeet_validates_exact_published_artifacts(
         add_archive_member(archive, "model_weights.ckpt", checkpoint.getvalue())
         add_archive_member(archive, "artifacts/source.model", b"tokenizer")
     source_bytes = args.model_path.read_bytes()
-    encoder, decoder = torch.nn.Identity(), torch.nn.Identity()
+    encoder = torch.nn.Identity()
+    decoder = None if use_ctc else torch.nn.Identity()
     construct_model = Mock(return_value=(encoder, decoder))
     validate_source = Mock(wraps=validate_parakeet)
     load_checkpoint = Mock(wraps=torch.load)
     validate_config = Mock(wraps=parakeet_exporter.validate_model_config)
 
-    def export_onnx(encoder, decoder, model_config, export_args) -> tuple[Path, Path]:
+    def export_onnx(
+        encoder, decoder, model_config, export_args
+    ) -> tuple[Path, Path | None]:
         """Write small ONNX graphs so production cleanup can run unchanged.
 
         Parameters
         ----------
         encoder : torch.nn.Module
             Placeholder encoder recorded by the surrounding Mock.
-        decoder : torch.nn.Module
-            Placeholder decoder recorded by the surrounding Mock.
+        decoder : torch.nn.Module | None
+            Placeholder TDT decoder, or None for CTC.
         model_config : DictConfig
             Source configuration passed by the exporter.
         export_args : argparse.Namespace
@@ -473,20 +828,20 @@ def test_export_parakeet_validates_exact_published_artifacts(
 
         Returns
         -------
-        tuple[Path, Path]
-            Newly written encoder and decoder graph paths.
+        tuple[Path, Path | None]
+            Newly written encoder and optional TDT decoder graph paths.
         """
 
         paths = tuple(
             export_args.output_dir / name
             for name in ("parakeet.onnx", "tdt_decoder.onnx")
         )
-        for path in paths:
+        for path in paths[:1] if use_ctc else paths:
             onnx.save(
                 onnx.helper.make_model(onnx.helper.make_graph([], path.stem, [], [])),
                 path,
             )
-        return paths
+        return (paths[0], None) if use_ctc else paths
 
     def build_engine(onnx_path, engine_path, profiles, optimization_level) -> None:
         """Stand in for TensorRT only after extraction resources are released.
@@ -522,6 +877,7 @@ def test_export_parakeet_validates_exact_published_artifacts(
         assert model_config is not validate_config.call_args.args[0]
         assert model_config == validate_config.call_args.args[0]
         assert model_config == OmegaConf.load(model_dir / "model_config.yaml")
+        assert model_config.decoder_params.blank_penalty == args.blank_penalty
         expected_files = {
             "model_config.yaml",
             "bpe.model",
@@ -530,11 +886,14 @@ def test_export_parakeet_validates_exact_published_artifacts(
         }
         if debug:
             expected_files.update(("parakeet.onnx", "tdt_decoder.onnx"))
+        if use_ctc:
+            expected_files.difference_update(("tdt_decoder.trt", "tdt_decoder.onnx"))
         assert {path.name for path in model_dir.iterdir()} == expected_files
         assert all(path.is_file() for path in model_dir.iterdir())
         assert (model_dir / "bpe.model").read_bytes() == b"tokenizer"
         assert (model_dir / "parakeet.trt").read_bytes() == b"parakeet.onnx"
-        assert (model_dir / "tdt_decoder.trt").read_bytes() == b"tdt_decoder.onnx"
+        if not use_ctc:
+            assert (model_dir / "tdt_decoder.trt").read_bytes() == b"tdt_decoder.onnx"
 
     export_onnx_mock = Mock(side_effect=export_onnx)
     build = Mock(side_effect=build_engine)
@@ -560,13 +919,13 @@ def test_export_parakeet_validates_exact_published_artifacts(
     config, state_dict, *settings = construct_model.call_args.args
     assert config == source_config
     torch.testing.assert_close(
-        state_dict, OrderedDict({"embedding.weight": weight}), rtol=0, atol=0
+        state_dict, OrderedDict({adjusted_key: weight}), rtol=0, atol=0
     )
-    assert settings == [partitions, torch.float16, torch.bfloat16]
+    assert settings == [partitions, torch.float16, torch.bfloat16, args.decoder_type]
     export_onnx_mock.assert_called_once_with(encoder, decoder, source_config, args)
     validate_config.assert_called_once()
     validate.assert_called_once_with(args.output_dir, validate_config.call_args.args[0])
-    assert build.call_args_list == [
+    expected_builds = [
         call(
             args.output_dir / "parakeet.onnx",
             args.output_dir / "parakeet.trt",
@@ -586,6 +945,8 @@ def test_export_parakeet_validates_exact_published_artifacts(
             3,
         ),
     ]
+    assert build.call_args_list == (expected_builds[:1] if use_ctc else expected_builds)
+    assert args.beam == (1 if use_ctc else 4)
     assert args.model_path.read_bytes() == source_bytes
 
 
@@ -607,7 +968,7 @@ def test_make_model_wires_configuration_and_state_dicts(
 ) -> None:
     make_encoder = Mock(return_value=Mock(spec=torch.nn.Module))
     make_decoder = Mock(return_value=Mock(spec=torch.nn.Module))
-    monkeypatch.setattr(parakeet_exporter, "ParakeetTDTEncoder", make_encoder)
+    monkeypatch.setattr(parakeet_exporter, "ParakeetEncoder", make_encoder)
     monkeypatch.setattr(parakeet_exporter, "Decoder", make_decoder)
     encoder_weight = torch.ones(1)
     decoder_weights = OrderedDict(
@@ -648,7 +1009,12 @@ def test_make_model_wires_configuration_and_state_dicts(
     model_config.joint.num_extra_outputs = 7
 
     encoder, decoder = make_model(
-        model_config, state_dict, 3, torch.float16, torch.bfloat16
+        model_config,
+        state_dict,
+        3,
+        torch.float16,
+        torch.bfloat16,
+        "transducer_modified_beam_search",
     )
 
     assert encoder is make_encoder.return_value
@@ -670,6 +1036,8 @@ def test_make_model_wires_configuration_and_state_dicts(
         conv_kernel_size=15,
         subsampling_batch_partitions=3,
         dtype=torch.float16,
+        use_bias=False,
+        vocab_size=None,
     )
     make_decoder.assert_called_once_with(
         vocab_size=321,
@@ -705,6 +1073,7 @@ def test_make_parakeet_runtime_config(monkeypatch: pytest.MonkeyPatch) -> None:
     model_config.decoding.greedy.max_symbols = 7
     args = make_export_args()
     args.beam = 5
+    args.blank_penalty = 0.25
     args.min_audio_seconds = 0.25
     args.opt_audio_seconds = 7.5
     args.max_audio_seconds = 30.0
@@ -737,7 +1106,7 @@ def test_make_parakeet_runtime_config(monkeypatch: pytest.MonkeyPatch) -> None:
             "pred_rnn_layers": 3,
             "num_extra_outputs": 3,
             "beam": 5,
-            "blank_penalty": 0.0,
+            "blank_penalty": 0.25,
             "max_symbols_per_timestep": 7,
             "tdt_durations": [0, 2, 4],
         },
@@ -760,12 +1129,32 @@ def test_validate_parakeet_accepts_beam_one(decoder_type: str) -> None:
     assert runtime_config.decoder_params.beam == 1
 
 
-def test_validate_parakeet_rejects_beam_larger_than_vocabulary() -> None:
-    model_config = make_model_config()
+@pytest.mark.parametrize("use_ctc", (False, True))
+@pytest.mark.parametrize("feat_out", (-1, 1024))
+def test_validate_parakeet_accepts_no_encoder_output_projection(
+    use_ctc: bool, feat_out: int
+) -> None:
+    model_config = make_ctc_config() if use_ctc else make_model_config()
+    model_config.encoder.feat_out = feat_out
     args = make_export_args()
-    args.beam = model_config.decoder.vocab_size + 1
+    if use_ctc:
+        args.decoder_type = "ctc_greedy_search"
+        args.beam = 1
+    validate_parakeet(model_config, args)
 
-    with pytest.raises(ValueError, match="beam must not exceed decoder.vocab_size"):
+
+@pytest.mark.parametrize("use_ctc", (False, True))
+def test_validate_parakeet_rejects_beam_larger_than_vocabulary(use_ctc: bool) -> None:
+    model_config = make_ctc_config() if use_ctc else make_model_config()
+    args = make_export_args()
+    vocab_field = "num_classes" if use_ctc else "vocab_size"
+    if use_ctc:
+        args.decoder_type = "ctc_greedy_search"
+    args.beam = model_config.decoder[vocab_field] + 1
+
+    with pytest.raises(
+        ValueError, match=rf"beam must not exceed decoder\.{vocab_field}"
+    ):
         validate_parakeet(model_config, args)
 
 
@@ -817,6 +1206,19 @@ def test_validate_parakeet_rejects_parameter_tensor_overflow(
 
     with pytest.raises(ValueError, match=parameter_name):
         validate_parakeet(model_config, make_export_args())
+
+
+def test_validate_parakeet_ctc_projection_indexing_boundary() -> None:
+    model_config = make_ctc_config()
+    args = make_export_args()
+    args.decoder_type = "ctc_greedy_search"
+    args.beam = 1
+    model_config.decoder.num_classes = (1 << 31) // model_config.encoder.d_model - 2
+    validate_parakeet(model_config, args)
+
+    model_config.decoder.num_classes += 1
+    with pytest.raises(ValueError, match="ctc projection weight exceeds"):
+        validate_parakeet(model_config, args)
 
 
 def test_validate_parakeet_rejects_encoder_decoder_interface_mismatch() -> None:
@@ -900,6 +1302,47 @@ def test_validate_parakeet_rejects_invalid_export_arguments(
         validate_parakeet(make_model_config(), args)
 
 
+@pytest.mark.parametrize("use_ctc", (False, True))
+@pytest.mark.parametrize(
+    "blank_penalty",
+    (-torch.finfo(torch.float32).max, -0.25, 0.0, 0.25, torch.finfo(torch.float32).max),
+)
+def test_parakeet_preserves_valid_blank_penalty(
+    use_ctc: bool, blank_penalty: float
+) -> None:
+    config = make_ctc_config() if use_ctc else make_model_config()
+    args = make_export_args()
+    args.blank_penalty = blank_penalty
+    if use_ctc:
+        args.decoder_type = "ctc_greedy_search"
+        args.beam = 1
+
+    validate_parakeet(config, args)
+    runtime_config = make_runtime_config(config, args)
+    assert runtime_config.decoder_params.blank_penalty == blank_penalty
+
+
+@pytest.mark.parametrize("use_ctc", (False, True))
+@pytest.mark.parametrize(
+    "blank_penalty",
+    (False, 0, "0.25", None, float("nan"), float("inf"), -float("inf"), 1e39, -1e39),
+)
+def test_validate_parakeet_rejects_invalid_blank_penalty(
+    use_ctc: bool, blank_penalty: object
+) -> None:
+    config = make_ctc_config() if use_ctc else make_model_config()
+    args = make_export_args()
+    args.blank_penalty = blank_penalty
+    if use_ctc:
+        args.decoder_type = "ctc_greedy_search"
+        args.beam = 1
+
+    with pytest.raises(
+        ValueError, match="blank_penalty must be a finite float32 value"
+    ):
+        validate_parakeet(config, args)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -910,9 +1353,7 @@ def test_validate_parakeet_rejects_invalid_export_arguments(
         ("preprocessor.pad_to", False),
         ("preprocessor.pad_value", 0),
         ("encoder.subsampling_factor", 8.0),
-        ("encoder.xscaling", 0),
         ("encoder.untie_biases", 1),
-        ("encoder.use_bias", 0),
         ("decoder.blank_as_pad", 1),
     ),
 )
@@ -1043,9 +1484,13 @@ def test_validate_parakeet_flash_attention_capacity_boundary() -> None:
         ("encoder.subsampling_factor", 4),
         ("encoder.self_attention_model", "abs_pos"),
         ("encoder.att_context_style", "chunked_limited"),
-        ("encoder.xscaling", True),
+        ("encoder.xscaling", 0),
+        ("encoder.xscaling", 1),
+        ("encoder.xscaling", "invalid"),
         ("encoder.untie_biases", False),
-        ("encoder.use_bias", True),
+        ("encoder.use_bias", 0),
+        ("encoder.use_bias", 1),
+        ("encoder.use_bias", "invalid"),
         ("encoder.conv_norm_type", "layer_norm"),
         ("encoder.att_context_size", [-1, 0]),
         ("decoder.blank_as_pad", False),
@@ -1064,7 +1509,7 @@ def test_validate_parakeet_rejects_unsupported_fixed_values(
 
 def test_validate_parakeet_rejects_unsupported_decoder_type() -> None:
     args = make_export_args()
-    args.decoder_type = "ctc_greedy_search"
+    args.decoder_type = "unknown"
 
     with pytest.raises(ValueError, match="supports only"):
         validate_parakeet(make_model_config(), args)
@@ -1450,6 +1895,8 @@ def test_adjust_state_dict_converts_complete_parakeet_layout() -> None:
     assert isinstance(adjusted, OrderedDict)
     assert tuple(state_dict) == tuple(original_values)
     assert all(state_dict[key] is value for key, value in original_items)
+    for name in ("feed_forward1", "feed_forward2"):
+        original_values[f"encoder.layers.0.{name}.linear2.weight"] *= 0.5
     torch.testing.assert_close(state_dict, original_values, rtol=0, atol=0)
     torch.testing.assert_close(adjusted, expected, rtol=0, atol=0)
 
@@ -1502,14 +1949,19 @@ def test_adjust_state_dict_fuses_every_attention_layer() -> None:
         )
 
 
-@pytest.mark.parametrize("pointwise_layer", ("pointwise_conv1", "pointwise_conv2"))
+@pytest.mark.parametrize(
+    "key",
+    (
+        "encoder.layers.0.conv.pointwise_conv1.weight",
+        "encoder.layers.0.conv.pointwise_conv2.weight",
+        "decoder.decoder_layers.0.weight",
+    ),
+)
 @pytest.mark.parametrize("shape", ((4, 4), (4, 4, 2)))
 def test_adjust_state_dict_rejects_invalid_pointwise_weight_shape(
-    pointwise_layer: str, shape: tuple[int, ...]
+    key: str, shape: tuple[int, ...]
 ) -> None:
-    state_dict = OrderedDict(
-        {f"encoder.layers.0.conv.{pointwise_layer}.weight": torch.ones(shape)}
-    )
+    state_dict = OrderedDict({key: torch.ones(shape)})
 
     with pytest.raises(ValueError, match="Expected pointwise Conv1d weight"):
         adjust_state_dict(state_dict)

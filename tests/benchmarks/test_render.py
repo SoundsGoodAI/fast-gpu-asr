@@ -188,9 +188,9 @@ def test_all_rows_and_scoped_highlights_are_rendered(tmp_path, rows):
         )
     assert "Batch size" not in highlights
     assert next(line for line in highlights.splitlines() if line.startswith("|")) == (
-        "| GPU | Model | Batch 1<br>RTFx | Batch 256<br>RTFx"
-        " | Batch 1<br>Suite time | Batch 256<br>Suite time"
-        " | Batch 1<br>Mean WER | Batch 256<br>Mean WER |"
+        "| GPU | Model | Batch&nbsp;1<br>RTFx | Batch&nbsp;256<br>RTFx"
+        " | Batch&nbsp;1<br>Suite&nbsp;time | Batch&nbsp;256<br>Suite&nbsp;time"
+        " | Batch&nbsp;1<br>Mean&nbsp;WER | Batch&nbsp;256<br>Mean&nbsp;WER |"
     )
     assert overview.count("<img ") == 2
     for family in ("zipformer", "parakeet"):
@@ -289,33 +289,33 @@ def test_bf16_observation_groups_matching_comparisons(tmp_path, rows):
     ) in text
 
 
-def test_plot_grid_stacks_full_width_images_below_their_headers():
+def test_plot_grid_places_models_in_equal_width_columns():
     table = ET.fromstring(render.plot_grid())
     rows = table.findall("./tbody/tr")
-    assert len(rows) == 4
-    assert all(len(row) == 1 for row in rows)
-    for heading, plot, family, name in zip(
-        rows[::2],
-        rows[1::2],
+    assert len(rows) == 2
+    assert all(len(row) == 2 for row in rows)
+    for header, cell, family, name in zip(
+        rows[0].findall("th"),
+        rows[1].findall("td"),
         ("zipformer", "parakeet"),
         render.MODELS.values(),
         strict=True,
     ):
-        header = heading.find("th")
-        assert header.get("width") == "100%"
+        assert header.get("width") == "50%"
         assert header.find("div").get("align") == "center"
-        assert header.find("div/big").text == f"{name} (beam 6)"
-        cell = plot.find("td")
+        assert header.find("div/big").text == f"{name} (decoder beam 6)"
         link = cell.find("a")
         image = link.find("img")
         path = f"{render.RAW_BENCHMARK_URL}{family}-fp16-bf16-fp32.svg"
-        assert cell.get("width") == "100%"
+        assert cell.get("width") == "50%"
         assert link.get("href") == image.get("src") == path
         assert image.get("width") == "100%"
         assert image.get("alt") == f"{name}, FP16 / BF16 / FP32"
 
 
 def test_figures_use_precision_axes_and_real_measurements(tmp_path, rows):
+    for row in rows:
+        row["inference_seconds"] /= 2
     records = render.load_measurements(write_csv(tmp_path / "measurements.csv", rows))
     for model in render.MODELS:
         for precisions in (
@@ -340,8 +340,9 @@ def test_figures_use_precision_axes_and_real_measurements(tmp_path, rows):
             )
             assert chart.layout.yaxis.range == (
                 0,
-                20_000 if fp32_only else 15_000,
+                20_000 if fp32_only else 27_000,
             )
+            assert chart.layout.yaxis.dtick == 5_000
             series = [(gpu, p) for p in precisions for gpu in ("A100", "H200")]
             for trace, (gpu, precision) in zip(chart.data, series, strict=True):
                 assert trace.name == f"{gpu} {precision.upper()}"
@@ -353,9 +354,8 @@ def test_figures_use_precision_axes_and_real_measurements(tmp_path, rows):
                 ]
                 assert tuple(trace.x) == tuple(r.batch_size for r in expected)
                 assert tuple(trace.y) == tuple(r.rtfx for r in expected)
-                assert (
-                    trace.line.color == {"A100": "dodgerblue", "H200": "limegreen"}[gpu]
-                )
+                assert max(trace.y) < chart.layout.yaxis.range[1]
+                assert trace.line.color == {"A100": "deepskyblue", "H200": "lime"}[gpu]
                 assert (
                     trace.line.dash
                     == {"fp16": "solid", "bf16": "dash", "fp32": "dot"}[precision]

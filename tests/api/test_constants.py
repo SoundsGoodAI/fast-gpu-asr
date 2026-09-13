@@ -15,6 +15,7 @@ from fast_gpu_asr.constants import (
     AUDIO_SAMPLES_PER_WORKER,
     CUDA_DEFAULT_SHARED_MEMORY_BYTES,
     DECODER_TYPES,
+    FLOAT32_MAX,
     INT32_MAX,
     MODEL_CONFIG_FILE,
     MODEL_TYPE_PARAKEET,
@@ -118,6 +119,8 @@ def test_shared_scalar_constants_are_stable() -> None:
     assert isinstance(ONNX_OPSET_VERSION, int) and ONNX_OPSET_VERSION == 20
     assert TENSORRT_PLUGIN_NAMESPACE == "fast_gpu_asr"
     assert isinstance(INT32_MAX, int) and INT32_MAX == 2_147_483_647
+    assert isinstance(FLOAT32_MAX, float)
+    assert FLOAT32_MAX == 3.4028234663852886e38
     assert isinstance(CUDA_DEFAULT_SHARED_MEMORY_BYTES, int)
     assert CUDA_DEFAULT_SHARED_MEMORY_BYTES == 48 * 1024
     assert ZERO_LOG == -20.7233

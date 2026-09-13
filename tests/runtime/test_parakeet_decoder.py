@@ -24,7 +24,7 @@ from fast_gpu_asr.constants import (
     TDT_PREPARE_INPUTS_THREADS,
     TDT_SELECT_TOKENS_THREADS,
 )
-from fast_gpu_asr.decoder import parakeet_decoder
+from fast_gpu_asr.decoder import parakeet_tdt_decoder
 from fast_gpu_asr.decoder.gpu_kernels import (
     HISTORY_HELPERS_SOURCE,
     TDT_BEAM_SEARCH_KERNEL,
@@ -32,7 +32,7 @@ from fast_gpu_asr.decoder.gpu_kernels import (
     TDT_PREPARE_INPUTS_KERNEL,
     TDT_SELECT_TOKENS_KERNEL,
 )
-from fast_gpu_asr.decoder.parakeet_decoder import ParakeetModifiedBeamSearchDecoder
+from fast_gpu_asr.decoder.parakeet_tdt_decoder import ParakeetModifiedBeamSearchDecoder
 from fast_gpu_asr.utils import ASRInferenceError, ASRInitializationError
 
 PARAKEET_SEARCH_BUFFER_PAIRS = (
@@ -587,7 +587,9 @@ def test_parakeet_decoder_propagates_non_capture_driver_errors(
 
     failure = cp.cuda.driver.CUDADriverError(901)
     failing_kernel = Mock(side_effect=failure)
-    monkeypatch.setattr(parakeet_decoder, "TDT_SELECT_TOKENS_KERNEL", failing_kernel)
+    monkeypatch.setattr(
+        parakeet_tdt_decoder, "TDT_SELECT_TOKENS_KERNEL", failing_kernel
+    )
     install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [-2.0, 0.0])
 
     with pytest.raises(cp.cuda.driver.CUDADriverError) as error:
@@ -1048,7 +1050,7 @@ def test_parakeet_decoder_stops_at_step_budget_with_stale_active_flag(
     decoder = make_fake_parakeet_decoder()
     decoder.max_symbols_per_timestep = 1
     context = install_static_decoder_context(decoder, [-8.0, 0.0, -8.0], [-8.0, 0.0])
-    kernel = parakeet_decoder.TDT_BEAM_SEARCH_KERNEL
+    kernel = parakeet_tdt_decoder.TDT_BEAM_SEARCH_KERNEL
 
     def search_with_stale_flag(*args, **kwargs) -> None:
         """Run real search but leave its completion flag active.
@@ -1070,7 +1072,7 @@ def test_parakeet_decoder_stops_at_step_budget_with_stale_active_flag(
         decoder.active_flags.fill(1)
 
     monkeypatch.setattr(
-        parakeet_decoder, "TDT_BEAM_SEARCH_KERNEL", search_with_stale_flag
+        parakeet_tdt_decoder, "TDT_BEAM_SEARCH_KERNEL", search_with_stale_flag
     )
 
     assert decoder(
@@ -1097,17 +1099,25 @@ def test_parakeet_decoder_limits_zero_duration_token_emissions() -> None:
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("beam", (1, 2))
 @pytest.mark.parametrize(
-    ("blank_penalty", "expected_tokens"),
-    ((0.0, []), (0.2, [1])),
-    ids=("no-penalty", "with-penalty"),
+    ("blank_probability", "blank_penalty", "expected_tokens"),
+    ((0.75, 0.0, []), (0.75, 2.0, [1]), (0.25, 0.0, [1]), (0.25, -2.0, [])),
+    ids=("blank-wins", "positive-penalty", "token-wins", "negative-penalty"),
 )
 def test_parakeet_decoder_applies_blank_penalty(
-    blank_penalty: float, expected_tokens: list[int]
+    blank_probability: float,
+    blank_penalty: float,
+    expected_tokens: list[int],
+    beam: int,
 ) -> None:
-    decoder = make_fake_parakeet_decoder()
+    decoder = make_fake_parakeet_decoder(beam=beam)
     decoder.blank_penalty = blank_penalty
-    install_static_decoder_context(decoder, [-8.0, 0.0, 0.1], [-8.0, 0.0])
+    install_static_decoder_context(
+        decoder,
+        np.log([0.01, 0.99 - blank_probability, blank_probability]).tolist(),
+        np.log([0.001, 0.999]).tolist(),
+    )
     token_ids, timestamps = decoder(
         cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
     )
@@ -2427,13 +2437,15 @@ def test_parakeet_decoder_opts_in_to_large_shared_memory(
     }
     kernel = SimpleNamespace(max_dynamic_shared_size_bytes=0)
     selection_kernel = SimpleNamespace(max_dynamic_shared_size_bytes=0)
-    monkeypatch.setattr(parakeet_decoder, "get_engine", lambda path: engine)
-    monkeypatch.setattr(parakeet_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
+    monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(
         NullCudaContext, "attributes", {"MaxSharedMemoryPerBlockOptin": 64 * 1024}
     )
-    monkeypatch.setattr(parakeet_decoder, "TDT_BEAM_SEARCH_KERNEL", kernel)
-    monkeypatch.setattr(parakeet_decoder, "TDT_SELECT_TOKENS_KERNEL", selection_kernel)
+    monkeypatch.setattr(parakeet_tdt_decoder, "TDT_BEAM_SEARCH_KERNEL", kernel)
+    monkeypatch.setattr(
+        parakeet_tdt_decoder, "TDT_SELECT_TOKENS_KERNEL", selection_kernel
+    )
     with pytest.raises(ASRInitializationError, match="execution context"):
         ParakeetModifiedBeamSearchDecoder(
             Path("decoder.trt"),
@@ -2494,8 +2506,8 @@ def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
         assert events == ["enter_device", "enter_stream"]
         raise failure
 
-    monkeypatch.setattr(parakeet_decoder.cp.cuda, "Device", make_device)
-    monkeypatch.setattr(parakeet_decoder, "get_engine", fail_engine_load)
+    monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", make_device)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", fail_engine_load)
 
     with pytest.raises(RuntimeError) as error:
         ParakeetModifiedBeamSearchDecoder(
@@ -2712,7 +2724,7 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
     context = RecordingParakeetContext()
     engine = FakeParakeetEngine(context, encoder_trt_dtype, state_trt_dtype)
     load_engine = Mock(return_value=engine)
-    monkeypatch.setattr(parakeet_decoder, "get_engine", load_engine)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", load_engine)
     decoder = construct_parakeet_decoder(stream)
 
     load_engine.assert_called_once_with(Path("decoder.trt"))
@@ -2828,7 +2840,7 @@ def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
         "token_log_probs": (6, 8),
         "duration_log_probs": (6, 2),
     }
-    monkeypatch.setattr(parakeet_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
 
     decoder = ParakeetModifiedBeamSearchDecoder(
         Path("wide-decoder.trt"),
@@ -2883,7 +2895,7 @@ def test_parakeet_decoder_reports_fixed_tensor_binding_failure(
     stream = cp.cuda.get_current_stream()
     context = RecordingParakeetContext(rejected_binding)
     engine = FakeParakeetEngine(context)
-    monkeypatch.setattr(parakeet_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
 
     with pytest.raises(ASRInitializationError) as error:
         construct_parakeet_decoder(stream)
@@ -2911,8 +2923,8 @@ def test_parakeet_decoder_reports_context_setup_failure(
     )
     engine = FakeParakeetEngine(context)
     load_engine = Mock(return_value=engine)
-    monkeypatch.setattr(parakeet_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(parakeet_decoder, "get_engine", load_engine)
+    monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", load_engine)
 
     with pytest.raises(ASRInitializationError) as error:
         construct_parakeet_decoder(stream)

@@ -3,7 +3,7 @@
 # Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2018 Ryan Leary
 # Adapted for batched TensorRT export; see the upstream notices in NOTICE.
-"""Export-friendly log-mel extraction for NVIDIA Parakeet TDT models."""
+"""Export-friendly log-mel extraction for NVIDIA Parakeet models."""
 
 import torch
 
@@ -17,7 +17,7 @@ from ....constants import (
 class FeatureExtractor(torch.nn.Module):
     """Compute batched log-mel features compatible with NeMo.
 
-    Both supported Parakeet TDT checkpoints use 16 kHz mono PCM, 25 ms Hann
+    Supported Parakeet TDT and CTC checkpoints use 16 kHz mono PCM, 25 ms Hann
     windows, a 10 ms frame shift, a 512-point FFT, power spectra, Slaney mel
     normalization, 0.97 pre-emphasis, no inference-time dither, and per-feature
     utterance normalization. Dynamo ONNX export emits the complete frontend as

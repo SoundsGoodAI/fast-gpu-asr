@@ -32,7 +32,7 @@ MODELS = {
     "zipformer_cr_ctc_rnnt": "Zipformer CR-CTC-transducer",
     "parakeet_v3": "Parakeet V3",
 }
-COLORS = {"A100": "dodgerblue", "H200": "limegreen", "B300": "red"}
+COLORS = {"A100": "deepskyblue", "H200": "lime", "B300": "red"}
 PRECISIONS = ("fp16", "bf16", "fp32")
 PLOTS = (PRECISIONS,)
 BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
@@ -266,32 +266,32 @@ def pending_results(records: list[Measurement]) -> str:
 
 
 def plot_grid() -> str:
-    """Stack full-width model plots with all three precisions overlaid.
+    """Place model plots side by side with all three precisions overlaid.
 
     Returns
     -------
     str
-        Single-column HTML table with headings and absolute, PyPI-compatible URLs.
+        Two-column HTML table with headings and absolute, PyPI-compatible URLs.
     """
 
-    lines = ["<table>", "  <tbody>"]
-    for model, name in MODELS.items():
-        lines += [
-            "    <tr>",
-            '      <th width="100%"><div align="center">'
-            f"<big>{escape(name)} (beam 6)</big></div></th>",
-            "    </tr>",
-        ]
-        for precisions in PLOTS:
-            suffix = "-".join(precisions)
-            label = " / ".join(p.upper() for p in precisions)
+    lines = ["<table>", "  <tbody>", "    <tr>"]
+    for name in MODELS.values():
+        lines.append(
+            '      <th width="50%"><div align="center">'
+            f"<big>{escape(name)} (decoder beam 6)</big></div></th>"
+        )
+    lines.append("    </tr>")
+    for precisions in PLOTS:
+        suffix = "-".join(precisions)
+        label = " / ".join(p.upper() for p in precisions)
+        lines.append("    <tr>")
+        for model, name in MODELS.items():
             path = escape(f"{RAW_BENCHMARK_URL}{model.split('_')[0]}-{suffix}.svg")
-            lines += [
-                "    <tr>",
-                f'      <td width="100%"><a href="{path}"><img src="{path}" '
-                f'width="100%" alt="{escape(name)}, {label}" /></a></td>',
-                "    </tr>",
-            ]
+            lines.append(
+                f'      <td width="50%"><a href="{path}"><img src="{path}" '
+                f'width="100%" alt="{escape(name)}, {label}" /></a></td>'
+            )
+        lines.append("    </tr>")
     lines += ["  </tbody>", "</table>"]
     return "\n".join(lines)
 
@@ -313,9 +313,9 @@ def highlights(records: list[Measurement]) -> str:
     lines = [
         "**FP16, batch sizes 1 and 256, beam 6:**",
         "",
-        "| GPU | Model | Batch 1<br>RTFx | Batch 256<br>RTFx"
-        " | Batch 1<br>Suite time | Batch 256<br>Suite time"
-        " | Batch 1<br>Mean WER | Batch 256<br>Mean WER |",
+        "| GPU | Model | Batch&nbsp;1<br>RTFx | Batch&nbsp;256<br>RTFx"
+        " | Batch&nbsp;1<br>Suite&nbsp;time | Batch&nbsp;256<br>Suite&nbsp;time"
+        " | Batch&nbsp;1<br>Mean&nbsp;WER | Batch&nbsp;256<br>Mean&nbsp;WER |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     large_batches = {
@@ -525,7 +525,8 @@ def get_figure(
     ----------
     records : list[Measurement]
         All validated records, not just the plotted subset; their maximum RTFx
-        determines the shared vertical limit. An FP32-only plot uses 20,000 RTFx.
+        determines the shared vertical limit with 5% headroom and 5,000-RTFx ticks.
+        An FP32-only plot uses 20,000 RTFx.
     model : str
         Model key from MODELS.
     precisions : tuple[str, ...]
@@ -548,7 +549,7 @@ def get_figure(
     extra_legend_rows = len(precisions) - 1
     batches, max_rtfx = BATCHES[:8], 20000
     if precisions != ("fp32",):
-        max_rtfx = ceil(max(r.rtfx for r in records) * 1.05 / 5000) * 5000
+        max_rtfx = ceil(max(r.rtfx for r in records) * 1.05 / 1000) * 1000
         batches = BATCHES
 
     fig = go.Figure()
@@ -614,6 +615,7 @@ def get_figure(
             "rangemode": "tozero",
             "gridcolor": "gainsboro",
             "range": [0, max_rtfx],
+            "dtick": 5000,
             "tickformat": ",d",
         },
     )

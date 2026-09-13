@@ -9,12 +9,10 @@ remain internal implementation details.
 """
 
 from .asr import ASR
-from .decoder.parakeet_decoder import ParakeetModifiedBeamSearchDecoder
+from .decoder.ctc_decoder import CTCGreedyDecoder
+from .decoder.parakeet_tdt_decoder import ParakeetModifiedBeamSearchDecoder
 from .decoder.postprocessor import PostProcessor
-from .decoder.zipformer_decoder import (
-    CTCGreedyDecoder,
-    ZipformerModifiedBeamSearchDecoder,
-)
+from .decoder.zipformer_rnnt_decoder import ZipformerModifiedBeamSearchDecoder
 from .encoder.encoder import Encoder
 
 __all__ = [

@@ -20,10 +20,10 @@ from omegaconf import DictConfig
 
 from ..constants import (
     DECODER_TYPES,
+    FLOAT32_MAX,
     INT32_MAX,
     PARAKEET_MAX_ENCODER_FRAMES,
     PRECISION_DTYPES,
-    TRANSDUCER_DECODER_TYPES,
 )
 from ..tensorrt_plugins import load_tensorrt_plugins
 
@@ -33,17 +33,17 @@ logger = logging.getLogger(__name__)
 def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> None:
     """Validate a source Parakeet configuration and TensorRT export profile.
 
-    This validator accepts the offline Parakeet TDT architecture reconstructed
-    by the exporter. It checks the feature extractor, subsampling, attention,
-    convolution, prediction network, joiner, and fixed-batch audio profile.
+    This validator accepts the offline Parakeet TDT and CTC architectures
+    reconstructed by the exporter. It checks the feature extractor, encoder,
+    selected decoder head, blank penalty, and fixed-batch audio profile.
 
     Parameters
     ----------
     model_config : DictConfig
         Configuration extracted from the source Parakeet ``.nemo`` archive.
     args : argparse.Namespace
-        Parsed export arguments containing batch, beam, duration-profile, and
-        TensorRT build settings.
+        Parsed export arguments containing batch, beam, blank penalty,
+        duration-profile, and TensorRT build settings.
 
     Raises
     ------
@@ -53,6 +53,19 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
     TypeError
         Raised when the configured TDT durations are not iterable.
     """
+
+    use_ctc = args.decoder_type == "ctc_greedy_search"
+    if args.decoder_type not in DECODER_TYPES:
+        raise ValueError(
+            f"Parakeet export supports only {DECODER_TYPES}, got {args.decoder_type}."
+        )
+    vocab_field = "num_classes" if use_ctc else "vocab_size"
+    if vocab_field not in model_config.decoder:
+        decoder_name = "CTC" if use_ctc else "TDT"
+        raise ValueError(
+            f"The checkpoint does not contain the requested {decoder_name} decoder."
+        )
+    vocab_size = model_config.decoder[vocab_field]
 
     expected_values = (
         ("sample_rate", model_config.sample_rate, 16000),
@@ -90,21 +103,47 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             model_config.encoder.att_context_style,
             "regular",
         ),
-        ("encoder.xscaling", model_config.encoder.xscaling, False),
         ("encoder.untie_biases", model_config.encoder.untie_biases, True),
-        ("encoder.use_bias", model_config.encoder.use_bias, False),
         ("encoder.conv_norm_type", model_config.encoder.conv_norm_type, "batch_norm"),
-        ("decoder.blank_as_pad", model_config.decoder.blank_as_pad, True),
-        ("joint.jointnet.activation", model_config.joint.jointnet.activation, "relu"),
     )
+
+    if use_ctc:
+        expected_values += (
+            (
+                "decoder.feat_in",
+                model_config.decoder.feat_in,
+                model_config.encoder.d_model,
+            ),
+        )
+    else:
+        expected_values += (
+            ("decoder.blank_as_pad", model_config.decoder.blank_as_pad, True),
+            (
+                "joint.jointnet.activation",
+                model_config.joint.jointnet.activation,
+                "relu",
+            ),
+        )
+
     for name, actual, expected in expected_values:
         if actual != expected:
             raise ValueError(f"Expected {name}={expected}, got {actual}.")
 
-    if args.decoder_type not in TRANSDUCER_DECODER_TYPES:
+    for name in ("xscaling", "use_bias"):
+        value = model_config.encoder.get(name, True)
+        if not isinstance(value, bool):
+            raise ValueError(f"Expected encoder.{name} to be boolean, got {value}.")
+    if (
+        "causal_downsampling" in model_config.encoder
+        and model_config.encoder.causal_downsampling
+    ):
+        raise ValueError("Parakeet export requires noncausal downsampling.")
+    if "feat_out" in model_config.encoder and model_config.encoder.feat_out not in (
+        -1,
+        model_config.encoder.d_model,
+    ):
         raise ValueError(
-            f"Parakeet export supports only {TRANSDUCER_DECODER_TYPES}, "
-            f"got {args.decoder_type}."
+            "Parakeet export does not support a separate encoder output projection."
         )
 
     for name in ("encoder_precision", "decoder_precision"):
@@ -171,17 +210,25 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         ("encoder.n_heads", model_config.encoder.n_heads),
         ("encoder.pos_emb_max_len", model_config.encoder.pos_emb_max_len),
         ("encoder.conv_kernel_size", model_config.encoder.conv_kernel_size),
-        ("decoder.vocab_size", model_config.decoder.vocab_size),
-        ("decoder.prednet.pred_hidden", model_config.decoder.prednet.pred_hidden),
-        (
-            "decoder.prednet.pred_rnn_layers",
-            model_config.decoder.prednet.pred_rnn_layers,
-        ),
-        ("joint.jointnet.encoder_hidden", model_config.joint.jointnet.encoder_hidden),
-        ("joint.jointnet.joint_hidden", model_config.joint.jointnet.joint_hidden),
-        ("joint.num_extra_outputs", model_config.joint.num_extra_outputs),
-        ("decoding.greedy.max_symbols", model_config.decoding.greedy.max_symbols),
+        (f"decoder.{vocab_field}", vocab_size),
     )
+
+    if not use_ctc:
+        positive_integer_values += (
+            ("decoder.prednet.pred_hidden", model_config.decoder.prednet.pred_hidden),
+            (
+                "decoder.prednet.pred_rnn_layers",
+                model_config.decoder.prednet.pred_rnn_layers,
+            ),
+            (
+                "joint.jointnet.encoder_hidden",
+                model_config.joint.jointnet.encoder_hidden,
+            ),
+            ("joint.jointnet.joint_hidden", model_config.joint.jointnet.joint_hidden),
+            ("joint.num_extra_outputs", model_config.joint.num_extra_outputs),
+            ("decoding.greedy.max_symbols", model_config.decoding.greedy.max_symbols),
+        )
+
     for name, value in positive_integer_values:
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f"Expected {name} to be a positive integer, got {value}.")
@@ -191,7 +238,10 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             "encoder.d_model must be even for relative positional encoding, got "
             f"{model_config.encoder.d_model}."
         )
-    if model_config.encoder.d_model != model_config.joint.jointnet.encoder_hidden:
+    if (
+        not use_ctc
+        and model_config.encoder.d_model != model_config.joint.jointnet.encoder_hidden
+    ):
         raise ValueError(
             "encoder.d_model and joint.jointnet.encoder_hidden must match, got "
             f"{model_config.encoder.d_model} and "
@@ -216,28 +266,33 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             "encoder.conv_kernel_size must be odd, got "
             f"{model_config.encoder.conv_kernel_size}."
         )
+    context = model_config.encoder.get("conv_context_size")
+    padding = (model_config.encoder.conv_kernel_size - 1) // 2
+    if context is not None and context != [padding, padding]:
+        raise ValueError("Parakeet export requires symmetric convolution context.")
 
-    durations = list(model_config.model_defaults.tdt_durations)
-    if not durations or any(
-        not isinstance(duration, int) or not 0 <= duration <= INT32_MAX
-        for duration in durations
-    ):
-        raise ValueError(
-            "model_defaults.tdt_durations must contain non-negative signed "
-            "32-bit integers."
-        )
-    if len(durations) != len(set(durations)):
-        raise ValueError("model_defaults.tdt_durations must contain unique values.")
-    if len(durations) != model_config.joint.num_extra_outputs:
-        raise ValueError(
-            "The number of model_defaults.tdt_durations must match "
-            "joint.num_extra_outputs."
-        )
-    if 0 not in durations or all(duration == 0 for duration in durations):
-        raise ValueError(
-            "model_defaults.tdt_durations must contain zero and at least one "
-            "positive duration."
-        )
+    if not use_ctc:
+        durations = list(model_config.model_defaults.tdt_durations)
+        if not durations or any(
+            not isinstance(duration, int) or not 0 <= duration <= INT32_MAX
+            for duration in durations
+        ):
+            raise ValueError(
+                "model_defaults.tdt_durations must contain non-negative signed "
+                "32-bit integers."
+            )
+        if len(durations) != len(set(durations)):
+            raise ValueError("model_defaults.tdt_durations must contain unique values.")
+        if len(durations) != model_config.joint.num_extra_outputs:
+            raise ValueError(
+                "The number of model_defaults.tdt_durations must match "
+                "joint.num_extra_outputs."
+            )
+        if 0 not in durations or all(duration == 0 for duration in durations):
+            raise ValueError(
+                "model_defaults.tdt_durations must contain zero and at least one "
+                "positive duration."
+            )
 
     if not isinstance(args.batch_size, int) or args.batch_size < 1:
         raise ValueError(f"batch_size must be positive, got {args.batch_size}.")
@@ -264,10 +319,18 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
 
     if not isinstance(args.beam, int) or args.beam < 1:
         raise ValueError(f"beam must be positive, got {args.beam}.")
-    if args.beam > model_config.decoder.vocab_size:
+    if args.beam > vocab_size:
         raise ValueError(
-            f"beam must not exceed decoder.vocab_size, got beam={args.beam} and "
-            f"decoder.vocab_size={model_config.decoder.vocab_size}."
+            f"beam must not exceed decoder.{vocab_field}, got beam={args.beam} and "
+            f"decoder.{vocab_field}={vocab_size}."
+        )
+
+    if (
+        not isinstance(args.blank_penalty, float)
+        or not -FLOAT32_MAX <= args.blank_penalty <= FLOAT32_MAX
+    ):
+        raise ValueError(
+            f"blank_penalty must be a finite float32 value, got {args.blank_penalty}."
         )
 
     decoder_capacity = args.batch_size * args.beam
@@ -277,38 +340,50 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
             f"got {decoder_capacity}."
         )
 
-    decoder_dim = model_config.decoder.prednet.pred_hidden
-    pred_rnn_layers = model_config.decoder.prednet.pred_rnn_layers
-    decoder_tensor_elements = {
-        "encoder_output": decoder_capacity * model_config.joint.jointnet.encoder_hidden,
-        "targets": decoder_capacity,
-        "input_states_1": pred_rnn_layers * decoder_capacity * decoder_dim,
-        "input_states_2": pred_rnn_layers * decoder_capacity * decoder_dim,
-        "token_log_probs": decoder_capacity * (model_config.decoder.vocab_size + 1),
-        "duration_log_probs": decoder_capacity * model_config.joint.num_extra_outputs,
-        "output_states_1": pred_rnn_layers * decoder_capacity * decoder_dim,
-        "output_states_2": pred_rnn_layers * decoder_capacity * decoder_dim,
-    }
-    for name, elements in decoder_tensor_elements.items():
-        if elements > INT32_MAX:
-            raise ValueError(
-                f"Parakeet decoder tensor {name} exceeds signed 32-bit indexing: "
-                f"{elements} elements, limit={INT32_MAX}."
-            )
+    if not use_ctc:
+        decoder_dim = model_config.decoder.prednet.pred_hidden
+        pred_rnn_layers = model_config.decoder.prednet.pred_rnn_layers
+        decoder_tensor_elements = {
+            "encoder_output": decoder_capacity
+            * model_config.joint.jointnet.encoder_hidden,
+            "targets": decoder_capacity,
+            "input_states_1": pred_rnn_layers * decoder_capacity * decoder_dim,
+            "input_states_2": pred_rnn_layers * decoder_capacity * decoder_dim,
+            "token_log_probs": decoder_capacity * (model_config.decoder.vocab_size + 1),
+            "duration_log_probs": decoder_capacity
+            * model_config.joint.num_extra_outputs,
+            "output_states_1": pred_rnn_layers * decoder_capacity * decoder_dim,
+            "output_states_2": pred_rnn_layers * decoder_capacity * decoder_dim,
+        }
+        for name, elements in decoder_tensor_elements.items():
+            if elements > INT32_MAX:
+                raise ValueError(
+                    f"Parakeet decoder tensor {name} exceeds signed 32-bit indexing: "
+                    f"{elements} elements, limit={INT32_MAX}."
+                )
 
     model_dim = model_config.encoder.d_model
     feed_forward_dim = model_dim * model_config.encoder.ff_expansion_factor
-    joiner_dim = model_config.joint.jointnet.joint_hidden
-    vocab_size = model_config.decoder.vocab_size
-    num_extra_outputs = model_config.joint.num_extra_outputs
     parameter_tensor_elements = {
-        "encoder feed-forward weight": model_dim * feed_forward_dim,
-        "decoder embedding weight": (vocab_size + 1) * decoder_dim,
-        "decoder recurrent weight": 4 * decoder_dim * decoder_dim,
-        "decoder encoder projection weight": model_dim * joiner_dim,
-        "decoder output projection weight": (vocab_size + 1 + num_extra_outputs)
-        * joiner_dim,
+        "encoder feed-forward weight": model_dim * feed_forward_dim
     }
+    if use_ctc:
+        parameter_tensor_elements.update(
+            {"ctc projection weight": (vocab_size + 1) * model_dim}
+        )
+    else:
+        joiner_dim = model_config.joint.jointnet.joint_hidden
+        num_extra_outputs = model_config.joint.num_extra_outputs
+        parameter_tensor_elements.update(
+            {
+                "decoder embedding weight": (vocab_size + 1) * decoder_dim,
+                "decoder recurrent weight": 4 * decoder_dim * decoder_dim,
+                "decoder encoder projection weight": model_dim * joiner_dim,
+                "decoder output projection weight": (vocab_size + 1 + num_extra_outputs)
+                * joiner_dim,
+            }
+        )
+
     for name, elements in parameter_tensor_elements.items():
         if elements > INT32_MAX:
             raise ValueError(
@@ -386,8 +461,8 @@ def validate_zipformer(
 
     The validator restricts export to the supported offline Icefall Zipformer
     architecture. It checks feature extraction, encoder stack descriptions,
-    decoder-head availability, vocabulary dimensions, and the fixed-batch
-    TensorRT audio profile.
+    decoder-head availability, vocabulary dimensions, blank penalty, and the
+    fixed-batch TensorRT audio profile.
 
     Parameters
     ----------
@@ -400,8 +475,8 @@ def validate_zipformer(
         Decoder vocabulary size represented by the SentencePiece tokenizer and
         model output heads.
     args : argparse.Namespace
-        Parsed export arguments containing decoder, batch, beam, duration-profile,
-        and TensorRT build settings.
+        Parsed export arguments containing decoder, batch, beam, blank penalty,
+        duration-profile, and TensorRT build settings.
 
     Raises
     ------
@@ -735,6 +810,14 @@ def validate_zipformer(
         raise ValueError(
             f"beam must be a positive integer between 1 and {vocab_size}, got "
             f"{args.beam}."
+        )
+
+    if (
+        not isinstance(args.blank_penalty, float)
+        or not -FLOAT32_MAX <= args.blank_penalty <= FLOAT32_MAX
+    ):
+        raise ValueError(
+            f"blank_penalty must be a finite float32 value, got {args.blank_penalty}."
         )
 
     if decoder_type != "ctc_greedy_search":

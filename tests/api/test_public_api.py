@@ -10,9 +10,9 @@ import fast_gpu_asr
 EXPECTED_IMPORTS = {
     "ASR": ".asr",
     "Encoder": ".encoder.encoder",
-    "CTCGreedyDecoder": ".decoder.zipformer_decoder",
-    "ZipformerModifiedBeamSearchDecoder": ".decoder.zipformer_decoder",
-    "ParakeetModifiedBeamSearchDecoder": ".decoder.parakeet_decoder",
+    "CTCGreedyDecoder": ".decoder.ctc_decoder",
+    "ZipformerModifiedBeamSearchDecoder": ".decoder.zipformer_rnnt_decoder",
+    "ParakeetModifiedBeamSearchDecoder": ".decoder.parakeet_tdt_decoder",
     "PostProcessor": ".decoder.postprocessor",
 }
 

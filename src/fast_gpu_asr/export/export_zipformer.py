@@ -92,6 +92,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--blank-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Value subtracted from blank-token log probabilities during CTC or "
+            "transducer decoding. Positive values discourage blanks; zero "
+            "leaves scores unchanged. Must be a finite float32 value."
+        ),
+    )
+    parser.add_argument(
         "--encoder-precision",
         type=str,
         choices=tuple(PRECISION_DTYPES),
@@ -461,6 +471,9 @@ def make_runtime_config(
 ) -> DictConfig:
     """Build the compact runtime configuration stored in a Zipformer bundle.
 
+    Beam width and blank penalty are saved for both CTC and transducer decoding.
+    The penalty is applied by the runtime, not baked into the TensorRT engines.
+
     Parameters
     ----------
     model_config : DictConfig
@@ -483,7 +496,7 @@ def make_runtime_config(
     model_params = model_config.model_params
     frame_opts = model_config.feature_opts.frame_opts
     right_padding_samples = frame_opts.frame_length_ms * frame_opts.samp_freq // 2000
-    decoder_params = {"beam": args.beam, "blank_penalty": 0.0}
+    decoder_params = {"beam": args.beam, "blank_penalty": args.blank_penalty}
     if args.decoder_type != "ctc_greedy_search":
         decoder_params.update(
             {

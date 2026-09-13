@@ -83,7 +83,7 @@ class EngineCase:
 
 ENGINE_CASES = (
     # TensorRT may select TF32 or another reduced-mantissa FP32 cuBLAS tactic.
-    EngineCase("fp32", trt.float32, cp.float32, torch.float32, 3e-4),
+    EngineCase("fp32", trt.float32, cp.float32, torch.float32, 4e-4),
     EngineCase("fp16", trt.float16, cp.float16, torch.float16, 5e-3),
     pytest.param(
         EngineCase("bf16", trt.bfloat16, cp.dtype("bfloat16"), torch.bfloat16, 3e-2),

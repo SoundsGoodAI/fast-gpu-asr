@@ -2,7 +2,7 @@
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 # Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
 # Modified from NeMo for batched TensorRT export; see NOTICE and LICENSE.
-"""Fast Conformer encoder used by NVIDIA Parakeet TDT models."""
+"""Fast Conformer encoder used by NVIDIA Parakeet TDT and CTC models."""
 
 import torch
 
@@ -15,8 +15,8 @@ from .attention import RelPositionalEncoding, RelPositionMultiHeadAttention
 from .features import FeatureExtractor
 
 
-class ParakeetTDTEncoder(torch.nn.Module):
-    """Audio-to-encoder module for Parakeet TDT export."""
+class ParakeetEncoder(torch.nn.Module):
+    """Waveform encoder with an optional CTC head for Parakeet export."""
 
     def __init__(
         self,
@@ -36,6 +36,8 @@ class ParakeetTDTEncoder(torch.nn.Module):
         conv_kernel_size: int,
         subsampling_batch_partitions: int,
         dtype: torch.dtype,
+        use_bias: bool,
+        vocab_size: int | None,
     ) -> None:
         """Initialize the waveform frontend and Fast Conformer encoder.
 
@@ -77,9 +79,17 @@ class ParakeetTDTEncoder(torch.nn.Module):
             Conformer layers. Supported values are ``torch.float32``,
             ``torch.float16``, and ``torch.bfloat16``. Feature extraction remains
             ``torch.float32``.
+        use_bias : bool
+            Include Conformer projection and convolution biases.
+        vocab_size : int | None
+            Number of non-blank CTC tokens. None exports TDT encoder embeddings;
+            otherwise an FP32 CTC head appends one blank output.
         """
 
         super().__init__()
+
+        self.encoder_dtype = dtype
+        self.ctc = vocab_size is not None
 
         self.feature_extractor = FeatureExtractor(
             samp_freq,
@@ -100,7 +110,11 @@ class ParakeetTDTEncoder(torch.nn.Module):
             pos_emb_max_len,
             conv_kernel_size,
             subsampling_batch_partitions,
+            use_bias,
         )
+        self.projection_output = torch.nn.Identity()
+        if vocab_size is not None:
+            self.projection_output = torch.nn.Linear(model_dim, vocab_size + 1)
 
         for module in (self.encoder.pre_encode, *self.encoder.layers):
             module.to(dtype=dtype)
@@ -108,7 +122,7 @@ class ParakeetTDTEncoder(torch.nn.Module):
     def forward(
         self, audio: torch.Tensor, audio_lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert padded waveforms into encoder embeddings.
+        """Convert padded waveforms into encoder embeddings or CTC log probabilities.
 
         Parameters
         ----------
@@ -125,16 +139,26 @@ class ParakeetTDTEncoder(torch.nn.Module):
         ]
             Encoder output with the configured floating-point dtype and shape
             ``(batch_size, subsampled_num_frames, model_dim)`` and
-            ``torch.int32`` valid lengths.
+            ``torch.int32`` valid lengths. With a CTC head, the output is FP32
+            log probabilities of shape ``(batch_size, num_frames, vocab_size + 1)``.
         """
 
         features, feature_lengths = self.feature_extractor(audio, audio_lengths)
         features = features.to(self.encoder.pre_encode.conv1.weight.dtype)
-        return self.encoder(features, feature_lengths)
+        output, output_lengths = self.encoder(features, feature_lengths)
+        output_dtype = (
+            self.projection_output.weight.dtype if self.ctc else self.encoder_dtype
+        )
+        output = self.projection_output(output.to(output_dtype))
+
+        if self.ctc:
+            output = torch.nn.functional.log_softmax(output, dim=2)
+
+        return output, output_lengths
 
 
 class FastConformer(torch.nn.Module):
-    """Fast Conformer encoder matching the Parakeet TDT encoder layout."""
+    """Fast Conformer with input scaling folded into weights and normalization."""
 
     def __init__(
         self,
@@ -147,6 +171,7 @@ class FastConformer(torch.nn.Module):
         pos_emb_max_len: int,
         conv_kernel_size: int,
         subsampling_batch_partitions: int,
+        use_bias: bool,
     ) -> None:
         """Initialize subsampling, positional encoding, and Conformer layers.
 
@@ -171,6 +196,8 @@ class FastConformer(torch.nn.Module):
         subsampling_batch_partitions : int
             Number of batch partitions used through the third subsampling
             convolution.
+        use_bias : bool
+            Include Conformer projection and convolution biases.
         """
 
         super().__init__()
@@ -188,6 +215,7 @@ class FastConformer(torch.nn.Module):
                 model_dim * feed_forward_expansion_factor,
                 n_heads,
                 conv_kernel_size,
+                use_bias,
             )
             for _ in range(n_layers)
         )
@@ -210,7 +238,7 @@ class FastConformer(torch.nn.Module):
             torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16],
             torch.Tensor[torch.int32],
         ]
-            Encoder output with the same floating-point dtype as ``features`` and shape
+            Encoder output with the input's floating-point dtype and shape
             ``(batch_size, subsampled_num_frames, model_dim)`` and
             ``torch.int32`` valid lengths.
         """
@@ -228,7 +256,12 @@ class ConformerLayer(torch.nn.Module):
     """Single Conformer encoder layer."""
 
     def __init__(
-        self, model_dim: int, feed_forward_dim: int, n_heads: int, conv_kernel_size: int
+        self,
+        model_dim: int,
+        feed_forward_dim: int,
+        n_heads: int,
+        conv_kernel_size: int,
+        use_bias: bool,
     ) -> None:
         """Initialize one Macaron Conformer layer.
 
@@ -242,21 +275,23 @@ class ConformerLayer(torch.nn.Module):
             The number of attention heads.
         conv_kernel_size : int
             The kernel size of the depthwise convolution module.
+        use_bias : bool
+            Include projection and convolution biases.
         """
 
         super().__init__()
 
         self.norm_feed_forward1 = torch.nn.LayerNorm(model_dim)
-        self.feed_forward1 = ConformerFeedForward(model_dim, feed_forward_dim)
+        self.feed_forward1 = ConformerFeedForward(model_dim, feed_forward_dim, use_bias)
 
         self.norm_conv = torch.nn.LayerNorm(model_dim)
-        self.conv = ConformerConvolution(model_dim, conv_kernel_size)
+        self.conv = ConformerConvolution(model_dim, conv_kernel_size, use_bias)
 
         self.norm_self_att = torch.nn.LayerNorm(model_dim)
-        self.self_attn = RelPositionMultiHeadAttention(n_heads, model_dim)
+        self.self_attn = RelPositionMultiHeadAttention(n_heads, model_dim, use_bias)
 
         self.norm_feed_forward2 = torch.nn.LayerNorm(model_dim)
-        self.feed_forward2 = ConformerFeedForward(model_dim, feed_forward_dim)
+        self.feed_forward2 = ConformerFeedForward(model_dim, feed_forward_dim, use_bias)
 
         self.norm_out = torch.nn.LayerNorm(model_dim)
 
@@ -347,7 +382,7 @@ class ConvSubsampling(torch.nn.Module):
             torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16],
             torch.Tensor[torch.int32],
         ]
-            Subsampled features with the same floating-point dtype as ``x`` and shape
+            Subsampled features with the input's floating-point dtype and shape
             ``(batch_size, subsampled_num_frames, feat_out)`` and their
             ``torch.int32`` valid lengths.
         """
@@ -420,8 +455,8 @@ class ConvSubsampling(torch.nn.Module):
 class ConformerFeedForward(torch.nn.Module):
     """Macaron feed-forward branch used in a Conformer layer."""
 
-    def __init__(self, model_dim: int, feed_forward_dim: int) -> None:
-        """Initialize the bias-free Conformer feed-forward projections.
+    def __init__(self, model_dim: int, feed_forward_dim: int, use_bias: bool) -> None:
+        """Initialize the Conformer feed-forward projections.
 
         Parameters
         ----------
@@ -429,13 +464,15 @@ class ConformerFeedForward(torch.nn.Module):
             The input and output hidden dimension.
         feed_forward_dim : int
             The intermediate feed-forward dimension.
+        use_bias : bool
+            Include biases in both linear projections.
         """
 
         super().__init__()
 
-        self.linear1 = torch.nn.Linear(model_dim, feed_forward_dim, bias=False)
+        self.linear1 = torch.nn.Linear(model_dim, feed_forward_dim, bias=use_bias)
         self.activation = torch.nn.SiLU()
-        self.linear2 = torch.nn.Linear(feed_forward_dim, model_dim, bias=False)
+        self.linear2 = torch.nn.Linear(feed_forward_dim, model_dim, bias=use_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the Conformer feed-forward branch.
@@ -458,7 +495,7 @@ class ConformerFeedForward(torch.nn.Module):
 class ConformerConvolution(torch.nn.Module):
     """Conformer convolution module."""
 
-    def __init__(self, model_dim: int, kernel_size: int) -> None:
+    def __init__(self, model_dim: int, kernel_size: int, use_bias: bool) -> None:
         """Initialize the pointwise and depthwise convolution branches.
 
         Parameters
@@ -467,18 +504,19 @@ class ConformerConvolution(torch.nn.Module):
             The hidden dimension, also the number of channels of the convolution module.
         kernel_size : int
             Odd kernel size of the depthwise convolution.
-
+        use_bias : bool
+            Include pointwise and depthwise convolution biases.
         """
 
         super().__init__()
 
-        self.pointwise_conv1 = torch.nn.Linear(model_dim, 2 * model_dim, bias=False)
+        self.pointwise_conv1 = torch.nn.Linear(model_dim, 2 * model_dim, bias=use_bias)
         self.depthwise_conv = torch.nn.Conv1d(
-            model_dim, model_dim, kernel_size, groups=model_dim, bias=False
+            model_dim, model_dim, kernel_size, groups=model_dim, bias=use_bias
         )
         self.batch_norm = torch.nn.BatchNorm1d(model_dim)
         self.activation = torch.nn.SiLU()
-        self.pointwise_conv2 = torch.nn.Linear(model_dim, model_dim, bias=False)
+        self.pointwise_conv2 = torch.nn.Linear(model_dim, model_dim, bias=use_bias)
         self.padding = (kernel_size - 1) // 2
 
     def forward(self, x: torch.Tensor, output_lengths: torch.Tensor) -> torch.Tensor:
@@ -519,6 +557,8 @@ class ConformerConvolution(torch.nn.Module):
             depthwise_bias = self.batch_norm.bias - (
                 self.batch_norm.running_mean * batch_norm_scale
             )
+            if self.depthwise_conv.bias is not None:
+                depthwise_bias += self.depthwise_conv.bias * batch_norm_scale
 
             x = torch.onnx.ops.symbolic(
                 PARAKEET_CONFORMER_CONVOLUTION_PLUGIN_NAME,

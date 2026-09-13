@@ -424,6 +424,11 @@ def make_encoder_engine(
         if model_config.model_type == "zipformer_asr"
         else model_config.audio_encoder_params.model_dim
     )
+    if (
+        model_config.model_type == "parakeet_asr"
+        and model_config.decoder_type == "ctc_greedy_search"
+    ):
+        output_dim = model_config.vocab_size + 1
     return FakeEngine(
         ("audio", "audio_lengths"),
         ("encoder_output", "encoder_output_lengths"),
@@ -678,6 +683,7 @@ def test_validate_model_config_reports_mandatory_missing_value(
         ("zipformer", "ctc_greedy_search"),
         ("parakeet", "transducer_modified_beam_search"),
         ("parakeet", "transducer_greedy_search"),
+        ("parakeet", "ctc_greedy_search"),
     ),
 )
 def test_validate_model_config_accepts_supported_decoder_modes(
@@ -689,10 +695,28 @@ def test_validate_model_config_accepts_supported_decoder_modes(
         model_config = make_parakeet_config()
         model_config.decoder_type = decoder_type
         model_config.decoder_params.beam = (
-            1 if decoder_type == "transducer_greedy_search" else 2
+            2 if decoder_type == "transducer_modified_beam_search" else 1
         )
+        if decoder_type == "ctc_greedy_search":
+            model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
 
     validate_model_config(model_config)
+
+
+@pytest.mark.parametrize(
+    "vocab_size,blank_id,message",
+    ((4, 0, "blank_id=4"), (INT32_MAX, INT32_MAX, "vocabulary plus blank")),
+)
+def test_parakeet_ctc_rejects_invalid_blank_dimensions(
+    vocab_size: int, blank_id: int, message: str
+) -> None:
+    config = make_parakeet_config()
+    config.decoder_type = "ctc_greedy_search"
+    config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
+    config.vocab_size = vocab_size
+    config.blank_id = blank_id
+    with pytest.raises(ASRInitializationError, match=message):
+        validate_model_config(config)
 
 
 @pytest.mark.parametrize(
@@ -763,8 +787,8 @@ def test_validate_model_config_accepts_ctc_without_transducer_decoder_fields() -
         (
             "parakeet",
             "decoder_type",
-            "ctc_greedy_search",
-            "Parakeet TDT models do not contain a CTC head",
+            "unknown",
+            "Expected decoder_type to be one of",
         ),
     ),
 )
@@ -906,13 +930,14 @@ def test_validate_model_config_requires_six_zipformer_stack_values(field: str) -
         ("parakeet", "decoder_params.tdt_durations"),
     ),
 )
-def test_validate_model_config_propagates_non_iterable_metadata(
-    architecture: str, field: str
+@pytest.mark.parametrize("value", (1, "012345", {"a": 0}))
+def test_validate_model_config_rejects_non_list_metadata(
+    architecture: str, field: str, value: object
 ) -> None:
     model_config = make_model_config(architecture)
-    OmegaConf.update(model_config, field, 1)
+    OmegaConf.update(model_config, field, value, merge=False)
 
-    with pytest.raises(TypeError):
+    with pytest.raises(ASRInitializationError, match=field):
         validate_model_config(model_config)
 
 
@@ -1623,6 +1648,22 @@ def test_validate_encoder_engine_rejects_tensor_shape_mismatch(
         validate_encoder_engine(engine, model_config)
 
 
+@pytest.mark.parametrize(
+    "output_dim", (4, 6), ids=("missing-blank", "encoder-features")
+)
+def test_validate_parakeet_ctc_encoder_rejects_wrong_output_dimension(
+    output_dim: int,
+) -> None:
+    model_config = make_parakeet_config()
+    model_config.decoder_type = "ctc_greedy_search"
+    model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
+    engine = make_encoder_engine(model_config, trt.float32)
+    engine.shapes["encoder_output"] = (2, -1, output_dim)
+
+    with pytest.raises(ASRInitializationError, match="encoder_output shape"):
+        validate_encoder_engine(engine, model_config)
+
+
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 @pytest.mark.parametrize("floating_dtype", (trt.float32, trt.float16, trt.bfloat16))
 def test_validate_decoder_engine_accepts_supported_precision(
@@ -2094,14 +2135,20 @@ def test_validate_model_rejects_decoder_before_loading_context_cache(
         validate_model(tmp_path, model_config)
 
 
-def test_validate_model_accepts_complete_zipformer_ctc_bundle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
+def test_validate_model_accepts_complete_ctc_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
-    model_config = make_zipformer_config("ctc_greedy_search")
-    encoder_path = tmp_path / "zipformer.trt"
+    model_config = make_model_config(architecture)
+    model_config.decoder_type = "ctc_greedy_search"
+    model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
+    if architecture == "zipformer":
+        model_config.audio_encoder_params.use_ctc = True
+        model_config.audio_encoder_params.output_dim = model_config.vocab_size
+    encoder_path = tmp_path / f"{architecture}.trt"
     encoder_path.touch()
     tokenizer = Mock()
-    load_engine = Mock(return_value=make_encoder_engine(model_config))
+    load_engine = Mock(return_value=make_encoder_engine(model_config, trt.float32))
     validate_context = Mock()
     monkeypatch.setattr(utils_module, "validate_tokenizer", tokenizer)
     monkeypatch.setattr(utils_module, "get_engine", load_engine)

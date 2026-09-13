@@ -3,7 +3,7 @@
 # Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
 # Copyright 2017 Johns Hopkins University (Shinji Watanabe)
 # Modified from NeMo for batched TensorRT export; see NOTICE and LICENSE.
-"""Relative-position attention modules used by NVIDIA Parakeet TDT models."""
+"""Relative-position attention modules used by NVIDIA Parakeet models."""
 
 import torch
 
@@ -17,7 +17,7 @@ from ....constants import (
 class RelPositionMultiHeadAttention(torch.nn.Module):
     """Parakeet relative-position multi-head attention for offline inference."""
 
-    def __init__(self, n_head: int, n_feat: int) -> None:
+    def __init__(self, n_head: int, n_feat: int, use_bias: bool) -> None:
         """Initialize attention projections and per-head positional biases.
 
         Parameters
@@ -26,6 +26,8 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
             Number of attention heads.
         n_feat : int
             Input and output hidden dimension. It must be divisible by ``n_head``.
+        use_bias : bool
+            Include biases in content and output projections, as in legacy CTC models.
         """
 
         super().__init__()
@@ -34,9 +36,9 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
         self.d_k = n_feat // n_head
         self.s_d_k = self.d_k**0.5
 
-        self.linear_qkv = torch.nn.Linear(n_feat, 3 * n_feat, bias=False)
+        self.linear_qkv = torch.nn.Linear(n_feat, 3 * n_feat, bias=use_bias)
 
-        self.linear_out = torch.nn.Linear(n_feat, n_feat, bias=False)
+        self.linear_out = torch.nn.Linear(n_feat, n_feat, bias=use_bias)
         self.linear_pos = torch.nn.Linear(n_feat, n_feat, bias=False)
 
         self.pos_bias_u = torch.nn.Parameter(torch.zeros(n_head, self.d_k))

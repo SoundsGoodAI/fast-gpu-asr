@@ -20,14 +20,14 @@ from fast_gpu_asr.constants import (
     ZIPFORMER_BEAM_SEARCH_THREADS,
     ZIPFORMER_DECODER_CONTEXTS_FILE,
 )
-from fast_gpu_asr.decoder import gpu_kernels, zipformer_decoder
+from fast_gpu_asr.decoder import gpu_kernels, zipformer_rnnt_decoder
+from fast_gpu_asr.decoder.ctc_decoder import CTCGreedyDecoder
 from fast_gpu_asr.decoder.gpu_kernels import (
     ZIPFORMER_BEAM_SEARCH_SOURCE,
     ZIPFORMER_FINALIZE_KERNEL,
     get_zipformer_beam_search_kernels,
 )
-from fast_gpu_asr.decoder.zipformer_decoder import (
-    CTCGreedyDecoder,
+from fast_gpu_asr.decoder.zipformer_rnnt_decoder import (
     ZipformerModifiedBeamSearchDecoder,
 )
 from fast_gpu_asr.utils import ASRInferenceError, ASRInitializationError
@@ -399,13 +399,23 @@ def test_ctc_greedy_collapses_repeats_and_blanks(dtype: np.dtype) -> None:
 
 
 @pytest.mark.cuda
-def test_ctc_greedy_applies_blank_penalty_before_argmax() -> None:
-    decoder = make_ctc_decoder(blank_penalty=0.2)
-    log_probs = cp.array([[[0.1, 0.0]]], dtype=cp.float32)
+@pytest.mark.parametrize("blank_id", (0, 1))
+@pytest.mark.parametrize(
+    ("blank_probability", "blank_penalty", "emits_token"),
+    ((0.75, 0.0, False), (0.75, 2.0, True), (0.25, 0.0, True), (0.25, -2.0, False)),
+    ids=("blank-wins", "positive-penalty", "token-wins", "negative-penalty"),
+)
+def test_ctc_greedy_applies_blank_penalty_before_argmax(
+    blank_id: int, blank_probability: float, blank_penalty: float, emits_token: bool
+) -> None:
+    decoder = make_ctc_decoder(blank_id=blank_id, blank_penalty=blank_penalty)
+    log_probs = cp.full((1, 1, 2), np.log(1 - blank_probability), dtype=cp.float32)
+    log_probs[:, :, blank_id] = np.log(blank_probability)
 
-    token_ids, _ = decoder(log_probs, cp.array([1], dtype=np.int32))
+    token_ids, timestamps = decoder(log_probs, cp.array([1], dtype=np.int32))
 
-    assert token_ids == [[1]]
+    assert token_ids == ([[1 - blank_id]] if emits_token else [[]])
+    assert timestamps == ([[0.0]] if emits_token else [[]])
 
 
 @pytest.mark.cuda
@@ -1080,22 +1090,29 @@ def test_zipformer_decoder_does_not_leak_results_across_calls() -> None:
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("beam", (1, 2))
 @pytest.mark.parametrize(
-    ("blank_penalty", "expected_tokens"),
-    ((0.0, []), (0.2, [1])),
-    ids=("no-penalty", "with-penalty"),
+    ("blank_probability", "blank_penalty", "expected_tokens"),
+    ((0.75, 0.0, []), (0.75, 2.0, [1]), (0.25, 0.0, [1]), (0.25, -2.0, [])),
+    ids=("blank-wins", "positive-penalty", "token-wins", "negative-penalty"),
 )
 def test_zipformer_decoder_applies_blank_penalty(
-    blank_penalty: float, expected_tokens: list[int]
+    blank_probability: float,
+    blank_penalty: float,
+    expected_tokens: list[int],
+    beam: int,
 ) -> None:
-    decoder = make_fake_zipformer_decoder()
+    decoder = make_fake_zipformer_decoder(beam=beam)
     decoder.blank_penalty = blank_penalty
-    decoder.decoder = ScriptedDecoderContext(decoder, ([0.1, 0.0, -8.0, -8.0],))
-    token_ids, _ = decoder(
+    decoder.decoder = ScriptedDecoderContext(
+        decoder, (np.log([blank_probability, 0.98 - blank_probability, 0.01, 0.01]),)
+    )
+    token_ids, timestamps = decoder(
         cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32)
     )
 
     assert token_ids == [expected_tokens]
+    assert timestamps == ([[0.0]] if expected_tokens else [[]])
 
 
 @pytest.mark.cuda
@@ -1236,7 +1253,7 @@ def test_zipformer_decoder_handles_cuda_capture_errors(
             raise CaptureError(status)
 
     monkeypatch.setattr(
-        zipformer_decoder.cp.cuda.runtime, "CUDARuntimeError", CaptureError
+        zipformer_rnnt_decoder.cp.cuda.runtime, "CUDARuntimeError", CaptureError
     )
     decoder = make_fake_zipformer_decoder()
     decoder.stream = InvalidatingStream(non_blocking=True)
@@ -1875,7 +1892,7 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
     )
     context = RecordingZipformerContext()
     engine = FakeZipformerEngine(context, engine_dtype)
-    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
     stream = cp.cuda.get_current_stream()
     decoder = ZipformerModifiedBeamSearchDecoder(
         engine_path,
@@ -1943,7 +1960,7 @@ def test_zipformer_decoder_initializes_every_wide_beam_context(
         "encoder_output": (6, 4),
         "tokens_log_prob": (6, 8),
     }
-    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
 
     decoder = ZipformerModifiedBeamSearchDecoder(
         engine_path,
@@ -1987,8 +2004,8 @@ def test_zipformer_decoder_opts_in_to_large_shared_memory(
         "encoder_output": (beam, 4),
         "tokens_log_prob": (beam, vocab_size),
     }
-    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda path: engine)
-    monkeypatch.setattr(zipformer_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(
         NullCudaContext,
         "attributes",
@@ -2032,8 +2049,8 @@ def test_zipformer_decoder_rejects_missing_execution_context(
 ) -> None:
     stream = NullCudaContext()
     engine = FakeZipformerEngine(None)
-    monkeypatch.setattr(zipformer_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
 
     with pytest.raises(
         ASRInitializationError, match="could not create the Zipformer decoder"
@@ -2047,8 +2064,8 @@ def test_zipformer_decoder_rejects_profile_selection_failure(
     stream = NullCudaContext()
     context = RecordingZipformerContext(profile_accepted=False)
     engine = FakeZipformerEngine(context)
-    monkeypatch.setattr(zipformer_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
 
     with pytest.raises(ASRInitializationError, match="optimization profile 0"):
         construct_zipformer_decoder(stream)
@@ -2085,9 +2102,9 @@ def test_zipformer_decoder_rejects_tensor_binding_failure(
         assert dtype is np.float32
         return SimpleNamespace(data=SimpleNamespace(ptr=1))
 
-    monkeypatch.setattr(zipformer_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(zipformer_decoder.cp, "empty", allocate)
-    monkeypatch.setattr(zipformer_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
+    monkeypatch.setattr(zipformer_rnnt_decoder.cp, "empty", allocate)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
 
     with pytest.raises(ASRInitializationError, match=rejected_binding):
         construct_zipformer_decoder(stream)

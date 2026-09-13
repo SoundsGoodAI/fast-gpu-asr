@@ -32,6 +32,7 @@ def make_attention(
     dtype: torch.dtype = torch.float32,
     num_heads: int = NUM_HEADS,
     feature_dim: int = FEATURE_DIM,
+    use_bias: bool = False,
 ) -> RelPositionMultiHeadAttention:
     """Create attention with deterministic, nontrivial parameters.
 
@@ -43,6 +44,8 @@ def make_attention(
         Number of attention heads.
     feature_dim : int
         Feature width, divisible by ``num_heads``.
+    use_bias : bool
+        Include content and output projection biases.
 
     Returns
     -------
@@ -52,7 +55,9 @@ def make_attention(
 
     generator = torch.Generator().manual_seed(8)
     with torch.random.fork_rng(devices=[]):
-        attention = RelPositionMultiHeadAttention(num_heads, feature_dim).to(dtype)
+        attention = RelPositionMultiHeadAttention(num_heads, feature_dim, use_bias).to(
+            dtype
+        )
     with torch.no_grad():
         for parameter in attention.parameters():
             values = 0.2 * torch.randn(parameter.shape, generator=generator)
@@ -105,12 +110,21 @@ def reference_attention(
         for key_index in range(sequence_length):
             relative_index = sequence_length - 1 - query_index + key_index
             content_score = (
-                (query[:, query_index] + attention.pos_bias_u) * key[:, key_index]
-            ).sum(dim=2)
+                (
+                    (query[:, query_index] + attention.pos_bias_u).float()
+                    * key[:, key_index].float()
+                )
+                .sum(dim=2)
+                .to(x.dtype)
+            )
             position_score = (
-                (query[:, query_index] + attention.pos_bias_v)
-                * position[:, relative_index]
-            ).sum(dim=2)
+                (
+                    (query[:, query_index] + attention.pos_bias_v).float()
+                    * position[:, relative_index].float()
+                )
+                .sum(dim=2)
+                .to(x.dtype)
+            )
             scores[:, :, query_index, key_index] = (
                 content_score.float() + position_score.float()
             ) / math.sqrt(head_dim)
@@ -130,11 +144,15 @@ def reference_attention(
 
 @pytest.mark.parametrize(("dtype", "atol", "rtol"), ATTENTION_DTYPE_CASES)
 @pytest.mark.parametrize("sequence_length", (1, 7))
+@pytest.mark.parametrize("use_bias", (False, True))
 def test_parakeet_attention_matches_indexed_reference(
-    dtype: torch.dtype, atol: float, rtol: float, sequence_length: int
+    dtype: torch.dtype, atol: float, rtol: float, sequence_length: int, use_bias: bool
 ) -> None:
     generator = torch.Generator().manual_seed(17 + sequence_length)
-    attention = make_attention(dtype)
+    attention = make_attention(dtype, use_bias=use_bias)
+    assert (attention.linear_qkv.bias is not None) == use_bias
+    assert (attention.linear_out.bias is not None) == use_bias
+    assert attention.linear_pos.bias is None
     x = torch.randn(2, sequence_length, FEATURE_DIM, dtype=dtype, generator=generator)
     pos_emb = torch.randn(
         (1, 2 * sequence_length - 1, FEATURE_DIM), dtype=dtype, generator=generator
@@ -192,7 +210,9 @@ def test_parakeet_attention_promotes_score_sum_before_softmax(
     dtype: torch.dtype, position_delta: float
 ) -> None:
     with torch.random.fork_rng(devices=[]):
-        attention = RelPositionMultiHeadAttention(n_head=1, n_feat=2).to(dtype)
+        attention = RelPositionMultiHeadAttention(
+            n_head=1, n_feat=2, use_bias=False
+        ).to(dtype)
     with torch.no_grad():
         # Produce content logits (1, 1), positional logits (+delta, -delta),
         # and scalar values (0, 1) in the first output channel.
@@ -235,7 +255,9 @@ def test_parakeet_attention_excludes_padding_below_old_mask_floor(
     dtype: torch.dtype,
 ) -> None:
     with torch.random.fork_rng(devices=[]):
-        attention = RelPositionMultiHeadAttention(n_head=1, n_feat=2).to(dtype)
+        attention = RelPositionMultiHeadAttention(
+            n_head=1, n_feat=2, use_bias=False
+        ).to(dtype)
     with torch.no_grad():
         attention.linear_qkv.weight.zero_()
         attention.linear_qkv.weight[0, 1] = 1.0
@@ -255,11 +277,12 @@ def test_parakeet_attention_excludes_padding_below_old_mask_floor(
 
 
 @pytest.mark.parametrize(("dtype", "atol", "rtol"), ATTENTION_DTYPE_CASES)
-def test_parakeet_attention_zeros_only_utterances_without_valid_frames(
-    dtype: torch.dtype, atol: float, rtol: float
+@pytest.mark.parametrize("use_bias", (False, True))
+def test_parakeet_attention_masks_utterances_without_valid_frames(
+    dtype: torch.dtype, atol: float, rtol: float, use_bias: bool
 ) -> None:
     generator = torch.Generator().manual_seed(19)
-    attention = make_attention(dtype)
+    attention = make_attention(dtype, use_bias=use_bias)
     inputs = torch.randn(2, 3, FEATURE_DIM, dtype=dtype, generator=generator)
     positions = torch.randn(1, 5, FEATURE_DIM, dtype=dtype, generator=generator)
     output_lengths = torch.tensor((3, 0), dtype=torch.int32)
@@ -269,9 +292,12 @@ def test_parakeet_attention_zeros_only_utterances_without_valid_frames(
 
     torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
     assert torch.count_nonzero(output[0]) > 0
-    torch.testing.assert_close(
-        output[1], torch.zeros_like(output[1]), atol=0.0, rtol=0.0
+    expected_empty = (
+        attention.linear_out.bias.expand_as(output[1])
+        if use_bias
+        else torch.zeros_like(output[1])
     )
+    torch.testing.assert_close(output[1], expected_empty, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.parametrize(("dtype", "atol", "rtol"), ATTENTION_DTYPE_CASES)
