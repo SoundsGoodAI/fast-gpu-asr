@@ -1436,9 +1436,13 @@ def test_validate_parakeet_accepts_paired_convolution_channels(precision: str) -
     validate_parakeet(model_config, args)
 
 
-def test_validate_parakeet_positional_capacity_boundary() -> None:
+@pytest.mark.parametrize("max_audio_seconds", (40.0, 240.0))
+def test_validate_parakeet_positional_capacity_boundary(
+    max_audio_seconds: float,
+) -> None:
     model_config = make_model_config()
     args = make_export_args()
+    args.max_audio_seconds = max_audio_seconds
     max_samples = round(args.max_audio_seconds * model_config.sample_rate)
     feature_frames = (
         max_samples
@@ -1455,15 +1459,14 @@ def test_validate_parakeet_positional_capacity_boundary() -> None:
         validate_parakeet(model_config, args)
 
 
-def test_validate_parakeet_relative_attention_capacity_boundary() -> None:
+@pytest.mark.parametrize("max_audio_seconds", (163.84, 240.0, 399.99))
+def test_validate_parakeet_accepts_generic_attention_profiles(
+    max_audio_seconds: float,
+) -> None:
     args = make_export_args()
-    args.max_audio_seconds = 655_359 / 16_000
+    args.max_audio_seconds = max_audio_seconds
 
     validate_parakeet(make_model_config(), args)
-
-    args.max_audio_seconds = 655_360 / 16_000
-    with pytest.raises(ValueError, match="supports at most 512"):
-        validate_parakeet(make_model_config(), args)
 
 
 @pytest.mark.parametrize(

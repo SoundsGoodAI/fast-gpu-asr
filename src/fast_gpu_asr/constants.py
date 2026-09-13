@@ -53,7 +53,6 @@ AUDIO_SAMPLES_PER_WORKER = 16_000_000
 CUDA_DEFAULT_SHARED_MEMORY_BYTES = 48 * 1024
 FLOAT32_MAX = torch.finfo(torch.float32).max
 INT32_MAX = (1 << 31) - 1
-PARAKEET_MAX_ENCODER_FRAMES = 512
 TDT_BEAM_SEARCH_THREADS = 256
 # Keep this even so each graph replay restores canonical ping-pong buffer roles.
 TDT_BEAM_SEARCH_CHUNK_STEPS = 8

@@ -8,7 +8,7 @@
 [![Lint: Ruff](https://img.shields.io/badge/lint-Ruff-30203d?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
 [![License: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-blue)](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/LICENSE)
 
-### **Zipformer and Parakeet. Built for speed.**
+**Zipformer and Parakeet. Built for speed.**
 
 Batched offline speech recognition for NVIDIA GPUs. Raw audio in, text and word
 timestamps out, through one Python API. TensorRT engines, native CUDA plugins,
@@ -21,38 +21,39 @@ and GPU beam search handle inference; no NeMo or k2 installation is needed.
 <table>
   <tbody>
     <tr>
-      <th width="50%"><div align="center"><big>Zipformer CR-CTC Transducer (decoder beam 6)</big></div></th>
-      <th width="50%"><div align="center"><big>Parakeet V3 TDT (decoder beam 6)</big></div></th>
+      <th width="50%"><div align="center"><big>Zipformer CR-CTC Transducer beam 6</big></div></th>
+      <th width="50%"><div align="center"><big>Parakeet V3 TDT beam 6</big></div></th>
     </tr>
     <tr>
-      <td width="50%"><a href="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/zipformer-fp16-bf16-fp32.svg"><img src="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/zipformer-fp16-bf16-fp32.svg" width="100%" alt="Zipformer CR-CTC-transducer, FP16 / BF16 / FP32" /></a></td>
-      <td width="50%"><a href="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/parakeet-fp16-bf16-fp32.svg"><img src="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/parakeet-fp16-bf16-fp32.svg" width="100%" alt="Parakeet V3, FP16 / BF16 / FP32" /></a></td>
+      <td width="50%"><a href="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/zipformer-fp16-bf16-fp32.svg"><img src="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/zipformer-fp16-bf16-fp32.svg" width="100%" alt="Zipformer CR-CTC Transducer, FP16 / BF16 / FP32" /></a></td>
+      <td width="50%"><a href="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/parakeet-fp16-bf16-fp32.svg"><img src="https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/parakeet-fp16-bf16-fp32.svg" width="100%" alt="Parakeet V3 TDT, FP16 / BF16 / FP32" /></a></td>
     </tr>
   </tbody>
 </table>
 
 **RTFx** = total audio duration / total inference time: throughput, not request latency.
+Each configuration processes **157.8 hours of audio across seven English datasets**.
 
 **FP16, decoder beam 6:**
 
 | GPU | Model | Batch&nbsp;1<br>RTFx | Batch&nbsp;256<br>RTFx | Batch&nbsp;1<br>Suite&nbsp;time | Batch&nbsp;256<br>Suite&nbsp;time | Batch&nbsp;1<br>Mean&nbsp;WER | Batch&nbsp;256<br>Mean&nbsp;WER |
 |---|---|---:|---:|---:|---:|---:|---:|
-| A100 | [Zipformer CR-CTC-transducer](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#a100) | 589.0 | 10,298.5 | 964.35 s | 55.15 s | 5.254% | 5.259% |
-| A100 | [Parakeet V3](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#a100) | 560.8 | 6,482.0 | 1012.79 s | 87.62 s | 4.824% | 4.816% |
-| H200 | [Zipformer CR-CTC-transducer](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#h200) | 578.2 | 18,100.2 | 982.29 s | 31.38 s | 5.254% | 5.260% |
-| H200 | [Parakeet V3](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#h200) | 593.6 | 12,352.7 | 956.80 s | 45.98 s | 4.803% | 4.804% |
-| B300 | [Zipformer CR-CTC-transducer](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#b300) | 879.8 | 25,108.6 | 645.57 s | 22.62 s | 5.257% | 5.261% |
-| B300 | [Parakeet V3](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#b300) | 897.5 | 19,398.7 | 632.82 s | 29.28 s | 4.814% | 4.810% |
+| A100 | [Zipformer CR-CTC Transducer](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#a100) | 589.0 | 10,298.5 | 964.35 s | 55.15 s | 5.254% | 5.259% |
+| A100 | [Parakeet V3 TDT](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#a100) | 560.8 | 6,482.0 | 1012.79 s | 87.62 s | 4.824% | 4.816% |
+| H200 | [Zipformer CR-CTC Transducer](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#h200) | 578.2 | 18,100.2 | 982.29 s | 31.38 s | 5.254% | 5.260% |
+| H200 | [Parakeet V3 TDT](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#h200) | 593.6 | 12,352.7 | 956.80 s | 45.98 s | 4.803% | 4.804% |
+| B300 | [Zipformer CR-CTC Transducer](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#b300) | 879.8 | 25,108.6 | 645.57 s | 22.62 s | 5.257% | 5.261% |
+| B300 | [Parakeet V3 TDT](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md#b300) | 897.5 | 19,398.7 | 632.82 s | 29.28 s | 4.814% | 4.810% |
 
 We reproduced the [Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) English evaluation with fast-gpu-asr, using its datasets and WER scorer and reporting both **RTFx and WER**. [Methodology](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/methodology.md#timing-and-scoring).
 
 ### Key Observations
 
 - **Batching matters.** On B300 with FP16, batch 256 versus batch 1 delivers 28.5x for Zipformer CR-CTC Transducer and 21.6x for Parakeet V3 TDT.
-- **Gains taper.** On that same GPU with FP16, doubling capacity from 128 to 256 changes throughput by +25.1% for Zipformer CR-CTC Transducer and +23.0% for Parakeet V3.
-- **BF16 is supported too.** At B300/batch 256, BF16 throughput is slightly higher for Zipformer CR-CTC Transducer and Parakeet V3 than FP16. WER is recorded for every configuration; precision can marginally change outputs.
-- **FP16 vs. FP32.** At B300/batch 128, FP16 changes throughput by +22.2% for Zipformer CR-CTC Transducer and +58.5% for Parakeet V3 relative to FP32.
-- **Mean-WER is consistent across precisions and batches.** On B300, the recorded mean-WER span across all measured precisions and batches is 0.014% for Zipformer CR-CTC Transducer and 0.034% for Parakeet V3.
+- **Gains taper.** On that same GPU with FP16, doubling capacity from 128 to 256 changes throughput by +25.1% for Zipformer CR-CTC Transducer and +23.0% for Parakeet V3 TDT.
+- **BF16 is supported too.** At B300/batch 256, BF16 throughput is slightly higher for Zipformer CR-CTC Transducer and Parakeet V3 TDT than FP16. WER is recorded for every configuration; precision can marginally change outputs.
+- **FP16 vs. FP32.** At B300/batch 128, FP16 changes throughput by +22.2% for Zipformer CR-CTC Transducer and +58.5% for Parakeet V3 TDT relative to FP32.
+- **Mean-WER is consistent across precisions and batches.** On B300, the recorded mean-WER span across all measured precisions and batches is 0.014 percentage points for Zipformer CR-CTC Transducer and 0.034 percentage points for Parakeet V3 TDT.
 
 [All results](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/docs/benchmarks/results.md) | [Download CSV](https://raw.githubusercontent.com/SoundsGoodAI/fast-gpu-asr/main/docs/benchmarks/measurements.csv)
 
@@ -60,10 +61,11 @@ We reproduced the [Open ASR Leaderboard](https://github.com/huggingface/open_asr
 
 ## Quick Start
 
-**Requirements:** Linux x86-64, Python 3.12-3.14, an NVIDIA GPU, and
+**Requirements:** Linux x86-64, Python 3.12-3.14, a Turing (SM75) or newer NVIDIA GPU, and
 [NVIDIA driver 580 or newer](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 The package uses CUDA 13 and TensorRT.
-The wheel includes all nine TensorRT custom plugins; no local compilation or TensorRT development headers are needed.
+The wheel includes all nine TensorRT plugin libraries; no local compilation or
+TensorRT development headers are needed.
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -75,13 +77,13 @@ provide GPU inference; PyTorch does not need CUDA support. Package metadata cann
 select PyTorch's CPU index for pip automatically.
 
 **Supported families: Parakeet TDT/CTC and Zipformer Transducer/CTC.**
-You can export compatible checkpoints and finetuned models, not just the models
+You can export compatible checkpoints and fine-tuned models, not just the models
 shown below. Checkpoints must match the exporters' supported architectures and
 checkpoint/configuration formats.
 
 The examples export **FP16, batch size 8**, with a **0.1 / 8 / 40-second**
 minimum/typical/maximum audio duration profile. Transducer examples use **beam 6**;
-CTC uses **greedy decoding with beam 1**. Checkpoints are downloaded from each
+CTC uses **greedy decoding**. Checkpoints are downloaded from each
 model's `main` branch and are not bundled with the package.
 
 Build engines **on the GPU you will use**, with the same TensorRT/plugin stack
@@ -108,9 +110,9 @@ fast-gpu-asr-export-zipformer \
   --optimization-level 5
 ```
 
-#### CTC Decoding
+### Zipformer CTC
 
-Export the same CR-CTC checkpoint's CTC head instead of its Transducer head:
+Export the same CR-CTC checkpoint's CTC head instead of its transducer head:
 
 ```bash
 fast-gpu-asr-export-zipformer \
@@ -210,11 +212,12 @@ or split audio beforehand.
 with times in seconds. Timestamps come from decoder tokens; the final word ends
 at the clip's duration. Select a GPU with `ASR(..., device_id=0)`.
 
-### Models and Inference Precision
+## Models and Inference Precision
 
 | Family | Example checkpoints | Decoder modes |
 |---|---|---|
-| Zipformer Transducer / CTC | [CR-CTC / Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M), [Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M) | Transducer modified beam search; CTC greedy |
+| Zipformer Transducer | [CR-CTC Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M), [Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M) | Transducer modified beam search |
+| Zipformer CTC | [CR-CTC Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M) | CTC greedy |
 | Parakeet TDT | [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) | TDT modified beam search |
 | Parakeet CTC | [0.6B](https://huggingface.co/nvidia/parakeet-ctc-0.6b), [1.1B](https://huggingface.co/nvidia/parakeet-ctc-1.1b) | CTC greedy |
 
@@ -222,14 +225,14 @@ at the clip's duration. Select a GPU with `ASR(..., device_id=0)`.
 Published measurements cover A100, H200, and B300 with Zipformer
 CR-CTC Transducer and Parakeet V3 TDT, using beam 6 and English audio.
 
-This is an **offline batch inference library**, not a streaming server.
+This is an **offline batch inference library**, not a streaming engine.
 Engines have fixed batch capacity and dynamic audio length
-within their exported profiles. Choose smaller batch size or separate duration
+within their exported profiles. Choose a smaller batch size or separate duration
 profiles when memory or latency matters more than aggregate throughput.
 
 ## Implementation Details
 
-### Zipformer and Parakeet FastConformer Encoder
+### Zipformer Encoder and Parakeet FastConformer
 
 A single TensorRT engine turns raw waveforms into decoder-ready outputs.
 Features and activations stay on the GPU, and the decoder consumes the outputs
@@ -268,7 +271,7 @@ Like k2/Icefall's Zipformer reference
 [`modified_beam_search`](https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/pruned_transducer_stateless2/beam_search.py),
 our search emits at most one nonblank token per encoder frame. Key differences:
 
-- **Merge first, then prune.** Icefall selects the top `beam` candidates before
+- **Merge first, then prune.** k2/Icefall selects the top `beam` candidates before
   merging duplicate histories. We combine their scores with log-sum-exp first,
   then retain the top `beam` **unique hypotheses**. Duplicates cannot waste beam
   slots, and combined scores can rescue histories that early pruning would lose.
@@ -306,16 +309,18 @@ For both models, these search changes can affect transcripts; they do not
 guarantee better WER or identical upstream results. These are implementation
 comparisons, not matched speedup measurements against upstream decoders.
 
-#### Decoder Settings
+### Decoder Settings
 
-`transducer_modified_beam_search` uses the exported beam width;
-`transducer_greedy_search` just simply forces `beam=1` on the same beam search, not a separate
-greedy algorithm. `ctc_greedy_search` requires a CTC head and uses neither a
+`transducer_modified_beam_search` uses the exported beam width.
+`transducer_greedy_search` performs greedy, single-hypothesis decoding by forcing
+`beam=1`, keeping only the best hypothesis at each step. It reuses the modified
+beam-search implementation rather than a separate decoder.
+`ctc_greedy_search` requires a CTC head and uses neither a
 transducer decoder engine nor a predictor table.
 
 Both exporters accept `--blank-penalty` (default `0.0`), subtracted from blank log
 probabilities after normalization. Positive values discourage blanks in every
-mode, including beam one. `k2` applies its penalty before softmax, so equal
+mode, including beam one. k2/Icefall's reference applies its penalty before softmax, so equal
 nonzero settings are not equivalent. Mode, beam, and penalty are saved in
 `model_config.yaml`.
 
@@ -333,14 +338,13 @@ transcripts: check WER alongside throughput.
   epsilons to keep residuals in range while retaining FP16 subsampling and
   Conformer layers. FP32/BF16 exports instead fold the scale into the subsampling
   projection's weights and bias.
-- **Export.** Parakeet profiles are limited to 512 encoder frames by the attention
-  plugin. Build engines for the target GPU and matching TensorRT/plugin versions.
+- **Export.** Build engines for the target GPU and matching TensorRT/plugin versions.
   Use `--debug` to keep intermediate ONNX files; successful exports otherwise
   remove them.
 - **Runtime.** Each `ASR` instance reuses buffers and serializes calls with a lock.
   Model-bundle validation is enabled by default (`validate=True`).
 
-### Build From Source
+## Build From Source
 
 Provide a CUDA-compatible C++20 host compiler and TensorRT development headers
 (`NvInfer.h`) matching the runtime in `uv.lock`. If the headers are outside the
@@ -353,17 +357,16 @@ uv run --frozen python -m fast_gpu_asr.tensorrt_plugins.build
 ```
 
 `uv` installs `nvcc`, CUDA headers/libraries, TensorRT, and CPU-only PyTorch.
-PyTorch handles ONNX export. Prefix exporter
-commands with `uv run --frozen` when using the checkout. For TensorRT headers,
-[CI](https://github.com/SoundsGoodAI/fast-gpu-asr/actions/workflows/ci.yml)
-uses GitHub releases, with a checksum-verified NVIDIA fallback when the tag is
-unavailable.
+PyTorch handles ONNX export. Prefix exporter commands with `uv run --frozen` when
+using the checkout.
+For TensorRT headers, [CI](https://github.com/SoundsGoodAI/fast-gpu-asr/actions/workflows/ci.yml)
+uses GitHub releases, with a checksum-verified NVIDIA fallback when the tag is unavailable.
 
 **Native targets:** `sm_75`, `sm_80`, `sm_86`, `sm_87`, `sm_88`, `sm_89`, `sm_90`,
 `sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121`, plus a `compute_80` PTX
 fallback. Verify execution and memory requirements on your GPU.
 
-### Tests and Packaging
+## Tests and Packaging
 
 After the source-build setup above, run from the repository root:
 
@@ -415,8 +418,6 @@ only the marked performance block in this README from `measurements.csv`.
 
 Code is [Apache-2.0](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/LICENSE). **Model weights and datasets retain their own
 licenses**; the code license does not grant commercial rights to noncommercial
-checkpoints.
-
-Built on the work of [k2](https://github.com/k2-fsa),
+checkpoints. Built on the work of [k2](https://github.com/k2-fsa),
 [NeMo](https://github.com/NVIDIA/NeMo), and their contributors, with NVIDIA
 TensorRT and CUDA libraries. See [NOTICE](https://github.com/SoundsGoodAI/fast-gpu-asr/blob/main/NOTICE) for component attribution.

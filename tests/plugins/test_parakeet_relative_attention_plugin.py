@@ -32,13 +32,16 @@ MINIMUM_POSITIVE_SCALE = np.nextafter(np.float32(0), np.float32(1))
 MAXIMUM_VALID_SCALE = np.float32(
     np.float64(np.finfo(np.float32).max) / np.float64(LOG2_E)
 )
-MAX_SEQUENCE_LENGTH = 512
+WARP_SEQUENCE_LENGTH = 2048
 INT32_MIN = np.iinfo(np.int32).min
 INT32_MAX = np.iinfo(np.int32).max
 SOFTMAX_DISPATCH_CASES = tuple(
     pytest.param(32 * (slots - 1) + 1, id=f"softmax-slots-{slots}")
     for slots in range(1, 17)
-) + (pytest.param(MAX_SEQUENCE_LENGTH, id="softmax-maximum"),)
+) + tuple(
+    pytest.param(length, id=f"softmax-length-{length}")
+    for length in (512, 513, 1024, 1025, WARP_SEQUENCE_LENGTH)
+)
 SHAPE_CASES = (
     pytest.param((1, 1), (1,), id="minimum"),
     pytest.param((2, 3), (0, 3), id="empty-utterance"),
@@ -46,8 +49,11 @@ SHAPE_CASES = (
     pytest.param((1, 32), (31,), id="one-warp-boundary"),
     pytest.param((1, 33), (33,), id="second-warp-slot"),
     pytest.param((3, 65), (INT32_MIN, 34, INT32_MAX), id="length-extremes"),
+    pytest.param((2, 513), (0, 507), id="long-row-mixed-lengths"),
+    pytest.param((1, 1024), (1024,), id="32-slots-boundary"),
+    pytest.param((1, 1025), (1023,), id="64-slots-partial-mask"),
     pytest.param(
-        (1, MAX_SEQUENCE_LENGTH), (MAX_SEQUENCE_LENGTH - 1,), id="maximum-partial-mask"
+        (1, WARP_SEQUENCE_LENGTH), (WARP_SEQUENCE_LENGTH - 1,), id="warp-partial-mask"
     ),
 )
 
@@ -82,7 +88,6 @@ class EngineCase:
 
 
 ENGINE_CASES = (
-    # TensorRT may select TF32 or another reduced-mantissa FP32 cuBLAS tactic.
     EngineCase("fp32", trt.float32, cp.float32, torch.float32, 4e-4),
     EngineCase("fp16", trt.float16, cp.float16, torch.float16, 5e-3),
     pytest.param(
@@ -172,7 +177,10 @@ type PluginCreatorFixture = tuple[ctypes.CDLL, trt.IPluginCreatorV3One]
 
 @pytest.fixture(scope="module")
 def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFixture:
-    """Compile, register, and return the Parakeet attention creator.
+    """Compile and register the current plugin once for this test module.
+
+    Compilation targets the active GPU architecture. The module-scoped fixture
+    keeps the shared library loaded while dependent engines use its creator.
 
     Parameters
     ----------
@@ -182,8 +190,7 @@ def plugin_creator(tmp_path_factory: pytest.TempPathFactory) -> PluginCreatorFix
     Returns
     -------
     PluginCreatorFixture
-        Library handle(s) and the registered creator, retained for dependent
-        engines.
+        Shared-library handle and the registered, namespaced TensorRT creator.
     """
 
     library = compile_and_load_plugin(
@@ -231,6 +238,7 @@ def build_serialized_engine(
     input_specs: tuple[InputSpec, ...],
     scale: float = DEFAULT_SCALE,
     profiles: dict[str, tuple[tuple[int, ...], ...]] | None = None,
+    optimization_level: int = 0,
 ) -> trt.IHostMemory | None:
     """Build a static or dynamic contract, returning None on build rejection.
 
@@ -245,6 +253,9 @@ def build_serialized_engine(
         Attention-logit multiplier serialized into the plugin.
     profiles : dict[str, tuple[tuple[int, ...], ...]] | None
         Mapping of input names to min/opt/max shapes; empty means static.
+    optimization_level : int
+        Zero selects the first, non-FAST cuBLAS tactic for reference checks;
+        higher levels enable timed tactic selection.
 
     Returns
     -------
@@ -274,8 +285,8 @@ def build_serialized_engine(
     output.name = "output"
     network.mark_output(output)
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
-    config.builder_optimization_level = 3
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)
+    config.builder_optimization_level = optimization_level
     if profiles:
         profile = builder.create_optimization_profile()
         for name, shapes in profiles.items():
@@ -289,7 +300,8 @@ def build_attention_engine(
     creator: trt.IPluginCreatorV3One,
     case: EngineCase,
     max_batch_size: int = 3,
-    max_sequence_length: int = MAX_SEQUENCE_LENGTH,
+    max_sequence_length: int = WARP_SEQUENCE_LENGTH,
+    optimization_level: int = 0,
 ) -> AttentionEngine | None:
     """Build and deserialize a dynamic attention engine for one dtype and layout.
 
@@ -303,6 +315,8 @@ def build_attention_engine(
         Maximum supported batch size in the test profile.
     max_sequence_length : int
         Maximum supported sequence length in the test profile.
+    optimization_level : int
+        Zero selects deterministic reference math; higher levels time tactics.
 
     Returns
     -------
@@ -332,7 +346,9 @@ def build_attention_engine(
         ),
         "valid_lengths": ((1,), (opt_batch,), (max_batch_size + 1,)),
     }
-    serialized = build_serialized_engine(creator, input_specs, case.scale, profiles)
+    serialized = build_serialized_engine(
+        creator, input_specs, case.scale, profiles, optimization_level
+    )
     if serialized is None:
         return None
     logger = trt.Logger(trt.Logger.ERROR)
@@ -355,24 +371,62 @@ def build_attention_engine(
 def attention_engine(
     request: pytest.FixtureRequest, plugin_creator: PluginCreatorFixture
 ) -> AttentionEngine:
-    """Build the production attention layout for every supported dtype.
+    """Build a module-scoped reference engine for each supported dtype.
+
+    Uses the default eight-head layout with 64 channels per head and a profile
+    supporting up to three utterances and 2,048 frames. Optimization level zero
+    selects non-FAST cuBLAS math for reference comparisons; optimized tactics
+    are checked separately. BF16 cases require an Ampere-or-newer GPU.
 
     Parameters
     ----------
     request : pytest.FixtureRequest
-        Parametrized dtype or layout selected for this module-scoped engine.
-    plugin_creator : tuple
-        Compiled library handles and the registered creator; retained for engine
+        Supplies an ``EngineCase`` from ``ENGINE_CASES`` through ``request.param``.
+    plugin_creator : PluginCreatorFixture
+        Compiled library handle and the registered creator; retained for engine
         lifetime.
 
     Returns
     -------
     AttentionEngine
-        Deserialized engine with its owning runtime.
+        Shared engine with its owning runtime, dtype, layout, and tolerance.
     """
 
     _, creator = plugin_creator
     result = build_attention_engine(creator, request.param)
+    assert result is not None
+    return result
+
+
+@pytest.fixture(scope="module", params=ENGINE_CASES, ids=lambda case: case.name)
+def generic_attention_engine(
+    request: pytest.FixtureRequest, plugin_creator: PluginCreatorFixture
+) -> AttentionEngine:
+    """Build a module-scoped reference engine covering the long-row fallback.
+
+    Two heads with eight channels each limit quadratic workspace use. The
+    profile supports up to two utterances and 4,097 frames, spanning both the
+    specialized and generic kernels. Optimization level zero selects non-FAST
+    cuBLAS math; BF16 cases require an Ampere-or-newer GPU.
+
+    Parameters
+    ----------
+    request : pytest.FixtureRequest
+        Supplies the dtype and tolerance from an ``ENGINE_CASES`` parameter;
+        the head layout and attention scale are replaced for this fixture.
+    plugin_creator : PluginCreatorFixture
+        Compiled library handle and the registered creator; retained for engine
+        lifetime.
+
+    Returns
+    -------
+    AttentionEngine
+        Shared engine with its owning runtime and reduced-layout case settings.
+    """
+
+    _, creator = plugin_creator
+    case = replace(request.param, num_heads=2, head_dim=8, scale=8**-0.5)
+    result = build_attention_engine(creator, case, 2, 4097)
     assert result is not None
     return result
 
@@ -660,6 +714,106 @@ def test_parakeet_relative_attention_plugin_matches_reference(
     )
 
 
+@pytest.mark.parametrize("case", ENGINE_CASES, ids=lambda case: case.name)
+def test_parakeet_relative_attention_optimized_long_profile(
+    plugin_creator: PluginCreatorFixture, case: EngineCase
+) -> None:
+    _, creator = plugin_creator
+    engine = build_attention_engine(
+        creator,
+        case,
+        max_sequence_length=WARP_SEQUENCE_LENGTH + 1,
+        optimization_level=3,
+    )
+    assert engine is not None
+    for length in (513, 1025, WARP_SEQUENCE_LENGTH, WARP_SEQUENCE_LENGTH + 1):
+        inputs = make_inputs(case, 2, length, (length, length // 2))
+        run = run_engine(engine, inputs)
+        expected = assert_run_matches_reference(run, case, inputs)
+        with run.stream:
+            run.stream.begin_capture()
+            assert run.context.execute_async_v3(run.stream.ptr)
+            graph = run.stream.end_capture()
+            run.output.fill(cp.nan)
+            graph.launch(run.stream)
+        run.stream.synchronize()
+        np.testing.assert_array_equal(run.output.astype(cp.float32).get(), expected)
+
+
+def test_parakeet_relative_attention_generic_shapes_and_graph_replay(
+    generic_attention_engine: AttentionEngine,
+) -> None:
+    case = generic_attention_engine.case
+    context = generic_attention_engine.engine.create_execution_context()
+    assert context is not None
+    for length in (2048, 2049, 4097, 17):
+        inputs = make_inputs(case, 2, length, (length, length // 2))
+        run = run_engine(generic_attention_engine, inputs, context)
+        assert_run_matches_reference(run, case, inputs)
+        with run.stream:
+            run.stream.begin_capture()
+            assert context.execute_async_v3(run.stream.ptr)
+            graph = run.stream.end_capture()
+        inputs = make_inputs(case, 2, length, (0, 7), seed=12000 + length)
+        with run.stream:
+            for destination, source in zip(run.inputs, inputs, strict=True):
+                cp.copyto(destination, cp.array(source, dtype=destination.dtype))
+            run.output.fill(cp.nan)
+            graph.launch(run.stream)
+        expected = assert_run_matches_reference(run, case, inputs)
+        for _ in range(3):
+            with run.stream:
+                run.output.fill(cp.nan)
+                graph.launch(run.stream)
+            run.stream.synchronize()
+            np.testing.assert_array_equal(run.output.astype(cp.float32).get(), expected)
+
+
+@pytest.mark.parametrize("length", (2049, 4097))
+def test_parakeet_relative_attention_generic_includes_last_key(
+    generic_attention_engine: AttentionEngine, length: int
+) -> None:
+    case = generic_attention_engine.case
+    inputs = zero_inputs(case, length, length)
+    query, key, value = np.split(inputs.qkv, 3, axis=2)
+    query[0, :, :: case.head_dim] = 20.0
+    key[0, length - 1, :: case.head_dim] = 20.0
+    value[0, length - 1] = 1.0
+    run = run_engine(generic_attention_engine, inputs)
+    run.stream.synchronize()
+    np.testing.assert_allclose(
+        run.output.astype(cp.float32).get(), 1.0, rtol=0, atol=case.tolerance
+    )
+
+
+@pytest.mark.parametrize("score", (-np.inf, np.inf, np.nan))
+@pytest.mark.parametrize("valid_length", (0, 1, 2))
+def test_parakeet_relative_attention_generic_nonfinite_scores(
+    generic_attention_engine: AttentionEngine, score: float, valid_length: int
+) -> None:
+    case = generic_attention_engine.case
+    inputs = zero_inputs(case, 2049, valid_length)
+    query, key, value = np.split(inputs.qkv, 3, axis=2)
+    query.fill(1.0)
+    key[0, 0] = score
+    value[0, 0] = 1.0
+    value[0, 1] = 7.0
+    run = run_engine(generic_attention_engine, inputs)
+    run.stream.synchronize()
+    expected = (
+        0.0
+        if valid_length == 0
+        else (7.0 if valid_length == 2 and score == -np.inf else np.nan)
+    )
+    np.testing.assert_allclose(
+        run.output.astype(cp.float32).get(),
+        expected,
+        rtol=0,
+        atol=case.tolerance,
+        equal_nan=True,
+    )
+
+
 @pytest.mark.parametrize("sequence_length", SOFTMAX_DISPATCH_CASES)
 def test_parakeet_relative_attention_exercises_every_softmax_dispatch_slot(
     attention_engine: AttentionEngine, sequence_length: int
@@ -802,16 +956,18 @@ def test_parakeet_relative_attention_preserves_nonfinite_score_semantics(
 
 
 @pytest.mark.parametrize("score", (-30.0, 30.0))
+@pytest.mark.parametrize("sequence_length", (2, 2049))
 def test_parakeet_relative_attention_does_not_overflow_finite_scaled_logits(
     plugin_creator: PluginCreatorFixture,
     attention_engine: AttentionEngine,
     score: float,
+    sequence_length: int,
 ) -> None:
     _, creator = plugin_creator
-    case = replace(attention_engine.case, scale=1e37)
-    engine = build_attention_engine(creator, case, 1, 2)
+    case = replace(attention_engine.case, num_heads=1, head_dim=2, scale=1e37)
+    engine = build_attention_engine(creator, case, 1, sequence_length)
     assert engine is not None
-    inputs = zero_inputs(case, 2, 1)
+    inputs = zero_inputs(case, sequence_length, 1)
     _, key, value = np.split(inputs.qkv, 3, axis=2)
     inputs.content_bias[:, 0] = 1.0
     key[0, 0, :: case.head_dim] = score
@@ -895,11 +1051,13 @@ def test_parakeet_relative_attention_applies_relative_position_shift(
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=case.tolerance)
 
 
+@pytest.mark.parametrize("sequence_length", (17, 1025))
 def test_parakeet_relative_attention_supports_cuda_graph_replay(
     attention_engine: AttentionEngine,
+    sequence_length: int,
 ) -> None:
     case = attention_engine.case
-    inputs = make_inputs(case, 2, 17, (17, 5), seed=8001)
+    inputs = make_inputs(case, 2, sequence_length, (sequence_length, 5), seed=8001)
     run = run_engine(attention_engine, inputs)
     run.stream.synchronize()
     with run.stream:
@@ -907,8 +1065,8 @@ def test_parakeet_relative_attention_supports_cuda_graph_replay(
         assert run.context.execute_async_v3(run.stream.ptr)
         graph = run.stream.end_capture()
         graph.upload(run.stream)
-    for replay, lengths in enumerate(((16, 7), (0, 17))):
-        inputs = make_inputs(case, 2, 17, lengths, seed=8100 + replay)
+    for replay, lengths in enumerate(((sequence_length - 1, 7), (0, sequence_length))):
+        inputs = make_inputs(case, 2, sequence_length, lengths, seed=8100 + replay)
         with run.stream:
             for destination, source in zip(run.inputs, inputs, strict=True):
                 cp.copyto(destination, cp.array(source, dtype=destination.dtype))
@@ -961,7 +1119,13 @@ def test_parakeet_relative_attention_reuses_context_across_shapes_and_streams(
     context = attention_engine.engine.create_execution_context()
     assert context is not None
     streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream.null)
-    shape_cases = ((1, 1, (1,)), (3, 65, (INT32_MIN, 34, INT32_MAX)), (1, 33, (32,)))
+    shape_cases = (
+        (1, 1, (1,)),
+        (3, 65, (INT32_MIN, 34, INT32_MAX)),
+        (2, 513, (513, 9)),
+        (1, WARP_SEQUENCE_LENGTH, (WARP_SEQUENCE_LENGTH,)),
+        (1, 33, (32,)),
+    )
     for index, (batch, length, valid_lengths) in enumerate(shape_cases):
         stream = streams[index % len(streams)]
         inputs = make_inputs(
@@ -1179,14 +1343,6 @@ def test_parakeet_relative_attention_accepts_valid_static_contract(
         ),
         pytest.param({4: (trt.int32, (1,))}, id="length-batch-shorter"),
         pytest.param({4: (trt.int32, (3,))}, id="length-batch-longer"),
-        pytest.param(
-            {
-                0: (trt.float16, (1, 513, 3 * DEFAULT_CHANNELS)),
-                1: (trt.float16, (1, 1025, DEFAULT_CHANNELS)),
-                4: (trt.int32, (1,)),
-            },
-            id="sequence-capacity",
-        ),
     ),
 )
 def test_parakeet_relative_attention_rejects_invalid_contracts(
@@ -1208,14 +1364,18 @@ def test_parakeet_relative_attention_rejects_invalid_input_count(
     assert not execute_static_contract(creator, specs)
 
 
-def test_parakeet_relative_attention_rejects_profile_above_capacity(
+def test_parakeet_relative_attention_rejects_unrepresentable_relative_length(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
     _, creator = plugin_creator
-    assert (
-        build_attention_engine(creator, ENGINE_CASES[1], max_sequence_length=513)
-        is None
+    specs = (
+        (trt.float16, (1, INT32_MAX // 2 + 2, 3)),
+        (trt.float16, (1, INT32_MAX, 1)),
+        (trt.float16, (1, 1)),
+        (trt.float16, (1, 1)),
+        (trt.int32, (1,)),
     )
+    assert build_serialized_engine(creator, specs) is None
 
 
 @pytest.mark.parametrize(

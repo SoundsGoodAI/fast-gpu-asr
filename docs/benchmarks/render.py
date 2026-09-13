@@ -29,8 +29,8 @@ import plotly.graph_objects as go
 
 # Insertion order controls model plots, GPU legends, and dataset WER columns.
 MODELS = {
-    "zipformer_cr_ctc_rnnt": "Zipformer CR-CTC-transducer",
-    "parakeet_v3": "Parakeet V3",
+    "zipformer_cr_ctc_rnnt": "Zipformer CR-CTC Transducer",
+    "parakeet_v3": "Parakeet V3 TDT",
 }
 COLORS = {"A100": "deepskyblue", "H200": "lime", "B300": "red"}
 PRECISIONS = ("fp16", "bf16", "fp32")
@@ -278,7 +278,7 @@ def plot_grid() -> str:
     for name in MODELS.values():
         lines.append(
             '      <th width="50%"><div align="center">'
-            f"<big>{escape(name)} (decoder beam 6)</big></div></th>"
+            f"<big>{escape(name)} beam 6</big></div></th>"
         )
     lines.append("    </tr>")
     for precisions in PLOTS:
@@ -311,7 +311,7 @@ def highlights(records: list[Measurement]) -> str:
     """
 
     lines = [
-        "**FP16, batch sizes 1 and 256, beam 6:**",
+        "**FP16, decoder beam 6:**",
         "",
         "| GPU | Model | Batch&nbsp;1<br>RTFx | Batch&nbsp;256<br>RTFx"
         " | Batch&nbsp;1<br>Suite&nbsp;time | Batch&nbsp;256<br>Suite&nbsp;time"
@@ -349,8 +349,9 @@ def highlights(records: list[Measurement]) -> str:
 def overview(records: list[Measurement]) -> str:
     """Build the README performance block.
 
-    The fastest configuration supplies the qualified headline and the GPU for
-    both models' scaling/precision findings. Highlights still include every GPU.
+    The fastest configuration supplies the headline (rounded down to thousands
+    above 1,000 RTFx) and the GPU for both models' scaling/precision findings.
+    Highlights still include every GPU; the audio total is shared by all records.
 
     Parameters
     ----------
@@ -364,6 +365,9 @@ def overview(records: list[Measurement]) -> str:
     """
 
     fastest = max(records, key=lambda r: r.rtfx)
+    headline_rtfx = int(fastest.rtfx)
+    if headline_rtfx >= 1000:
+        headline_rtfx = headline_rtfx // 1000 * 1000
     gpu = fastest.gpu
     planned = "/".join(g for g in COLORS if not any(r.gpu == g for r in records))
     by_key = {(r.model, r.precision, r.batch_size): r for r in records if r.gpu == gpu}
@@ -426,11 +430,13 @@ def overview(records: list[Measurement]) -> str:
 
     return "\n\n".join(
         [
-            f"## Batched speech recognition at up to {fastest.rtfx:,.0f} RTFx on {gpu}",
+            f"## Batched speech recognition at up to {headline_rtfx:,} RTFx on {gpu}",
             *([pending] if pending else []),
             plot_grid(),
             "**RTFx** = total audio duration / total inference time: "
-            "throughput, not request latency.",
+            "throughput, not request latency.\n"
+            f"Each configuration processes **{records[0].audio_seconds / 3600:,.1f} "
+            "hours of audio across seven English datasets**.",
             highlights(records),
             *(["### Key Observations", "\n".join(findings)] if findings else []),
             *([f"{planned} measurements are planned."] if planned else []),

@@ -22,7 +22,6 @@ from ..constants import (
     DECODER_TYPES,
     FLOAT32_MAX,
     INT32_MAX,
-    PARAKEET_MAX_ENCODER_FRAMES,
     PRECISION_DTYPES,
 )
 from ..tensorrt_plugins import load_tensorrt_plugins
@@ -437,12 +436,6 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
         )
 
     encoder_frames = (((feature_frames + 1) // 2 + 1) // 2 + 1) // 2
-    if encoder_frames > PARAKEET_MAX_ENCODER_FRAMES:
-        raise ValueError(
-            f"The maximum profile produces {encoder_frames} encoder frames, but "
-            "the Parakeet relative-attention plugin supports at most "
-            f"{PARAKEET_MAX_ENCODER_FRAMES}."
-        )
     if encoder_frames > model_config.encoder.pos_emb_max_len:
         raise ValueError(
             f"The maximum profile produces {encoder_frames} encoder frames, but "

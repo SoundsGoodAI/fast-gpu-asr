@@ -25,7 +25,6 @@ from fast_gpu_asr.constants import (
     PARAKEET_DECODER_ONNX_FILE,
     PARAKEET_DECODER_TENSORRT_FILE,
     PARAKEET_FEATURE_PLUGIN_NAME,
-    PARAKEET_MAX_ENCODER_FRAMES,
     PARAKEET_ONNX_FILE,
     PARAKEET_RELATIVE_ATTENTION_PLUGIN_NAME,
     PARAKEET_TENSORRT_FILE,
@@ -128,8 +127,6 @@ def test_shared_scalar_constants_are_stable() -> None:
 
 def test_runtime_algorithm_constraints() -> None:
     assert isinstance(AUDIO_SAMPLES_PER_WORKER, int) and AUDIO_SAMPLES_PER_WORKER > 0
-    assert isinstance(PARAKEET_MAX_ENCODER_FRAMES, int)
-    assert 0 < PARAKEET_MAX_ENCODER_FRAMES <= INT32_MAX
     assert isinstance(TDT_BEAM_SEARCH_CHUNK_STEPS, int)
     assert TDT_BEAM_SEARCH_CHUNK_STEPS > 0
     assert TDT_BEAM_SEARCH_CHUNK_STEPS % 2 == 0
@@ -308,16 +305,3 @@ int main()
     )
 
     assert result.stdout == TENSORRT_PLUGIN_NAMESPACE.encode("ascii") + b"\0"
-
-
-def test_parakeet_encoder_frame_limit_matches_cpp_plugin() -> None:
-    source = (PLUGIN_DIR / "parakeet_relative_attention_plugin.cu").read_text(
-        encoding="utf8"
-    )
-    declarations = re.findall(
-        r"^\s*constexpr\s+int32_t\s+kMaximumSequenceLength\s*=\s*(\d+);\s*$",
-        source,
-        flags=re.MULTILINE,
-    )
-
-    assert declarations == [str(PARAKEET_MAX_ENCODER_FRAMES)]

@@ -40,18 +40,19 @@ namespace
 // converting Q to the head-major layout required by the score GEMMs. K, V, and
 // relative positions remain in their original projection buffers and are read
 // with strided leading dimensions. The output is contiguous [N, T, C].
-// Relative alignment and masked softmax are fused in one warp-row CUDA kernel.
+// Relative alignment and masked softmax use warp-row kernels for short inputs
+// and a block-wide fallback for longer inputs.
 // Content and position score matrices are materialized in TensorRT-owned
 // workspace.
 constexpr char const* kPluginName = "parakeet_relative_attention";
 constexpr char const* kPluginVersion = "1";
 constexpr char const* kScaleField = "scale";
 constexpr char const* kTimingCacheId =
-    "layout=nt3c-ntc;relative=2t-1;queries=fused;softmax=warp4-natural";
+    "layout=nt3c-ntc;relative=2t-1;queries=fused;softmax=warp4-natural+block-recompute";
 constexpr size_t kTimingCacheIdSize = 128;
 constexpr int32_t kInputCount = 5;
 constexpr int32_t kOutputCount = 1;
-constexpr int32_t kMaximumSequenceLength = 512;
+constexpr int32_t kWarpSequenceLength = 2048;
 constexpr int32_t kWarpSize = 32;
 constexpr int32_t kWarpsPerBlock = 4;
 constexpr int32_t kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
@@ -262,8 +263,8 @@ bool haveValidShapes(Dims const* inputs, Dims const& output, DataType type) noex
     int64_t const heads = inputs[2].d[0];
     int64_t const headDim = inputs[2].d[1];
     // cuBLAS leading dimensions are int32_t. K and V advance through the
-    // fused projection with a 3C stride, so C itself must fit after scaling.
-    if (length > kMaximumSequenceLength || channels < 1
+    // fused projection with a 3C stride; relative scores have 2T-1 columns.
+    if (length > std::numeric_limits<int32_t>::max() / 2 + 1 || channels < 1
         || channels > std::numeric_limits<int32_t>::max() / 3)
     {
         return false;
@@ -471,10 +472,10 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
     int64_t const outputBase = static_cast<int64_t>(row) * sequenceLength;
     int64_t const positionBase = static_cast<int64_t>(row) * relativeLength;
 
-    // One warp owns one query row. Every lane retains up to 16 keys in
-    // registers, covering the production limit of 512 frames without shared
-    // memory or an intermediate relative-shift tensor. The host dispatches
-    // exactly ceil(T / 32) slots per lane. Matching NeMo, lengths mask keys only.
+    // One warp owns one query row, retaining keys in registers without shared
+    // memory or an intermediate relative-shift tensor. Up to 512 frames, dispatch
+    // uses exactly ceil(T / 32) slots per lane; longer rows use 32 or 64 slots.
+    // Matching NeMo, lengths mask keys only.
     // A nonpositive length has no valid softmax domain,
     // so return an all-zero row. Lengths at or above T leave the row unmasked.
     // Query rows remain defined because downstream lengths determine which
@@ -536,6 +537,109 @@ __global__ void parakeetRelativeSoftmax(T const* positionScores, int32_t const* 
     }
 }
 
+__device__ __forceinline__ float blockMaximum(float value, float* warpValues)
+{
+    int32_t const lane = threadIdx.x % kWarpSize;
+    int32_t const warp = threadIdx.x / kWarpSize;
+    value = warpMaximum(value);
+    if (lane == 0)
+    {
+        warpValues[warp] = value;
+    }
+    __syncthreads();
+    value = threadIdx.x < blockDim.x / kWarpSize ? warpValues[lane] : -CUDART_INF_F;
+    if (warp == 0)
+    {
+        value = warpMaximum(value);
+    }
+    if (threadIdx.x == 0)
+    {
+        warpValues[0] = value;
+    }
+    __syncthreads();
+    return warpValues[0];
+}
+
+__device__ __forceinline__ float blockSum(float value, float* warpValues)
+{
+    int32_t const lane = threadIdx.x % kWarpSize;
+    int32_t const warp = threadIdx.x / kWarpSize;
+    value = warpSum(value);
+    if (lane == 0)
+    {
+        warpValues[warp] = value;
+    }
+    __syncthreads();
+    value = threadIdx.x < blockDim.x / kWarpSize ? warpValues[lane] : 0.0F;
+    if (warp == 0)
+    {
+        value = warpSum(value);
+    }
+    if (threadIdx.x == 0)
+    {
+        warpValues[0] = value;
+    }
+    __syncthreads();
+    return warpValues[0];
+}
+
+template <typename T>
+__global__ void parakeetRelativeSoftmaxGeneric(T const* positionScores, int32_t const* validLengths,
+    T const* contentScores, T* attentionWeights, int32_t numHeads, int32_t sequenceLength,
+    int32_t relativeLength, float scale)
+{
+    int32_t const row = blockIdx.x;
+    int32_t const query = row % sequenceLength;
+    int32_t const batch = row / (numHeads * sequenceLength);
+    int32_t const validLength = validLengths[batch];
+    int64_t const outputBase = static_cast<int64_t>(row) * sequenceLength;
+    int64_t const positionBase = static_cast<int64_t>(row) * relativeLength;
+    if (validLength <= 0)
+    {
+        for (int32_t key = threadIdx.x; key < sequenceLength; key += blockDim.x)
+        {
+            attentionWeights[outputBase + key] = floatToScalar<T>(0.0F);
+        }
+        return;
+    }
+
+    // Recompute FP32 logits in three passes. The final pass alone overwrites
+    // contentScores, which aliases attentionWeights. This needs no extra
+    // workspace and avoids rounding intermediate logits or exponentials to T.
+    auto score = [&](int32_t key)
+    {
+        if (key >= validLength)
+        {
+            return -CUDART_INF_F;
+        }
+        int32_t const relative = sequenceLength - 1 - query + key;
+        return scale
+               * (scalarToFloat(contentScores[outputBase + key])
+                   + scalarToFloat(positionScores[positionBase + relative]));
+    };
+    float maximum = -CUDART_INF_F;
+    for (int32_t key = threadIdx.x; key < sequenceLength; key += blockDim.x)
+    {
+        maximum = fmaxf(maximum, score(key));
+    }
+    // Separate arrays prevent one warp's sum reduction from overwriting the
+    // maximum before every other warp has read it.
+    __shared__ float maximumReduction[kWarpSize];
+    __shared__ float sumReduction[kWarpSize];
+    maximum = blockMaximum(maximum, maximumReduction);
+    float sum = 0.0F;
+    for (int32_t key = threadIdx.x; key < sequenceLength; key += blockDim.x)
+    {
+        sum += exp2f((score(key) - maximum) * kLog2E);
+    }
+    float const inverseDenominator = 1.0F / blockSum(sum, sumReduction);
+    for (int32_t key = threadIdx.x; key < sequenceLength; key += blockDim.x)
+    {
+        attentionWeights[outputBase + key] =
+            floatToScalar<T>(exp2f((score(key) - maximum) * kLog2E) * inverseDenominator);
+    }
+}
+
 #define LAUNCH_SOFTMAX_CASE(SLOTS, TYPE)                                                           \
     case SLOTS:                                                                                    \
         parakeetRelativeSoftmax<TYPE, SLOTS><<<blocks, kThreadsPerBlock, 0, stream>>>(             \
@@ -550,9 +654,19 @@ bool launchParakeetSoftmax(void const* positionScores, int32_t const* validLengt
     int32_t sequenceLength, int32_t relativeLength, float scale, cudaStream_t stream)
 {
     int32_t const rows = batchSize * numHeads * sequenceLength;
+    if (sequenceLength > kWarpSequenceLength)
+    {
+        parakeetRelativeSoftmaxGeneric<T>
+            <<<rows, 256, 0, stream>>>(static_cast<T const*>(positionScores), validLengths,
+                static_cast<T const*>(contentScores), static_cast<T*>(attentionWeights), numHeads,
+                sequenceLength, relativeLength, scale);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
     // Avoid overflowing the validated int32 row count during ceiling division.
     uint32_t const blocks = static_cast<uint32_t>((rows - 1) / kWarpsPerBlock + 1);
-    switch ((sequenceLength + kWarpSize - 1) / kWarpSize)
+    int32_t const slots = (sequenceLength + kWarpSize - 1) / kWarpSize;
+    int32_t const maxSlots = slots <= 16 ? slots : (slots <= 32 ? 32 : 64);
+    switch (maxSlots)
     {
         LAUNCH_SOFTMAX_CASE(1, T);
         LAUNCH_SOFTMAX_CASE(2, T);
@@ -570,6 +684,8 @@ bool launchParakeetSoftmax(void const* positionScores, int32_t const* validLengt
         LAUNCH_SOFTMAX_CASE(14, T);
         LAUNCH_SOFTMAX_CASE(15, T);
         LAUNCH_SOFTMAX_CASE(16, T);
+        LAUNCH_SOFTMAX_CASE(32, T);
+        LAUNCH_SOFTMAX_CASE(64, T);
     default: return false;
     }
     return cudaPeekAtLastError() == cudaSuccess;
@@ -668,7 +784,8 @@ class ParakeetRelativeAttentionPlugin final : public IPluginV3,
         }
         if (!hasAddressableBytes(inputs[4].max, sizeof(int32_t))
             || !hasAddressableBytes(outputs[0].max, dataTypeBytes(outputs[0].desc.type))
-            || inputs[0].max.d[1] > kMaximumSequenceLength)
+            || inputs[0].max.d[1] > std::numeric_limits<int32_t>::max() / 2 + 1
+            || inputs[1].max.d[1] > std::numeric_limits<int32_t>::max())
         {
             return 1;
         }

@@ -156,15 +156,16 @@ def test_all_rows_and_scoped_highlights_are_rendered(tmp_path, rows):
     page = render.results_page(records)
     overview = render.overview(records)
     assert overview.splitlines()[0] == (
-        "## Batched speech recognition at up to 12,641 RTFx on H200"
+        "## Batched speech recognition at up to 12,000 RTFx on H200"
     )
-    assert "hours of audio" not in overview
     assert (
         "</table>\n\n**RTFx** = total audio duration / total inference time: "
-        "throughput, not request latency.\n\n**FP16, batch sizes 1 and 256, beam 6:**"
+        "throughput, not request latency.\n"
+        "Each configuration processes **3.4 hours of audio across seven English "
+        "datasets**.\n\n**FP16, decoder beam 6:**"
     ) in overview
-    assert "256.0x for Zipformer CR-CTC-transducer" in overview
-    assert "10.0% lower for Zipformer CR-CTC-transducer and Parakeet V3" in overview
+    assert "256.0x for Zipformer CR-CTC Transducer" in overview
+    assert "10.0% lower for Zipformer CR-CTC Transducer and Parakeet V3 TDT" in overview
     assert "### Key Observations" in overview
     assert overview.endswith(
         f"[All results]({render.BENCHMARK_URL}results.md) | "
@@ -197,7 +198,7 @@ def test_all_rows_and_scoped_highlights_are_rendered(tmp_path, rows):
         assert f"{family}-fp16-bf16-fp32.svg" in overview
     assert "<img " not in page
     assert "| GPU | Model |" not in page
-    assert "**FP16, batch sizes 1 and 256, beam 6:**" not in page
+    assert "**FP16, decoder beam 6:**" not in page
     assert "Both models use decoder beam 6" in page
     assert "[Methodology](methodology.md#timing-and-scoring)" not in page
     for text in (page, overview):
@@ -213,8 +214,8 @@ def test_all_rows_and_scoped_highlights_are_rendered(tmp_path, rows):
     assert "[CSV and plot reproduction](methodology.md#rebuild-plots)" in page
     for gpu in ("A100", "H200"):
         section = page.split(f"## {gpu}\n", 1)[1].split("\n## ", 1)[0]
-        assert section.count("| Zipformer CR-CTC-transducer |") == 52
-        assert section.count("| Parakeet V3 |") == 52
+        assert section.count("| Zipformer CR-CTC Transducer |") == 52
+        assert section.count("| Parakeet V3 TDT |") == 52
         assert section.count("0.25 | 1.25 | 2.25 | 3.25 | 4.25 | 5.25 | 6.25") == 52
 
 
@@ -265,15 +266,15 @@ def test_observations_use_matched_precision_batches_and_per_gpu_wer_spans(
             row["inference_seconds"] = 1000 / (2 * 2 * 256 * 1.005)
     records = render.load_measurements(write_csv(tmp_path / "measurements.csv", rows))
     text = render.overview(records)
-    assert "slightly higher for Zipformer CR-CTC-transducer" in text
+    assert "slightly higher for Zipformer CR-CTC Transducer" in text
     assert (
         "At H200/batch 128, FP16 changes throughput by +100.0% for "
-        "Zipformer CR-CTC-transducer and -50.0% for Parakeet V3 relative to FP32."
+        "Zipformer CR-CTC Transducer and -50.0% for Parakeet V3 TDT relative to FP32."
     ) in text
     assert (
         "On H200, the recorded mean-WER span across all measured precisions "
-        "and batches is 0.400 percentage points for Zipformer CR-CTC-transducer and "
-        "0.300 percentage points for Parakeet V3."
+        "and batches is 0.400 percentage points for Zipformer CR-CTC Transducer and "
+        "0.300 percentage points for Parakeet V3 TDT."
     ) in text
 
 
@@ -284,8 +285,8 @@ def test_bf16_observation_groups_matching_comparisons(tmp_path, rows):
     records = render.load_measurements(write_csv(tmp_path / "measurements.csv", rows))
     text = render.overview(records)
     assert (
-        "BF16 throughput is slightly higher for Zipformer CR-CTC-transducer "
-        "and Parakeet V3 than FP16."
+        "BF16 throughput is slightly higher for Zipformer CR-CTC Transducer "
+        "and Parakeet V3 TDT than FP16."
     ) in text
 
 
@@ -303,7 +304,7 @@ def test_plot_grid_places_models_in_equal_width_columns():
     ):
         assert header.get("width") == "50%"
         assert header.find("div").get("align") == "center"
-        assert header.find("div/big").text == f"{name} (decoder beam 6)"
+        assert header.find("div/big").text == f"{name} beam 6"
         link = cell.find("a")
         image = link.find("img")
         path = f"{render.RAW_BENCHMARK_URL}{family}-fp16-bf16-fp32.svg"
@@ -405,14 +406,14 @@ def test_pending_b300_bf16_is_explicit_without_inventing_measurements(tmp_path, 
             assert [trace.name for trace in chart.data] == expected
     for text in (render.overview(records), render.results_page(records)):
         assert "B300: 43/52 configurations" in text
-        assert "Pending: Parakeet V3 BF16 (batches 1-256)" in text
+        assert "Pending: Parakeet V3 TDT BF16 (batches 1-256)" in text
         assert "B300 measurements are planned" not in text
     overview = render.overview(records)
-    assert overview.splitlines()[0].endswith("25,283 RTFx on B300")
+    assert overview.splitlines()[0].endswith("25,000 RTFx on B300")
     bf16_finding = next(
         line for line in overview.splitlines() if line.startswith("- **BF16")
     )
-    assert "Zipformer CR-CTC-transducer" in bf16_finding
+    assert "Zipformer CR-CTC Transducer" in bf16_finding
     assert "Parakeet" not in bf16_finding
 
     completed = [

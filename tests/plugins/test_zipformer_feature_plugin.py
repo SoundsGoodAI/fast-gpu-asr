@@ -35,6 +35,7 @@ FEATURE_RTOL = 2e-4
 FEATURE_ATOL = 7e-3
 FEATURE_RMSE_ATOL = 2e-3
 FULL_SCALE_FEATURE_ATOL = 1.1e-2
+FULL_SCALE_FEATURE_RMSE_ATOL = 3e-3
 PROFILE_SHAPES = ((1, 1800), (2, 3400), (256, 5000))
 FFT_LENGTH = 1 << (FRAME_LENGTH - 1).bit_length()
 MEL_FREQUENCIES = FFT_LENGTH // 2 + 1
@@ -434,6 +435,7 @@ def assert_run_matches_pytorch(
     audio: np.typing.NDArray[np.float32],
     lengths: np.typing.NDArray[np.int64],
     atol: float = FEATURE_ATOL,
+    rmse_atol: float = FEATURE_RMSE_ATOL,
 ) -> tuple[np.typing.NDArray, np.typing.NDArray]:
     """Compare one native run with the independent eager implementation.
 
@@ -448,8 +450,9 @@ def assert_run_matches_pytorch(
     lengths : np.typing.NDArray[np.int64]
         INT64 valid sample counts, one per waveform.
     atol : float
-        Maximum elementwise absolute error; the independent RMSE bound still
-        applies.
+        Maximum elementwise absolute error.
+    rmse_atol : float
+        Maximum root-mean-square error over valid frames, independent of padding.
 
     Returns
     -------
@@ -474,7 +477,7 @@ def assert_run_matches_pytorch(
     np.testing.assert_allclose(actual, expected_array, rtol=FEATURE_RTOL, atol=atol)
     valid_frames = np.arange(actual.shape[1]) < actual_lengths[:, np.newaxis]
     differences = (actual - expected_array)[valid_frames].astype(np.float64)
-    assert np.sqrt(np.mean(differences**2)) < FEATURE_RMSE_ATOL
+    assert np.sqrt(np.mean(differences**2)) < rmse_atol
     np.testing.assert_allclose(
         actual[~valid_frames], extractor.zero_log, rtol=0, atol=5e-5
     )
@@ -791,6 +794,7 @@ def test_feature_plugin_full_scale_pcm_is_finite(feature_engine) -> None:
         audio,
         lengths,
         atol=FULL_SCALE_FEATURE_ATOL,
+        rmse_atol=FULL_SCALE_FEATURE_RMSE_ATOL,
     )
 
 

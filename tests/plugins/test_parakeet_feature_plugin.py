@@ -744,9 +744,19 @@ def test_feature_plugin_ignores_trailing_padding_extent(
 
     np.testing.assert_array_equal(short_lengths, (10,))
     np.testing.assert_array_equal(long_lengths, short_lengths)
+    # cuBLAS may select different arithmetic for different matrix shapes.
     np.testing.assert_allclose(
-        long_features[0, :10], short_features[0, :10], rtol=FEATURE_RTOL, atol=2e-3
+        long_features[0, :10],
+        short_features[0, :10],
+        rtol=FEATURE_RTOL,
+        atol=FEATURE_ATOL,
     )
+    for audio, expected in ((short_audio, short_features), (long_audio, long_features)):
+        audio[0, valid_length:] = np.nan
+        run = run_engine(engine, audio, lengths, context=long_run.context)
+        run.stream.synchronize()
+        np.testing.assert_array_equal(cp.asnumpy(run.features), expected)
+        np.testing.assert_array_equal(cp.asnumpy(run.feature_lengths), short_lengths)
 
 
 def test_feature_plugin_reuses_context_across_shape_changes(
