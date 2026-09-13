@@ -619,14 +619,16 @@ def test_validate_rejects_inconsistent_snapshots(
         (("status",), "success", "Unknown run status"),
         (("spec", "campaign_id"), "other", "Run metadata"),
         (("spec", "model"), "unknown", "outside the benchmark matrix"),
-        (("spec", "gpu"), "T4", "outside the benchmark matrix"),
+        (("spec", "gpu"), "../outside", "outside the benchmark matrix"),
+        (("spec", "gpu"), "", "outside the benchmark matrix"),
+        (("spec", "gpu"), 6000, "outside the benchmark matrix"),
         (("spec", "precision"), "int8", "outside the benchmark matrix"),
         (("spec", "beam"), 1, "outside the benchmark matrix"),
         (("spec", "beam"), 6.0, "outside the benchmark matrix"),
         (("spec", "batch_size"), 3, "outside the benchmark matrix"),
         (("spec", "batch_size"), 2.0, "outside the benchmark matrix"),
         (("hardware", "gpu", "uuid"), "other", "Hardware metadata"),
-        (("hardware", "gpu", "name"), "NVIDIA H200", "Hardware metadata"),
+        (("hardware", "gpu", "name"), "", "Hardware metadata"),
         (("passes",), [], "complete passes"),
         (("passes", 0, "rtfx"), 999, "batch timings"),
         (("passes", 0, "rtfx"), "1", "batch timings"),
@@ -664,6 +666,51 @@ def test_validate_rejects_invalid_values_even_with_matching_snapshots(
         (run_dir / f"pass-{i}/scores.json").write_text(json.dumps(saved))
     with pytest.raises(ValueError, match=message):
         report.validate_result(campaign, run_dir)
+
+
+def test_report_includes_custom_gpu_labels(
+    tmp_path, campaign, run_report, export_images
+):
+    names = {
+        "T4": "NVIDIA Tesla T4",
+        "RTX_PRO_6000": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    }
+    directories = []
+    for label, name in names.items():
+        directory = tmp_path / "runs" / f"{label}-parakeet_v3-fp16-b2"
+        result = write_run(campaign, directory, model="parakeet_v3")
+        result["spec"].update(gpu=label, gpu_uuid=f"GPU-{label}")
+        result["hardware"]["gpu"].update(name=name, uuid=f"GPU-{label}")
+        write_json(directory / "run.json", result["spec"])
+        write_json(directory / "hardware.json", result["hardware"])
+        write_json(directory / "result.json", result)
+        directories.append(directory)
+
+    output = tmp_path / "report"
+    run_report(campaign, directories, output)
+    runs = json.loads((output / "results.json").read_text())["runs"]
+    assert [r["spec"]["gpu"] for r in runs] == sorted(names)
+    for result in runs:
+        assert result["hardware"]["gpu"]["name"] == names[result["spec"]["gpu"]]
+    colors = {}
+    for figure, path in zip(
+        export_images.call_args.kwargs["fig"],
+        export_images.call_args.kwargs["file"],
+        strict=True,
+    ):
+        traces = [trace for trace in figure.data if trace.name in names]
+        assert [trace.name for trace in traces] == sorted(names)
+        for trace in traces:
+            assert trace.line.color == trace.marker.color == trace.error_y.color
+            assert colors.setdefault(trace.name, trace.line.color) == trace.line.color
+            if path.name == "parakeet_v3-fp16.svg":
+                expected = next(r for r in runs if r["spec"]["gpu"] == trace.name)
+                assert trace.x == (2,)
+                assert trace.y == (expected["rtfx_median"],)
+            else:
+                assert trace.x == trace.y == (None,)
+    assert len(set(colors.values())) == len(names)
+    assert all(f"| {label} |" in (output / "results.md").read_text() for label in names)
 
 
 @pytest.mark.parametrize("name", (DATASETS[0], "batches"))

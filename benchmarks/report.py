@@ -11,7 +11,8 @@ normalization or WER scoring. Rescore with ``benchmarks.score`` when needed.
 The private campaign and run artifacts are read-only inputs. Public output
 contains complete measurements, a reference-redacted manifest, Markdown tables,
 and one SVG per model/precision pair. An optional README update replaces only its
-benchmark marker block. See ``benchmarks/README.md`` for the command-line workflow.
+benchmark marker block. See
+``docs/benchmarks/methodology.md#collect-new-measurements`` for the workflow.
 """
 
 import argparse
@@ -21,18 +22,20 @@ from contextlib import ExitStack
 from hashlib import sha256
 from math import isclose, isfinite, log10
 from pathlib import Path
-from re import fullmatch, search
+from re import fullmatch
 from statistics import mean, median
 from tempfile import TemporaryDirectory
 from urllib.parse import quote
 
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.colors import qualitative
 
 from .common import (
     BATCHES,
     BEAMS,
     DATASETS,
+    GPU_LABEL_PATTERN,
     GPUS,
     MODELS,
     PRECISIONS,
@@ -160,7 +163,8 @@ def validate_result(
         raise ValueError("Run metadata differs from the result or campaign.")
     if (
         spec["model"] not in MODELS
-        or spec["gpu"] not in GPUS
+        or not isinstance(spec["gpu"], str)
+        or fullmatch(GPU_LABEL_PATTERN, spec["gpu"]) is None
         or spec["precision"] not in PRECISIONS
         or not isinstance(spec["beam"], int)
         or spec["beam"] != BEAMS[spec["model"]]
@@ -173,7 +177,8 @@ def validate_result(
     if (
         result["hardware"] != machine
         or machine["gpu"]["uuid"] != spec["gpu_uuid"]
-        or search(rf"\b{spec['gpu']}\b", machine["gpu"]["name"]) is None
+        or not isinstance(machine["gpu"]["name"], str)
+        or not machine["gpu"]["name"].strip()
     ):
         raise ValueError("Hardware metadata differs from the recorded GPU.")
 
@@ -393,6 +398,8 @@ def render_report(
     reports omit run-to-run ranges; other reports retain every pass's mean WER
     and show the median throughput with its minimum/maximum pass range.
 
+    Known GPU labels retain their colors and order. Other labels follow in
+    alphabetical order, with colors from Plotly's default qualitative palette.
     Every figure shares the throughput bounds, GPU colors, and logarithmic batch
     axis. Error bars span minimum/maximum pass throughput; a single pass has
     zero-width bars, not a repeatability estimate. Lines connect measured points
@@ -414,11 +421,17 @@ def render_report(
     to ``main``; this function does not roll back partial output.
     """
 
-    complete = sorted(
-        (r for r in records if r["status"] == "complete"),
+    complete = [r for r in records if r["status"] == "complete"]
+    colors = dict(COLORS)
+    for index, gpu in enumerate(
+        sorted({r["spec"]["gpu"] for r in complete} - colors.keys())
+    ):
+        colors[gpu] = qualitative.Plotly[index % len(qualitative.Plotly)]
+    gpus = tuple(colors)
+    complete.sort(
         key=lambda r: (
             tuple(MODELS).index(r["spec"]["model"]),
-            GPUS.index(r["spec"]["gpu"]),
+            gpus.index(r["spec"]["gpu"]),
             PRECISIONS.index(r["spec"]["precision"]),
             r["spec"]["batch_size"],
         ),
@@ -463,7 +476,7 @@ def render_report(
                 for r in complete
                 if r["spec"]["model"] == model and r["spec"]["precision"] == precision
             ]
-            for gpu in GPUS:
+            for gpu in gpus:
                 points = [r for r in selected if r["spec"]["gpu"] == gpu]
 
                 fig.add_trace(
@@ -472,9 +485,9 @@ def render_report(
                         y=[r["rtfx_median"] for r in points] or [None],
                         mode="lines+markers",
                         name=gpu,
-                        line={"color": COLORS[gpu], "width": 3},
+                        line={"color": colors[gpu], "width": 3},
                         marker={
-                            "color": COLORS[gpu],
+                            "color": colors[gpu],
                             "size": 8,
                             "line": {"color": "white", "width": 1.5},
                         },
@@ -487,7 +500,7 @@ def render_report(
                             "arrayminus": [
                                 r["rtfx_median"] - r["rtfx_range"][0] for r in points
                             ],
-                            "color": COLORS[gpu],
+                            "color": colors[gpu],
                             "thickness": 1,
                             "width": 3,
                         },

@@ -97,6 +97,37 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
           version: "0.11.21"
+      - name: Check pip installation with CPU PyTorch
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          with open("pyproject.toml", "rb") as source:
+              dependencies = tomllib.load(source)["project"]["dependencies"]
+          torch_requirement = next(r for r in dependencies if r.startswith("torch>="))
+          environment = Path(os.environ["RUNNER_TEMP"]) / "pip-cpu"
+          subprocess.run(
+              ["uv", "venv", "--seed", "--python", os.environ["PYTHON_VERSION"],
+               str(environment)],
+              check=True,
+          )
+          python = str(environment / "bin/python")
+          subprocess.run(
+              [python, "-m", "pip", "install", torch_requirement,
+               "--index-url", "https://download.pytorch.org/whl/cpu"],
+              check=True,
+          )
+          subprocess.run([python, "-m", "pip", "install", "--dry-run", "."], check=True)
+          subprocess.run(
+              [python, "-c", "import torch; assert torch.version.cuda is None"],
+              check=True,
+          )
+          PY
       - name: Install development environment
         run: uv sync --frozen --extra dev
       - name: Compile Python sources
@@ -156,12 +187,49 @@ jobs:
           headers_release="${major}.${minor}"
           archive="${RUNNER_TEMP}/tensorrt-headers.tar.gz"
           headers_dir="${RUNNER_TEMP}/tensorrt-headers"
-          curl -fsSL --retry 3 --retry-all-errors \
-            -o "${archive}" \
-            "https://codeload.github.com/NVIDIA/TensorRT/tar.gz/refs/tags/v${headers_release}"
           mkdir -p "${headers_dir}"
-          tar -xzf "${archive}" -C "${headers_dir}" --strip-components=2 \
-            "TensorRT-${headers_release}/include"
+          if curl -fsSL --retry 3 --retry-all-errors \
+            -o "${archive}" \
+            "https://codeload.github.com/NVIDIA/TensorRT/tar.gz/refs/tags/v${headers_release}"; then
+            tar -xzf "${archive}" -C "${headers_dir}" --strip-components=2 \
+              "TensorRT-${headers_release}/include"
+          else
+            # NVIDIA's packages can precede the matching GitHub release tag.
+            uv run --frozen python - "${tensorrt_version}" "${headers_dir}/headers.deb" <<'PY'
+          import gzip
+          import sys
+          from email.parser import Parser
+          from hashlib import sha256
+          from urllib.parse import urljoin
+          from urllib.request import urlopen
+
+          version, destination = sys.argv[1:]
+          repository = "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
+          with urlopen(repository + "Packages.gz", timeout=60) as response:
+              index = gzip.decompress(response.read()).decode()
+          for paragraph in index.split("\n\n"):
+              package = Parser().parsestr(paragraph)
+              if (
+                  package.get("Package") == "libnvinfer-headers-dev"
+                  and package.get("Architecture") in ("amd64", "all")
+                  and package.get("Version", "").startswith(version + "-")
+                  and "+cuda13." in package["Version"]
+              ):
+                  break
+          else:
+              raise RuntimeError(f"NVIDIA headers for TensorRT {version} were not found.")
+
+          with urlopen(urljoin(repository, package["Filename"]), timeout=60) as response:
+              data = response.read()
+          if sha256(data).hexdigest() != package["SHA256"]:
+              raise RuntimeError("NVIDIA TensorRT header package checksum mismatch.")
+          with open(destination, "wb") as output:
+              output.write(data)
+          print(f"NVIDIA headers: {package['Version']}")
+          PY
+            dpkg-deb --extract "${headers_dir}/headers.deb" "${headers_dir}"
+            headers_dir="${headers_dir}/usr/include/x86_64-linux-gnu"
+          fi
           # Treat vendor headers as system headers without hiding plugin diagnostics.
           printf 'CPLUS_INCLUDE_PATH=%s:%s\n' "${headers_dir}" "${CPLUS_INCLUDE_PATH:-}" >> "${GITHUB_ENV}"
       - name: Configure Python CUDA toolchain

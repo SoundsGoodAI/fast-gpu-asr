@@ -4,6 +4,7 @@
 """Validate CI, package metadata, and generated-artifact policies."""
 
 import ast
+import gzip
 import os
 import re
 import shlex
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterable
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -532,6 +535,56 @@ def test_ci_jobs_checkout_source_and_bootstrap_uv_reproducibly() -> None:
     assert len(setup_uv_versions) == 1
 
 
+@pytest.mark.parametrize("failed_step", (None, 1, 2, 3))
+def test_python_ci_checks_pip_with_cpu_pytorch(tmp_path, monkeypatch, failed_step):
+    job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["python-tests"]
+    step = get_named_step(job, "Check pip installation with CPU PyTorch")
+    assert_mandatory_step(step)
+    assert step["env"] == {"PYTHON_VERSION": "${{ matrix.python-version }}"}
+    assert job["steps"].index(step) < job["steps"].index(
+        get_named_step(job, "Install development environment")
+    )
+    with open(PYPROJECT_PATH, "rb") as source:
+        dependencies = tomllib.load(source)["project"]["dependencies"]
+    torch_requirement = next(r for r in dependencies if r.startswith("torch>="))
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    monkeypatch.chdir(REPOSITORY_ROOT)
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("PYTHON_VERSION", python_version)
+    python = str(tmp_path / "pip-cpu/bin/python")
+    expected = [
+        ["uv", "venv", "--seed", "--python", python_version, str(tmp_path / "pip-cpu")],
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            torch_requirement,
+            "--index-url",
+            "https://download.pytorch.org/whl/cpu",
+        ],
+        [python, "-m", "pip", "install", "--dry-run", "."],
+        [python, "-c", "import torch; assert torch.version.cuda is None"],
+    ]
+    calls = []
+
+    def run(command, check):
+        """Record install commands and optionally fail before the next step."""
+        assert check is True
+        calls.append(command)
+        if len(calls) == failed_step:
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    code = compile(get_python_heredoc(step["run"]), "<cpu-pytorch-install>", "exec")
+    if failed_step is None:
+        exec(code, {})
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            exec(code, {})
+    assert calls == expected[:failed_step]
+
+
 @pytest.mark.parametrize(
     ("gpu_tests", "ref", "error"),
     (
@@ -703,10 +756,14 @@ def test_gpu_ci_driver_preflight(driver_version: str | None, accepted: bool) -> 
         assert f"this image has {driver_version}" in result.stderr
 
 
-@pytest.mark.parametrize("version", ("11.2.1.2", "11.3.0.4"))
+@pytest.mark.parametrize("github_status,nvidia_status", ((0, 0), (22, 0), (22, 1)))
 def test_gpu_ci_selects_headers_from_installed_tensorrt(
-    tmp_path: Path, version: str
+    tmp_path: Path, github_status: int, nvidia_status: int
 ) -> None:
+    with open(REPOSITORY_ROOT / "uv.lock", "rb") as source:
+        lock = tomllib.load(source)
+    versions = {package["name"]: package["version"] for package in lock["package"]}
+    version = versions["tensorrt-cu13"]
     gpu_job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["gpu-tests"]
     step = get_named_step(gpu_job, "Install native build prerequisites")
     assert_mandatory_step(step)
@@ -717,12 +774,21 @@ def test_gpu_ci_selects_headers_from_installed_tensorrt(
     script = r"""
     sudo() { [[ "$*" == apt-get* ]]; }
     uv() {
-        [[ "$1 $2 $3 $4" == "run --frozen python -c" ]] || return 64
-        [[ "$5" == "$METADATA_QUERY" ]] || return 64
-        printf '%s\n' "$TENSORRT_VERSION"
+        [[ "$1 $2 $3" == "run --frozen python" ]] || return 64
+        if [[ "$4" == "-c" ]]; then
+            [[ "$5" == "$METADATA_QUERY" ]] || return 64
+            printf '%s\n' "$TENSORRT_VERSION"
+        else
+            [[ "$4" == "-" && "$5" == "$TENSORRT_VERSION" ]] || return 64
+            [[ "$6" == "$RUNNER_TEMP/tensorrt-headers/headers.deb" ]] || return 64
+            cat >/dev/null
+            printf 'NVIDIA fallback\n'
+            return "$NVIDIA_STATUS"
+        fi
     }
-    curl() { printf '%s\n' "$@"; }
+    curl() { printf '%s\n' "$@"; return "$DOWNLOAD_STATUS"; }
     tar() { printf '%s\n' "$@"; }
+    dpkg-deb() { printf '%s\n' "$@"; }
     """ + step["run"]
     github_env = tmp_path / "github-env"
     result = subprocess.run(
@@ -737,18 +803,103 @@ def test_gpu_ci_selects_headers_from_installed_tensorrt(
             "CPLUS_INCLUDE_PATH": "/existing/includes",
             "TENSORRT_VERSION": version,
             "METADATA_QUERY": metadata_query,
+            "DOWNLOAD_STATUS": str(github_status),
+            "NVIDIA_STATUS": str(nvidia_status),
         },
     )
+    if nvidia_status:
+        assert result.returncode == nvidia_status, result.stderr
+        assert "-xzf" not in result.stdout.splitlines()
+        assert "--extract" not in result.stdout.splitlines()
+        assert not github_env.exists()
+        return
+
     assert result.returncode == 0, result.stderr
     release = ".".join(version.split(".")[:2])
     assert (
         f"https://codeload.github.com/NVIDIA/TensorRT/tar.gz/refs/tags/v{release}"
         in result.stdout.splitlines()
     )
-    assert "--strip-components=2" in result.stdout.splitlines()
-    assert f"TensorRT-{release}/include" in result.stdout.splitlines()
+    headers = tmp_path / "tensorrt-headers"
+    if github_status:
+        assert result.stdout.splitlines()[-4:] == [
+            "NVIDIA fallback",
+            "--extract",
+            str(headers / "headers.deb"),
+            str(headers),
+        ]
+        headers /= "usr/include/x86_64-linux-gnu"
+    else:
+        assert "NVIDIA fallback" not in result.stdout
+        assert result.stdout.splitlines()[-6:] == [
+            "-xzf",
+            str(tmp_path / "tensorrt-headers.tar.gz"),
+            "-C",
+            str(headers),
+            "--strip-components=2",
+            f"TensorRT-{release}/include",
+        ]
+        assert headers.is_dir()
     assert github_env.read_text() == (
-        f"CPLUS_INCLUDE_PATH={tmp_path}/tensorrt-headers:/existing/includes\n"
+        f"CPLUS_INCLUDE_PATH={headers}:/existing/includes\n"
+    )
+
+
+@pytest.mark.parametrize("failure", (None, "missing", "checksum", "download"))
+def test_gpu_ci_nvidia_header_fallback(tmp_path, monkeypatch, failure):
+    with open(REPOSITORY_ROOT / "uv.lock", "rb") as source:
+        packages = tomllib.load(source)["package"]
+    version = next(p["version"] for p in packages if p["name"] == "tensorrt-cu13")
+    gpu_job = load_yaml_mapping(WORKFLOW_PATH)["jobs"]["gpu-tests"]
+    source = get_python_heredoc(
+        get_named_step(gpu_job, "Install native build prerequisites")["run"]
+    )
+    payload = b"matching NVIDIA header package"
+    checksum = "0" * 64 if failure == "checksum" else sha256(payload).hexdigest()
+    entry = (
+        "Package: libnvinfer-headers-dev\n"
+        f"Version: {version}-1+cuda13.0\nArchitecture: amd64\n"
+        f"Filename: ./headers.deb\nSHA256: {checksum}\n"
+    )
+    unrelated = entry.replace(version, version + "1")
+    unrelated += "\n" + entry.replace("cuda13.0", "cuda12.0")
+    unrelated += "\n" + entry.replace("amd64", "arm64")
+    unrelated += "\n" + entry.replace(
+        "Package: libnvinfer-headers-dev", "Package: other"
+    )
+    index = unrelated + ("\n" + entry if failure != "missing" else "")
+    requests = []
+
+    def download(url, timeout):
+        """Serve repository metadata and package bytes without network access."""
+        assert timeout == 60
+        requests.append(url)
+        if url.endswith("Packages.gz"):
+            return BytesIO(gzip.compress(index.encode()))
+        if failure == "download":
+            raise OSError("download failed")
+        return BytesIO(payload)
+
+    output = tmp_path / "headers.deb"
+    monkeypatch.setattr("urllib.request.urlopen", download)
+    monkeypatch.setattr(sys, "argv", ["download", version, str(output)])
+    if failure is None:
+        exec(compile(source, "<header-fallback>", "exec"), {})
+        assert output.read_bytes() == payload
+    else:
+        message = {
+            "missing": "not found",
+            "checksum": "checksum",
+            "download": "download failed",
+        }
+        with pytest.raises((RuntimeError, OSError), match=message[failure]):
+            exec(compile(source, "<header-fallback>", "exec"), {})
+        assert not output.exists()
+    repository = (
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
+    )
+    assert requests == [repository + "Packages.gz"] + (
+        [] if failure == "missing" else [repository + "headers.deb"]
     )
 
 

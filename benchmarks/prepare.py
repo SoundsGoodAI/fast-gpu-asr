@@ -38,8 +38,9 @@ def parse_args() -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        Dataset root, scorer checkout, output path, measured pass count, and each
-        model's checkpoint path and immutable Hugging Face revision.
+        Dataset root, scorer checkout, output path, measured pass count, selected
+        models, and their checkpoint paths and immutable Hugging Face revisions.
+        All models are selected by default; unselected inputs are optional.
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -58,22 +59,44 @@ def parse_args() -> argparse.Namespace:
         default=PROTOCOL["passes"],
         help="Positive measured pass count per configuration, frozen in the campaign.",
     )
+    parser.add_argument(
+        "--models",
+        choices=MODELS,
+        type=str,
+        nargs="+",
+        default=list(MODELS),
+        help="Models to freeze; defaults to all supported models.",
+    )
 
     for name in MODELS:
         parser.add_argument(
-            f"--{name}", type=Path, required=True, help=f"Local {name} checkpoint."
+            f"--{name}",
+            type=Path,
+            help=f"Local checkpoint; required when selecting {name}.",
         )
         parser.add_argument(
-            f"--{name}-revision", required=True, help="Full Hugging Face commit SHA."
+            f"--{name}-revision",
+            type=str,
+            help=f"Full Hugging Face commit SHA; required when selecting {name}.",
         )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if len(args.models) != len(set(args.models)):
+        parser.error("Duplicate models are not allowed.")
+    for name in args.models:
+        if getattr(args, name) is None:
+            parser.error(f"--{name} is required when selecting {name}.")
+        if getattr(args, f"{name}_revision") is None:
+            parser.error(f"--{name}-revision is required when selecting {name}.")
+
+    return args
 
 
 def main() -> None:
     """Verify inputs and write a new campaign only after preparation succeeds.
 
     The scorer checkout is verified before reading checkpoints and datasets.
+    Only selected models are verified and saved in the campaign.
     Checkpoints must retain their repository-root filenames and match full,
     lowercase Hugging Face commit SHAs. Zipformer additionally requires adjacent
     ``config.yaml`` and ``bpe.model`` files. Large LFS checkpoints are hashed
@@ -113,7 +136,8 @@ def main() -> None:
         "datasets": {},
     }
 
-    for name, repo in MODELS.items():
+    for name in args.models:
+        repo = MODELS[name]
         path = getattr(args, name)
         revision = getattr(args, f"{name}_revision")
         if fullmatch(r"[0-9a-f]{40}", revision) is None:

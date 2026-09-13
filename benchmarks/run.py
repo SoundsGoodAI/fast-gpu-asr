@@ -16,7 +16,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from platform import python_version
-from re import search
+from re import fullmatch
 from shutil import rmtree
 from sys import executable
 from traceback import format_exc
@@ -27,7 +27,7 @@ from .collect import check_gpu, nvidia_query
 from .common import (
     BATCHES,
     BEAMS,
-    GPUS,
+    GPU_LABEL_PATTERN,
     MODELS,
     PRECISIONS,
     PROTOCOL,
@@ -46,8 +46,9 @@ def parse_args() -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        Validated matrix selection, defaulting to all configured batch capacities
-        on every GPU. Use --batches to restrict the sweep explicitly.
+        Validated matrix selection, defaulting to all supported models, precisions,
+        and batch capacities on the selected GPU. Checkpoint paths are required
+        only for selected models.
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -55,9 +56,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets-root", type=Path, required=True)
     parser.add_argument("--scorer", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--gpu", choices=GPUS, required=True)
-    parser.add_argument("--device-id", type=int, default=0)
-    parser.add_argument("--models", choices=MODELS, nargs="+", default=list(MODELS))
+    parser.add_argument(
+        "--gpu",
+        type=str,
+        required=True,
+        help="Report label using letters, digits, underscores, or hyphens.",
+    )
+    parser.add_argument(
+        "--device-id", type=int, default=0, help="Physical GPU index from nvidia-smi."
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        choices=MODELS,
+        nargs="+",
+        default=list(MODELS),
+        help="Models to benchmark; each must be present in the prepared campaign.",
+    )
     parser.add_argument(
         "--batches",
         choices=BATCHES,
@@ -75,10 +90,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     for model in MODELS:
-        parser.add_argument(f"--{model}", type=Path, required=True)
+        parser.add_argument(
+            f"--{model}", type=Path, help=f"Required when selecting {model}."
+        )
 
     args = parser.parse_args()
 
+    if fullmatch(GPU_LABEL_PATTERN, args.gpu) is None:
+        parser.error(
+            "--gpu must start with a letter or digit and contain only letters, "
+            "digits, underscores, or hyphens."
+        )
     if args.batches is None:
         args.batches = list(BATCHES)
     if args.device_id < 0:
@@ -86,6 +108,9 @@ def parse_args() -> argparse.Namespace:
     for option in (args.models, args.batches, args.precisions):
         if len(option) != len(set(option)):
             parser.error("Duplicate models, batches, or precisions are not allowed.")
+    for model in args.models:
+        if getattr(args, model) is None:
+            parser.error(f"--{model} is required when selecting {model}.")
 
     return args
 
@@ -120,7 +145,8 @@ def main() -> None:
 
     Existing output is refused; retries require a new run root. The matrix file
     records even configurations not reached after interruption. Campaign/source
-    changes abort the matrix. Checkpoints and sidecars are hashed before launch
+    changes abort the matrix. Selected models must be present in the campaign.
+    Their checkpoints and sidecars are hashed before launch
     and again after each export, outside inference timing.
     Export arguments use the shared protocol, model-specific beam width, and the
     same requested precision for both engines, retaining exporter math defaults.
@@ -143,11 +169,11 @@ def main() -> None:
 
     campaign = load_campaign(args.campaign, check_source=True)
     for model in args.models:
+        if model not in campaign["models"]:
+            raise ValueError(f"Selected model {model} is not in the prepared campaign.")
         check_checkpoint(getattr(args, model), campaign["models"][model]["files"])
 
     gpu = nvidia_query("gpu", "name,uuid", str(args.device_id))[0]
-    if search(rf"\b{args.gpu}\b", gpu[0]) is None:
-        raise ValueError(f"Requested {args.gpu}, found {gpu[0]}.")
     check_gpu(gpu[1])
 
     fields = (

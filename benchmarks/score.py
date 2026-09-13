@@ -16,12 +16,13 @@ import statistics
 import tempfile
 from math import isfinite
 from pathlib import Path
+from re import fullmatch
 
 from .common import (
     BATCHES,
     BEAMS,
     DATASETS,
-    GPUS,
+    GPU_LABEL_PATTERN,
     MODELS,
     PRECISIONS,
     JSONValue,
@@ -151,7 +152,8 @@ def main() -> None:
         raise ValueError("Run belongs to a different campaign.")
     if (
         spec["model"] not in MODELS
-        or spec["gpu"] not in GPUS
+        or not isinstance(spec["gpu"], str)
+        or fullmatch(GPU_LABEL_PATTERN, spec["gpu"]) is None
         or spec["precision"] not in PRECISIONS
         or not isinstance(spec["batch_size"], int)
         or spec["batch_size"] not in BATCHES

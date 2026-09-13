@@ -380,7 +380,9 @@ def test_invalid_collection_is_rejected_before_loading_scorer(
     (
         ("campaign_id", "other", "different campaign"),
         ("model", "unknown", "benchmark matrix"),
-        ("gpu", "unknown", "benchmark matrix"),
+        ("gpu", "../outside", "benchmark matrix"),
+        ("gpu", "", "benchmark matrix"),
+        ("gpu", 6000, "benchmark matrix"),
         ("precision", "int8", "benchmark matrix"),
         ("batch_size", 3, "benchmark matrix"),
         ("batch_size", 2.0, "benchmark matrix"),
@@ -400,6 +402,19 @@ def test_invalid_run_configuration_is_rejected(
         score.main()
     scoring_run.loader.assert_not_called()
     assert not (scoring_run.directory / "result.json").exists()
+
+
+@pytest.mark.parametrize("gpu", ("T4", "RTX_PRO_6000"))
+def test_custom_gpu_labels_are_preserved(scoring_run, gpu):
+    path = scoring_run.directory / "run.json"
+    spec = json.loads(path.read_text())
+    spec["gpu"] = gpu
+    write_json(path, spec)
+    score.main()
+    result = json.loads((scoring_run.directory / "result.json").read_text())
+    assert result["status"] == "complete"
+    assert result["spec"]["gpu"] == gpu
+    assert result["spec"]["gpu_uuid"] == result["hardware"]["gpu"]["uuid"] == "GPU-test"
 
 
 @pytest.mark.parametrize("name", ("bundle-hashes", "plugin-hashes"))

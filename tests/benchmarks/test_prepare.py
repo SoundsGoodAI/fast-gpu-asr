@@ -509,11 +509,31 @@ def test_freeze_rejects_noninteger_chunk_index(
     assert not campaign_run.output.exists()
 
 
+@pytest.mark.parametrize(
+    "models",
+    (
+        None,
+        ("parakeet_v3",),
+        ("zipformer_cr_ctc_rnnt",),
+        ("parakeet_v3", "zipformer_cr_ctc_rnnt"),
+    ),
+)
 def test_main_writes_loadable_campaign(
-    campaign_run: SimpleNamespace, checkpoints: SimpleNamespace
+    campaign_run: SimpleNamespace, checkpoints: SimpleNamespace, models
 ) -> None:
+    selected = list(REVISIONS) if models is None else list(models)
+    if models is not None:
+        sys.argv.extend(("--models", *models))
+    for name, path in checkpoints.paths.items():
+        if name not in selected:
+            for option in (f"--{name}", f"--{name}-revision"):
+                index = sys.argv.index(option)
+                del sys.argv[index : index + 2]
+            for file in path.parent.iterdir():
+                file.unlink()
     prepare.main()
     campaign = common.load_campaign(campaign_run.output)
+    assert list(campaign["models"]) == selected
     assert campaign["source"] == campaign_run.source.return_value
     assert "scorer_revision" not in campaign
     assert campaign["models"] == {
@@ -530,17 +550,55 @@ def test_main_writes_loadable_campaign(
             },
         }
         for name, path in checkpoints.paths.items()
+        if name in selected
     }
     campaign_run.upstream.assert_called_once_with(campaign_run.scorer)
     assert campaign_run.source.call_args_list == [call(), call()]
     assert checkpoints.query.call_args_list == [
         call(
-            f"https://huggingface.co/api/models/{repo}/revision/{REVISIONS[name]}?blobs=true",
+            f"https://huggingface.co/api/models/{common.MODELS[name]}"
+            f"/revision/{REVISIONS[name]}?blobs=true",
             timeout=60,
         )
-        for name, repo in common.MODELS.items()
+        for name in selected
     ]
     assert not campaign_run.output.with_suffix(".json.tmp").exists()
+
+
+@pytest.mark.parametrize("selected_only", (False, True))
+@pytest.mark.parametrize("option", ("--parakeet_v3", "--parakeet_v3-revision"))
+def test_selected_models_require_checkpoint_and_revision(
+    campaign_run, checkpoints, capsys, selected_only, option
+):
+    if selected_only:
+        sys.argv.extend(("--models", "parakeet_v3"))
+    index = sys.argv.index(option)
+    del sys.argv[index : index + 2]
+    with pytest.raises(SystemExit) as error:
+        prepare.main()
+    assert error.value.code == 2
+    assert f"{option} is required when selecting parakeet_v3" in capsys.readouterr().err
+    checkpoints.query.assert_not_called()
+    campaign_run.upstream.assert_not_called()
+    assert not campaign_run.output.exists()
+
+
+@pytest.mark.parametrize(
+    "models,message",
+    (
+        ([], "expected at least one argument"),
+        (["unknown"], "invalid choice"),
+        (["parakeet_v3", "parakeet_v3"], "Duplicate models"),
+    ),
+)
+def test_prepare_rejects_invalid_model_selection(campaign_run, capsys, models, message):
+    sys.argv.extend(("--models", *models))
+    with pytest.raises(SystemExit) as error:
+        prepare.main()
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+    campaign_run.upstream.assert_not_called()
+    assert not campaign_run.output.exists()
 
 
 def test_main_refuses_existing_campaign(campaign_run: SimpleNamespace) -> None:

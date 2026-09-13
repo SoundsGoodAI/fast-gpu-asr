@@ -192,12 +192,23 @@ def matrix_run(
 
 
 @pytest.mark.parametrize("discard", (False, True))
+@pytest.mark.parametrize(
+    "models",
+    (tuple(MODELS), ("zipformer_cr_ctc_rnnt", "parakeet_v3"), ("parakeet_v3",)),
+)
 def test_matrix_runs_all_stages_in_order(
-    matrix_run: SimpleNamespace, discard: bool
+    matrix_run: SimpleNamespace, discard: bool, models: tuple[str, ...]
 ) -> None:
     args = matrix_run.args
-    args.models, args.precisions, args.batches = list(MODELS), list(PRECISIONS), [1, 2]
+    args.models, args.precisions, args.batches = list(models), list(PRECISIONS), [1, 2]
     args.discard_engines = discard
+    for model in MODELS:
+        if model not in models:
+            setattr(args, model, None)
+            del matrix_run.campaign["models"][model]
+            path = matrix_run.checkpoints.pop(model)
+            for file in path.parent.iterdir():
+                file.unlink()
 
     run.main()
 
@@ -444,12 +455,36 @@ def test_existing_output_is_preserved(matrix_run: SimpleNamespace) -> None:
     matrix_run.process.assert_not_called()
 
 
-def test_wrong_gpu_is_rejected(matrix_run: SimpleNamespace) -> None:
-    run.nvidia_query.side_effect = [[["NVIDIA H200", GPU]]]
-    with pytest.raises(ValueError, match="Requested H100, found NVIDIA H200"):
+def test_selected_model_must_be_in_campaign(matrix_run: SimpleNamespace) -> None:
+    del matrix_run.campaign["models"]["zipformer_rnnt"]
+    with pytest.raises(
+        ValueError, match="zipformer_rnnt is not in the prepared campaign"
+    ):
         run.main()
+    run.nvidia_query.assert_not_called()
     matrix_run.process.assert_not_called()
     assert not matrix_run.output.exists()
+
+
+def test_gpu_label_does_not_override_device_selection(
+    matrix_run: SimpleNamespace,
+) -> None:
+    matrix_run.args.gpu = "RTX_PRO_6000"
+    matrix_run.args.device_id = 2
+    name = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    run.nvidia_query.side_effect = [
+        [[name, GPU]],
+        [[name, GPU, "98304", "580", "[N/A]", "Default", "Disabled"]],
+    ]
+    run.main()
+    assert run.nvidia_query.call_args_list[0] == call("gpu", "name,uuid", "2")
+    directory = matrix_run.output / "RTX_PRO_6000-zipformer_rnnt-fp16-b1"
+    result = json.loads((directory / "result.json").read_text())
+    assert result["status"] == "complete"
+    assert result["spec"]["gpu"] == "RTX_PRO_6000"
+    assert result["spec"]["gpu_uuid"] == result["hardware"]["gpu"]["uuid"] == GPU
+    assert result["hardware"]["gpu"]["name"] == name
+    assert matrix_run.process.call_count == 3
 
 
 def test_gpu_contention_before_export_is_recorded(matrix_run: SimpleNamespace) -> None:
@@ -470,12 +505,60 @@ def test_gpu_contention_before_export_is_recorded(matrix_run: SimpleNamespace) -
     )
 
 
-@pytest.mark.parametrize("gpu", GPUS)
+@pytest.mark.parametrize("gpu", (*GPUS, "T4", "RTX_PRO_6000"))
 def test_default_batches_include_full_grid(cli: list[str], gpu: str) -> None:
     index = cli.index("--batches")
     del cli[index : index + 2]
     cli[cli.index("--gpu") + 1] = gpu
     assert run.parse_args().batches == list(BATCHES)
+
+
+@pytest.mark.parametrize(
+    "models",
+    (("zipformer_rnnt",), ("parakeet_v3",), ("zipformer_cr_ctc_rnnt", "parakeet_v3")),
+)
+def test_only_selected_checkpoint_paths_are_required(cli, models):
+    cli.extend(("--models", *models))
+    for model in MODELS:
+        if model not in models:
+            index = cli.index(f"--{model}")
+            del cli[index : index + 2]
+    args = run.parse_args()
+    assert args.models == list(models)
+    for model in MODELS:
+        assert (getattr(args, model) is not None) == (model in models)
+
+
+def test_default_models_include_all_checkpoints(cli):
+    index = cli.index("--models")
+    del cli[index : index + 2]
+    assert run.parse_args().models == list(MODELS)
+
+
+@pytest.mark.parametrize("selected_only", (False, True))
+def test_missing_selected_checkpoint_is_rejected(cli, capsys, selected_only):
+    if selected_only:
+        cli.extend(("--models", "parakeet_v3"))
+    else:
+        index = cli.index("--models")
+        del cli[index : index + 2]
+    index = cli.index("--parakeet_v3")
+    del cli[index : index + 2]
+    with pytest.raises(SystemExit) as error:
+        run.parse_args()
+    assert error.value.code == 2
+    assert "--parakeet_v3 is required" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "gpu", ("", "../outside", "GPU/0", "GPU\\0", "GPU|0", "GPU\n0")
+)
+def test_invalid_gpu_labels_are_rejected(cli, capsys, gpu):
+    cli[cli.index("--gpu") + 1] = gpu
+    with pytest.raises(SystemExit) as error:
+        run.parse_args()
+    assert error.value.code == 2
+    assert "--gpu must start" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

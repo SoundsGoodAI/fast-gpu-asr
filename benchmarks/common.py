@@ -49,7 +49,9 @@ BEAMS = {
     "parakeet_v2": 6,
     "parakeet_v3": 6,
 }
+# Preferred report order, not a whitelist of devices.
 GPUS = ("A100", "H100", "H200", "B200", "B300")
+GPU_LABEL_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]*"
 BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 PRECISIONS = ("fp32", "fp16", "bf16")
 PROTOCOL = {
