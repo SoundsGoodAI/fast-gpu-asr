@@ -10,7 +10,6 @@ from typing import cast
 from unittest.mock import Mock
 
 import cupy as cp
-import cupyx as cpx
 import numpy as np
 import pytest
 import tensorrt as trt
@@ -21,7 +20,6 @@ from fast_gpu_asr.constants import (
     TDT_BEAM_SEARCH_CHUNK_STEPS,
     TDT_BEAM_SEARCH_THREADS,
     TDT_HISTORY_CACHE_SIZE,
-    TDT_PREPARE_INPUTS_THREADS,
     TDT_SELECT_TOKENS_THREADS,
 )
 from fast_gpu_asr.decoder import parakeet_tdt_decoder
@@ -29,10 +27,14 @@ from fast_gpu_asr.decoder.gpu_kernels import (
     HISTORY_HELPERS_SOURCE,
     TDT_BEAM_SEARCH_KERNEL,
     TDT_FINALIZE_KERNEL,
+    TDT_GROUP_KERNEL,
     TDT_PREPARE_INPUTS_KERNEL,
+    TDT_SELECT_GROUPS_KERNEL,
     TDT_SELECT_TOKENS_KERNEL,
 )
-from fast_gpu_asr.decoder.parakeet_tdt_decoder import ParakeetModifiedBeamSearchDecoder
+from fast_gpu_asr.decoder.parakeet_tdt_decoder import (
+    ParakeetModifiedBeamSearchDecoder,
+)
 from fast_gpu_asr.utils import ASRInferenceError, ASRInitializationError
 
 PARAKEET_SEARCH_BUFFER_PAIRS = (
@@ -72,7 +74,7 @@ def expected_token_selection_shared_memory_bytes(vocab_size: int, threads: int) 
 def expected_beam_search_shared_memory_bytes(
     beam: int, duration_count: int, positive_duration_count: int, threads: int
 ) -> int:
-    """Return storage for candidates, bucket links, reductions, and selected pairs.
+    """Return storage for merged scores, reductions, and selected pairs.
 
     Parameters
     ----------
@@ -92,11 +94,70 @@ def expected_beam_search_shared_memory_bytes(
     """
 
     candidate_count = beam * (duration_count * beam + positive_duration_count)
-    bucket_count = 1 << ((candidate_count - 1) // 2).bit_length()
+    return candidate_count * np.dtype(np.float32).itemsize + (threads // 32 + beam) * (
+        np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
+    )
 
-    return bucket_count * np.dtype(np.int32).itemsize + (
-        candidate_count + threads // 32 + beam
-    ) * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
+
+def launch_tdt_candidates(decoder: ParakeetModifiedBeamSearchDecoder) -> None:
+    """Group and select prepared hypotheses on the current stream without TensorRT.
+
+    Parameters
+    ----------
+    decoder : ParakeetModifiedBeamSearchDecoder
+        Initialized candidate buffers, search state, scores, and token shortlists.
+        Both kernels write their results into ``decoder.candidates``.
+    """
+
+    TDT_GROUP_KERNEL(
+        (decoder.batch_size,),
+        (decoder.beam_search_threads,),
+        (
+            decoder.token_log_probs,
+            decoder.duration_log_probs,
+            decoder.hypothesis_scores,
+            decoder.hypothesis_nodes,
+            decoder.hypothesis_hashes,
+            decoder.hypothesis_lengths,
+            decoder.time_indexes,
+            decoder.symbols_at_timestep,
+            decoder.search_output_lengths,
+            decoder.durations_array,
+            decoder.positive_duration_indexes_array,
+            decoder.node_parents,
+            decoder.node_tokens,
+            decoder.runtime_dimensions,
+            *decoder.candidate_groups,
+            *decoder.candidate_blanks,
+            *decoder.candidates,
+            decoder.history_cache,
+            np.int32(decoder.beam),
+            np.int32(decoder.blank_id),
+            np.int32(decoder.durations_array.size),
+            np.int32(decoder.positive_duration_indexes_array.size),
+            np.int32(decoder.max_symbols_per_timestep),
+            np.float32(decoder.blank_penalty),
+            np.int32(TDT_HISTORY_CACHE_SIZE),
+        ),
+        shared_mem=decoder.group_shared_memory_bytes,
+    )
+    TDT_SELECT_GROUPS_KERNEL(
+        (decoder.batch_size * decoder.beam * decoder.durations_array.size,),
+        (decoder.beam_search_threads,),
+        (
+            decoder.token_log_probs,
+            decoder.top_token_scores,
+            decoder.top_token_indexes,
+            *decoder.candidate_groups,
+            *decoder.candidate_blanks,
+            *decoder.candidates,
+            np.int32(decoder.beam),
+            np.int32(decoder.blank_id),
+            np.int32(decoder.durations_array.size),
+            np.int32(decoder.positive_duration_indexes_array.size),
+        ),
+        shared_mem=decoder.group_selection_shared_memory_bytes,
+    )
 
 
 @pytest.mark.cuda
@@ -197,8 +258,8 @@ def test_parakeet_prepare_inputs_converts_precision(
     decoder_dtype_code: np.int32,
     unaligned_buffer: str | None,
 ) -> None:
-    encoder_output = (
-        cp.arange(16, dtype=cp.float32).reshape(1, 2, 8).astype(encoder_dtype)
+    encoder_output = (cp.arange(16, dtype=cp.float32).reshape(1, 2, 8) / 7 - 1).astype(
+        encoder_dtype
     )
     encoder_input = cp.full((2, 8), -1.0, dtype=decoder_dtype)
     if unaligned_buffer is not None:
@@ -237,7 +298,7 @@ def test_parakeet_prepare_inputs_converts_precision(
 
     np.testing.assert_array_equal(
         encoder_input[0].astype(cp.float32).get(),
-        encoder_output[0, 1].astype(cp.float32).get(),
+        encoder_output[0, 1].astype(decoder_dtype).astype(cp.float32).get(),
     )
     np.testing.assert_array_equal(
         encoder_input[1].astype(cp.float32).get(), np.zeros(8, dtype=np.float32)
@@ -252,8 +313,9 @@ def make_fake_parakeet_decoder(
     state_dtype: np.dtype | None = None,
     state_hidden_dim: int = 3,
     state_layers: int = 1,
+    vocab_size: int = 2,
 ) -> ParakeetModifiedBeamSearchDecoder:
-    """Create a Parakeet decoder without loading TensorRT.
+    """Initialize real GPU buffers using a fake TensorRT engine.
 
     Parameters
     ----------
@@ -269,119 +331,50 @@ def make_fake_parakeet_decoder(
         Width of each recurrent-state vector.
     state_layers : int
         Number of recurrent-state layers.
+    vocab_size : int
+        Number of nonblank tokens.
 
     Returns
     -------
     ParakeetModifiedBeamSearchDecoder
-        Decoder with CUDA search buffers initialized and no TensorRT context.
+        Decoder initialized through its real constructor, with FP32 encoder
+        inputs and a recording TensorRT context that does not execute inference.
+
+    Notes
+    -----
+    Runtime tests install a scripted context afterward. Graph capture is disabled
+    unless a test explicitly enables it, since callbacks may inspect GPU arrays
+    on the CPU. Only engine loading is patched; GPU allocation remains real.
     """
 
-    if state_dtype is None:
-        state_dtype = np.dtype(np.float32)
-
-    decoder = ParakeetModifiedBeamSearchDecoder.__new__(
-        ParakeetModifiedBeamSearchDecoder
-    )
-    decoder.device = cp.cuda.Device(0)
-    decoder.batch_size = batch_size
-    decoder.beam = beam
-    decoder.decoder_capacity = batch_size * beam
-    decoder.encoder_dim = 3
-    decoder.blank_id = 2
-    decoder.durations_array = cp.array(durations, dtype=np.int32)
-    decoder.positive_duration_indexes_array = cp.array(
-        [index for index, duration in enumerate(durations) if duration > 0],
-        dtype=np.int32,
-    )
-    decoder.max_symbols_per_timestep = 10
-    decoder.encoder_frame_shift_sec = 0.08
-    decoder.blank_penalty = 0.0
-    decoder.state_layers = state_layers
-    decoder.state_hidden_dim = state_hidden_dim
-    decoder.kernel_dtype_map = {
-        np.dtype(np.float32): np.int32(0),
-        np.dtype(np.float16): np.int32(1),
-        cp.dtype("bfloat16"): np.int32(2),
+    state_trt_dtype = {
+        np.dtype(np.float32): trt.float32,
+        np.dtype(np.float16): trt.float16,
+        cp.dtype("bfloat16"): trt.bfloat16,
+    }[np.dtype(np.float32) if state_dtype is None else state_dtype]
+    engine = FakeParakeetEngine(RecordingParakeetContext(), state_dtype=state_trt_dtype)
+    capacity = batch_size * beam
+    engine.shapes = {
+        "encoder_output": (capacity, 3),
+        "targets": (capacity, 1),
+        "input_states_1": (state_layers, capacity, state_hidden_dim),
+        "token_log_probs": (capacity, vocab_size + 1),
+        "duration_log_probs": (capacity, len(durations)),
     }
-    decoder.state_dtype = decoder.kernel_dtype_map[state_dtype]
-    decoder.encoder_input_dtype = np.int32(0)
-    decoder.prepare_inputs_threads = TDT_PREPARE_INPUTS_THREADS
-    decoder.token_selection_threads = TDT_SELECT_TOKENS_THREADS
-    decoder.beam_search_threads = TDT_BEAM_SEARCH_THREADS
-    decoder.stream = cp.cuda.get_current_stream()
-    decoder.beam_search_shared_memory_bytes = expected_beam_search_shared_memory_bytes(
-        beam,
-        decoder.durations_array.size,
-        decoder.positive_duration_indexes_array.size,
-        decoder.beam_search_threads,
-    )
-    decoder.token_selection_shared_memory_bytes = (
-        expected_token_selection_shared_memory_bytes(
-            decoder.blank_id, decoder.token_selection_threads
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
+        decoder = ParakeetModifiedBeamSearchDecoder(
+            Path("decoder.trt"),
+            batch_size=batch_size,
+            blank_id=vocab_size,
+            durations=durations,
+            max_symbols_per_timestep=10,
+            encoder_frame_shift_sec=0.08,
+            blank_penalty=0.0,
+            device_id=0,
+            stream=cp.cuda.get_current_stream(),
         )
-    )
-    decoder.cuda_graph = None
-    decoder.cuda_graph_signature = None
     decoder.cuda_graph_supported = False
-
-    capacity = decoder.decoder_capacity
-    search_shape = (batch_size, beam)
-    decoder.encoder_input = cp.empty((capacity, 3), dtype=np.float32)
-    decoder.targets = cp.empty((capacity, 1), dtype=np.int32)
-    decoder.state_1 = cp.empty(
-        (state_layers, capacity, state_hidden_dim), dtype=state_dtype
-    )
-    decoder.state_2 = cp.empty(
-        (state_layers, capacity, state_hidden_dim), dtype=state_dtype
-    )
-    decoder.token_log_probs = cp.empty(
-        (capacity, decoder.blank_id + 1), dtype=np.float32
-    )
-    decoder.duration_log_probs = cp.empty((capacity, len(durations)), dtype=np.float32)
-    decoder.output_state_1 = cp.empty_like(decoder.state_1)
-    decoder.output_state_2 = cp.empty_like(decoder.state_2)
-    decoder.next_state_1 = cp.empty_like(decoder.state_1)
-    decoder.next_state_2 = cp.empty_like(decoder.state_2)
-    decoder.hypothesis_scores = cp.empty(search_shape, dtype=np.float32)
-    decoder.next_scores = cp.empty_like(decoder.hypothesis_scores)
-    decoder.hypothesis_lengths = cp.empty(search_shape, dtype=np.int32)
-    decoder.next_lengths = cp.empty_like(decoder.hypothesis_lengths)
-    decoder.time_indexes = cp.empty(capacity, dtype=np.int32)
-    decoder.next_time_indexes = cp.empty_like(decoder.time_indexes)
-    decoder.last_tokens = cp.empty(capacity, dtype=np.int32)
-    decoder.next_last_tokens = cp.empty_like(decoder.last_tokens)
-    decoder.symbols_at_timestep = cp.empty(capacity, dtype=np.int32)
-    decoder.next_symbols_at_timestep = cp.empty_like(decoder.symbols_at_timestep)
-    decoder.parent_indexes = cp.empty(capacity, dtype=np.int32)
-    decoder.use_output_state = cp.empty(capacity, dtype=np.uint8)
-    decoder.search_output_lengths = cp.empty(batch_size, dtype=np.int32)
-    decoder.active_flags = cp.empty(batch_size, dtype=np.int32)
-    decoder.active_flags_host = cpx.empty_pinned(batch_size, dtype=np.int32)
-    decoder.runtime_dimensions = cp.empty(2, dtype=np.int32)
-    decoder.runtime_dimensions_host = cpx.empty_pinned(2, dtype=np.int32)
-    decoder.top_token_scores = cp.empty((capacity, beam), dtype=np.float32)
-    decoder.top_token_indexes = cp.empty((capacity, beam), dtype=np.int32)
-    decoder.completed_scores = cp.empty(batch_size, dtype=np.float32)
-    decoder.completed_lengths = cp.empty(batch_size, dtype=np.int32)
-    decoder.completed_nodes = cp.empty(batch_size, dtype=np.int32)
-    decoder.output_lengths = cp.empty(batch_size, dtype=np.int32)
-    decoder.output_lengths_host = cpx.empty_pinned(batch_size, dtype=np.int32)
-    decoder.token_capacity = 0
-    decoder.hypothesis_nodes = cp.empty(search_shape, dtype=np.int32)
-    decoder.next_nodes = cp.empty(search_shape, dtype=np.int32)
-    decoder.hypothesis_hashes = cp.empty(search_shape, dtype=np.uint64)
-    decoder.next_hashes = cp.empty(search_shape, dtype=np.uint64)
-    decoder.node_counts = cp.empty(batch_size, dtype=np.int32)
-    decoder.history_cache = cp.empty(
-        (batch_size, TDT_HISTORY_CACHE_SIZE), dtype=np.uint64
-    )
-    decoder.node_parents = None
-    decoder.node_tokens = None
-    decoder.node_timestamps = None
-    decoder.output_tokens = None
-    decoder.output_timestamps = None
-    decoder.output_tokens_host = None
-    decoder.output_timestamps_host = None
     return decoder
 
 
@@ -496,13 +489,17 @@ def install_static_decoder_context(
     -------
     RuntimeDecoderContext
         Installed callback-backed TensorRT execution context.
+
+    Notes
+    -----
+    Scores are preallocated on the GPU so the callback works during graph capture.
     """
 
     token_scores_array = cp.array(token_scores, dtype=np.float32)
     duration_scores_array = cp.array(duration_scores, dtype=np.float32)
 
     def execute(_call: int) -> bool:
-        """Write fixed scores and preserve recurrent state for one step.
+        """Write fixed scores and zero recurrent states for one step.
 
         Parameters
         ----------
@@ -517,8 +514,8 @@ def install_static_decoder_context(
 
         decoder.token_log_probs[...] = token_scores_array
         decoder.duration_log_probs[...] = duration_scores_array
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     context = RuntimeDecoderContext(decoder, execute)
@@ -624,8 +621,8 @@ def test_parakeet_decoder_restores_buffers_after_execution_failure() -> None:
             return False
         decoder.token_log_probs[...] = cp.array([[-10.0, 0.0, -2.0]], dtype=np.float32)
         decoder.duration_log_probs[...] = cp.array([[0.0, -10.0]], dtype=np.float32)
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
@@ -746,8 +743,8 @@ def test_parakeet_decoder_timestamps_token_after_blank_advance() -> None:
         else:
             decoder.token_log_probs[:, 1] = 0.0
             decoder.duration_log_probs[:, 1] = 0.0
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
@@ -783,8 +780,8 @@ def test_parakeet_decoder_does_not_leak_history_across_calls() -> None:
         decoder.token_log_probs[:, 1 if emit_token else decoder.blank_id] = 0.0
         decoder.duration_log_probs.fill(-10.0)
         decoder.duration_log_probs[:, 1] = 0.0
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
@@ -822,8 +819,8 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
         encoder_inputs.append(decoder.encoder_input.get())
         decoder.token_log_probs[...] = cp.array([[-10.0, 0.0, -2.0]], dtype=np.float32)
         decoder.duration_log_probs[...] = cp.array([[-10.0, 0.0]], dtype=np.float32)
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
@@ -841,13 +838,19 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
 def test_parakeet_decoder_clamps_runtime_output_lengths() -> None:
     decoder = make_fake_parakeet_decoder(batch_size=2)
     install_static_decoder_context(decoder, [-10.0, 0.0, -2.0], [-10.0, 0.0])
-    token_ids, timestamps = decoder(
-        cp.zeros((2, 2, 3), dtype=np.float32), cp.array([-1, 10], dtype=np.int32)
-    )
+    encoder_output = cp.zeros((2, 2, 3), dtype=np.float32)
+    output_lengths = cp.array([-1, 10], dtype=np.int32)
+    token_ids, timestamps = decoder(encoder_output, output_lengths)
 
     assert token_ids == [[], [1, 1]]
     assert timestamps[0] == []
     np.testing.assert_allclose(timestamps[1], [0.0, 0.08])
+
+    decoder.output_tokens.fill(-1)
+    decoder.output_timestamps.fill(np.nan)
+    repeated_tokens, repeated_timestamps = decoder(encoder_output, output_lengths)
+    assert repeated_tokens == token_ids
+    assert repeated_timestamps == timestamps
 
 
 @pytest.mark.cuda
@@ -879,8 +882,8 @@ def test_parakeet_decoder_clears_inactive_partial_batch_inputs() -> None:
         decoder.token_log_probs[:, decoder.blank_id] = 0.0
         decoder.duration_log_probs.fill(-10.0)
         decoder.duration_log_probs[:, 1] = 0.0
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     context = RuntimeDecoderContext(decoder, execute)
@@ -969,12 +972,13 @@ def test_parakeet_decoder_routes_recurrent_state_by_emission(
             Always ``True`` after writing scores and replacement states.
         """
 
-        state_snapshots.append(
-            (
-                decoder.state_1.astype(cp.float32).get(),
-                decoder.state_2.astype(cp.float32).get(),
+        if call < 3:
+            state_snapshots.append(
+                (
+                    decoder.state_1.astype(cp.float32).get(),
+                    decoder.state_2.astype(cp.float32).get(),
+                )
             )
-        )
         decoder.token_log_probs.fill(-10.0)
         decoder.duration_log_probs.fill(-10.0)
         if call == 0:
@@ -987,14 +991,16 @@ def test_parakeet_decoder_routes_recurrent_state_by_emission(
         decoder.output_state_2[...] = state_values + 7.0 + call
         return True
 
-    decoder.decoder = RuntimeDecoderContext(decoder, execute)
+    context = RuntimeDecoderContext(decoder, execute)
+    decoder.decoder = context
     token_ids, timestamps = decoder(
         cp.zeros((1, 2, 3), dtype=np.float32), cp.array([2], dtype=np.int32)
     )
 
     assert token_ids == [[1]]
     np.testing.assert_allclose(timestamps, [[0.0]])
-    assert len(state_snapshots) == TDT_BEAM_SEARCH_CHUNK_STEPS
+    assert context.calls == TDT_BEAM_SEARCH_CHUNK_STEPS
+    assert len(state_snapshots) == 3
     np.testing.assert_array_equal(state_snapshots[0][0], 0.0)
     np.testing.assert_array_equal(state_snapshots[0][1], 0.0)
     expected_values = state_values.get()
@@ -1141,8 +1147,9 @@ def test_parakeet_decoder_keeps_batch_token_candidates_separate() -> None:
 
 
 @pytest.mark.cuda
-def test_parakeet_decoder_reuses_cuda_graph_across_frame_shapes() -> None:
-    decoder = make_fake_parakeet_decoder(batch_size=2)
+@pytest.mark.parametrize("beam", (1, 2))
+def test_parakeet_decoder_reuses_cuda_graph_across_frame_shapes(beam: int) -> None:
+    decoder = make_fake_parakeet_decoder(beam=beam, batch_size=2)
     decoder.cuda_graph_supported = True
     context = install_static_decoder_context(decoder, [-10.0, 0.0, -10.0], [-10.0, 0.0])
     encoder_output = cp.zeros((2, 20, 3), dtype=np.float32)
@@ -1208,8 +1215,8 @@ def test_parakeet_decoder_retries_after_capture_execution_failure() -> None:
         decoder.token_log_probs[:, 1] = 0.0
         decoder.duration_log_probs.fill(-10.0)
         decoder.duration_log_probs[:, 0] = 0.0
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         if cp.cuda.runtime.streamIsCapturing(decoder.stream.ptr):
             capture_calls += 1
             return capture_calls != 2
@@ -1265,8 +1272,8 @@ def test_parakeet_decoder_recovers_from_invalidated_cuda_capture() -> None:
         decoder.token_log_probs[:, 1] = 0.0
         decoder.duration_log_probs.fill(-10.0)
         decoder.duration_log_probs[:, 0] = 0.0
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         if cp.cuda.runtime.streamIsCapturing(decoder.stream.ptr):
             with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
                 cp.cuda.runtime.streamSynchronize(decoder.stream.ptr)
@@ -1387,8 +1394,8 @@ def test_parakeet_decoder_length_normalizes_completed_hypotheses() -> None:
         else:
             decoder.token_log_probs[:, 0] = 0.0
             decoder.duration_log_probs[:, 1] = -0.15
-        decoder.output_state_1[...] = decoder.state_1
-        decoder.output_state_2[...] = decoder.state_2
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
         return True
 
     decoder.decoder = RuntimeDecoderContext(decoder, execute)
@@ -1398,6 +1405,54 @@ def test_parakeet_decoder_length_normalizes_completed_hypotheses() -> None:
 
     assert token_ids == [[1, 0]]
     np.testing.assert_allclose(timestamps, [[0.0, 0.0]])
+
+
+@pytest.mark.cuda
+def test_parakeet_decoder_retains_winner_outside_parent_token_shortlists() -> None:
+    decoder = make_fake_parakeet_decoder(beam=2, durations=(1, 2), vocab_size=5)
+
+    def execute(call: int) -> bool:
+        """Converge two paths whose winning shared token ranks third in each.
+
+        Parameters
+        ----------
+        call : int
+            Zero-based decoder invocation index. The first step emits a common
+            prefix at two encoder positions; later steps make token four win
+            only after merging the paths across their different durations.
+
+        Returns
+        -------
+        bool
+            Always ``True`` after writing scores and zero recurrent states.
+        """
+
+        decoder.token_log_probs.fill(-np.inf)
+        decoder.duration_log_probs.fill(-np.inf)
+        if call == 0:
+            decoder.token_log_probs[:, 0] = 0
+            decoder.duration_log_probs.fill(np.log(0.5))
+        else:
+            decoder.token_log_probs[...] = cp.log(
+                cp.array(
+                    [[0.4, 0.35, 0, 0, 0.25, 0], [0, 0, 0.4, 0.35, 0.25, 0]],
+                    dtype=np.float32,
+                )
+            )
+            decoder.duration_log_probs[0, 1] = 0
+            decoder.duration_log_probs[1, 0] = 0
+        decoder.output_state_1.fill(0.0)
+        decoder.output_state_2.fill(0.0)
+        return True
+
+    decoder.decoder = RuntimeDecoderContext(decoder, execute)
+    tokens, timestamps = decoder(
+        cp.zeros((1, 3, 3), dtype=np.float32), cp.array([3], dtype=np.int32)
+    )
+
+    assert tokens == [[0, 4]]
+    np.testing.assert_allclose(timestamps, [[0.0, 0.08]])
+    np.testing.assert_allclose(decoder.completed_scores.get(), [np.log(0.25)])
 
 
 @pytest.mark.cuda
@@ -1461,7 +1516,7 @@ def make_beam_search_buffers(
     state_2 = cp.zeros_like(state_1)
     scores = cp.zeros(search_shape, dtype=np.float32)
     nodes = cp.full(search_shape, -1, dtype=np.int32)
-    hashes = cp.arange(1, beam + 1, dtype=np.uint64).reshape(search_shape)
+    hashes = cp.zeros(search_shape, dtype=np.uint64)
     lengths = cp.zeros(search_shape, dtype=np.int32)
     time_indexes = cp.zeros(beam, dtype=np.int32)
     last_tokens = cp.full(beam, blank_id, dtype=np.int32)
@@ -1522,14 +1577,15 @@ def make_beam_search_buffers(
 def run_beam_search(
     buffers: SimpleNamespace, threads: int = TDT_BEAM_SEARCH_THREADS
 ) -> None:
-    """Launch the TDT beam-search kernel for a prepared fixture.
+    """Select full-vocabulary candidates, then advance the prepared search state.
 
     Parameters
     ----------
     buffers : SimpleNamespace
         CUDA arrays and scalar metadata created by ``make_beam_search_buffers``.
     threads : int
-        Number of CUDA threads launched for the utterance.
+        Number of threads in the final beam-search block. Candidate-selection
+        kernels use the decoder's default thread counts.
     """
 
     duration_count = buffers.durations.size
@@ -1537,6 +1593,48 @@ def run_beam_search(
     shared_memory = expected_beam_search_shared_memory_bytes(
         buffers.beam, duration_count, positive_duration_count, threads
     )
+    decoder = make_fake_parakeet_decoder(
+        beam=buffers.beam,
+        durations=tuple(buffers.durations.get().tolist()),
+        vocab_size=buffers.blank_id,
+    )
+    TDT_SELECT_TOKENS_KERNEL(
+        (buffers.beam,),
+        (TDT_SELECT_TOKENS_THREADS,),
+        (
+            buffers.token_log_probs,
+            buffers.scores,
+            buffers.time_indexes,
+            buffers.output_lengths,
+            buffers.top_token_scores,
+            buffers.top_token_indexes,
+            np.int32(buffers.blank_id),
+            np.int32(buffers.beam),
+        ),
+        shared_mem=expected_token_selection_shared_memory_bytes(
+            buffers.blank_id, TDT_SELECT_TOKENS_THREADS
+        ),
+    )
+    decoder.token_log_probs = buffers.token_log_probs
+    decoder.duration_log_probs = buffers.duration_log_probs
+    decoder.top_token_scores = buffers.top_token_scores
+    decoder.top_token_indexes = buffers.top_token_indexes
+    decoder.hypothesis_scores = buffers.scores
+    decoder.hypothesis_nodes = buffers.nodes
+    decoder.hypothesis_hashes = buffers.hashes
+    decoder.hypothesis_lengths = buffers.lengths
+    decoder.time_indexes = buffers.time_indexes
+    decoder.symbols_at_timestep = buffers.symbols
+    decoder.search_output_lengths = buffers.output_lengths
+    decoder.durations_array = buffers.durations
+    decoder.positive_duration_indexes_array = buffers.positive_duration_indexes
+    decoder.node_parents = buffers.node_parents
+    decoder.node_tokens = buffers.node_tokens
+    decoder.runtime_dimensions = buffers.runtime_dimensions
+    decoder.history_cache = buffers.history_cache
+    decoder.max_symbols_per_timestep = 10
+    decoder.blank_penalty = 0.0
+    launch_tdt_candidates(decoder)
     with pytest.MonkeyPatch.context() as patch:
         if shared_memory > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
             patch.setattr(
@@ -1547,10 +1645,7 @@ def run_beam_search(
             (1,),
             (threads,),
             (
-                buffers.token_log_probs,
-                buffers.duration_log_probs,
-                buffers.top_token_scores,
-                buffers.top_token_indexes,
+                *decoder.candidates,
                 buffers.scores,
                 buffers.nodes,
                 buffers.hashes,
@@ -1577,7 +1672,6 @@ def run_beam_search(
                 buffers.active_flags,
                 buffers.output_lengths,
                 buffers.durations,
-                buffers.positive_duration_indexes,
                 buffers.state_1,
                 buffers.state_2,
                 buffers.output_state_1,
@@ -1600,10 +1694,7 @@ def run_beam_search(
                 np.int32(positive_duration_count),
                 np.int32(buffers.blank_id),
                 np.int32(10),
-                np.float32(0.0),
                 np.float32(0.08),
-                buffers.history_cache,
-                np.int32(TDT_HISTORY_CACHE_SIZE),
             ),
             shared_mem=shared_memory,
         )
@@ -1617,6 +1708,12 @@ def test_parakeet_beam_search_scans_beyond_first_thread_block() -> None:
 
     buffers.token_log_probs[:, buffers.blank_id] = 0.0
     buffers.token_log_probs[-1, buffers.blank_id] = 5.0
+    buffers.nodes[0] = cp.arange(beam, dtype=np.int32)
+    buffers.hashes[0] = cp.arange(1, beam + 1, dtype=np.uint64)
+    buffers.lengths.fill(1)
+    buffers.node_parents[:beam] = -1
+    buffers.node_tokens[:beam] = cp.arange(beam, dtype=np.int32)
+    buffers.node_counts.fill(beam)
     buffers.state_1 = cp.repeat(
         cp.arange(beam, dtype=np.float32)[None, :, None], 4, axis=2
     )
@@ -1632,14 +1729,14 @@ def test_parakeet_beam_search_scans_beyond_first_thread_block() -> None:
     assert buffers.use_output_state.get()[0] == 0
     np.testing.assert_array_equal(buffers.next_state_1.get()[0, 0], beam - 1)
     np.testing.assert_array_equal(buffers.next_state_2.get()[0, 0], beam + 99)
-    np.testing.assert_array_equal(buffers.node_counts.get(), [0])
+    np.testing.assert_array_equal(buffers.node_counts.get(), [beam])
     np.testing.assert_array_equal(buffers.active_flags.get(), [1])
 
 
 @pytest.mark.cuda
 def test_parakeet_beam_search_merges_duplicate_blank_histories() -> None:
     buffers = make_beam_search_buffers(2, (1,), token_stride=4, num_frames=2)
-    buffers.top_token_scores.fill(-np.inf)
+    buffers.token_log_probs.fill(-np.inf)
     buffers.token_log_probs[:, buffers.blank_id] = 0.0
     buffers.scores[...] = cp.array([[0.0, -0.2]], dtype=np.float32)
     buffers.hashes.fill(0)
@@ -1677,7 +1774,6 @@ def test_parakeet_beam_search_merges_before_pruning(
     parent_mass = masses_array.sum(axis=1)
     buffers.scores[...] = cp.log(cp.array([parent_mass / 0.9]))
     buffers.token_log_probs[...] = cp.log(cp.array([[0.07, 0.03, 0.9]] * 2))
-    buffers.top_token_scores[...] = buffers.token_log_probs[:, :2]
     buffers.duration_log_probs[...] = cp.log(
         cp.array(masses_array / parent_mass[:, None])
     )
@@ -1728,7 +1824,6 @@ def test_parakeet_beam_search_checks_history_after_hash_match(
     buffers = make_beam_search_buffers(
         2, (1,), token_stride=max(map(len, histories)) + 2, num_frames=2
     )
-    buffers.top_token_scores.fill(-np.inf)
     buffers.token_log_probs.fill(-np.inf)
     buffers.scores[...] = cp.array([[0, -0.2]], dtype=np.float32)
     parents, tokens, nodes, hashes = [], [], [], []
@@ -1743,8 +1838,7 @@ def test_parakeet_beam_search_checks_history_after_hash_match(
             buffers.token_log_probs[parent, buffers.blank_id] = 0
             hashes.append(1234)
         else:
-            buffers.top_token_indexes[parent, 0] = token
-            buffers.top_token_scores[parent, 0] = 0
+            buffers.token_log_probs[parent, token] = 0
             # Invert the rolling hash so every expanded candidate has hash 1234.
             hashes.append((1234 - token - 1) * pow(1099511628211, -1, 2**64) % 2**64)
     buffers.nodes[...] = cp.array([nodes], dtype=np.int32)
@@ -1851,7 +1945,7 @@ def reference_beam_candidates(
         Token history for each parent hypothesis, in buffer row order.
     buffers : SimpleNamespace
         Single-utterance fixture from ``make_beam_search_buffers``. Log scores,
-        selected tokens, search positions, and durations are copied to the CPU
+        full token vocabulary, search positions, and durations are copied to the CPU
         without modifying the fixture.
 
     Returns
@@ -1875,9 +1969,8 @@ def reference_beam_candidates(
 
     beam = buffers.beam
     scores = buffers.scores.get()[0]
-    token_scores = buffers.top_token_scores.get()
-    tokens = buffers.top_token_indexes.get()
-    blank_scores = buffers.token_log_probs.get()[:, buffers.blank_id]
+    token_scores = buffers.token_log_probs.get()
+    blank_scores = token_scores[:, buffers.blank_id]
     duration_scores = buffers.duration_log_probs.get()
     durations = buffers.durations.get().tolist()
     times = buffers.time_indexes.get()
@@ -1886,15 +1979,15 @@ def reference_beam_candidates(
     candidates = [
         (
             parent,
-            int(tokens[parent, rank]),
+            token,
             duration,
             scores[parent]
             + duration_scores[parent, duration_index]
-            + token_scores[parent, rank],
+            + token_scores[parent, token],
         )
         for parent in range(beam)
         for duration_index, duration in enumerate(durations)
-        for rank in range(beam)
+        for token in range(buffers.blank_id)
     ]
     candidates.extend(
         (
@@ -1964,12 +2057,7 @@ def test_parakeet_beam_search_matches_enumeration(beam: int) -> None:
         if trial % 2:
             buffers.scores[0, 1:] = -np.inf
         token_scores = rng.uniform(-10, 0, (beam, beam + 1)).astype(np.float32)
-        indexes = np.argsort(token_scores[:, :beam], axis=1)[:, ::-1]
         buffers.token_log_probs[...] = cp.array(token_scores)
-        buffers.top_token_indexes[...] = cp.array(indexes, dtype=np.int32)
-        buffers.top_token_scores[...] = cp.array(
-            np.take_along_axis(token_scores, indexes, axis=1)
-        )
         buffers.duration_log_probs[...] = cp.array(
             rng.uniform(-5, 0, (beam, 4)), dtype=np.float32
         )
@@ -2023,7 +2111,7 @@ def test_parakeet_beam_search_matches_enumeration(beam: int) -> None:
 @pytest.mark.parametrize("tied", [False, True])
 def test_parakeet_beam_search_merging_is_deterministic(tied: bool) -> None:
     buffers = make_beam_search_buffers(16, (1, 2, 3), 4, 2)
-    buffers.top_token_scores.fill(-np.inf)
+    buffers.token_log_probs.fill(-np.inf)
     buffers.hashes.fill(0)
     buffers.scores[...] = 0.0 if tied else cp.linspace(-10, 0, 16).reshape(1, 16)
     buffers.token_log_probs[:, buffers.blank_id] = 0.0
@@ -2052,25 +2140,9 @@ def test_parakeet_beam_search_merging_is_deterministic(tied: bool) -> None:
 
 
 @pytest.mark.cuda
-def test_parakeet_beam_search_preserves_bucket_collisions() -> None:
-    buffers = make_beam_search_buffers(2, (1,), 4, 2)
-    buffers.top_token_scores.fill(-np.inf)
-    buffers.token_log_probs[:, buffers.blank_id] = 0.0
-    # These fingerprints share a bucket in the four-bucket table, not a history.
-    buffers.hashes[...] = cp.array([[1, 5]], dtype=np.uint64)
-
-    run_beam_search(buffers)
-
-    np.testing.assert_array_equal(buffers.next_scores.get(), [[0.0, 0.0]])
-    np.testing.assert_array_equal(buffers.next_hashes.get(), [[1, 5]])
-    np.testing.assert_array_equal(buffers.parent_indexes.get(), [0, 1])
-
-
-@pytest.mark.cuda
 @pytest.mark.parametrize("score", [-np.inf, np.inf, np.nan])
 def test_parakeet_beam_search_discards_nonfinite_candidates(score: float) -> None:
     buffers = make_beam_search_buffers(2, (0, 1), 4, 2)
-    buffers.top_token_scores.fill(score)
     buffers.token_log_probs.fill(score)
 
     run_beam_search(buffers)
@@ -2087,11 +2159,14 @@ def test_parakeet_beam_search_preserves_distinct_active_symbol_counts() -> None:
     buffers.duration_log_probs[...] = cp.array(
         [[-100.0, 0.0], [0.0, -100.0]], dtype=np.float32
     )
-    buffers.top_token_scores[...] = cp.array(
-        [[0.0, -100.0], [-0.1, -100.0]], dtype=np.float32
+    buffers.token_log_probs[:, :2] = cp.array(
+        [[-100.0, 0.0], [-100.0, -0.1]], dtype=np.float32
     )
-    buffers.top_token_indexes[...] = cp.array([[1, 0], [1, 0]], dtype=np.int32)
-    buffers.hashes.fill(7)
+    buffers.hashes.fill(2)
+    buffers.nodes.fill(0)
+    buffers.node_parents[0] = -1
+    buffers.node_tokens[0] = 1
+    buffers.node_counts.fill(1)
     buffers.lengths.fill(1)
     buffers.time_indexes[...] = cp.array([0, 1], dtype=np.int32)
     buffers.last_tokens.fill(1)
@@ -2110,6 +2185,423 @@ def test_parakeet_beam_search_preserves_distinct_active_symbol_counts() -> None:
     np.testing.assert_array_equal(buffers.next_state_1.get()[0, :, 0], [11.0, 21.0])
     np.testing.assert_array_equal(buffers.next_state_2.get()[0, :, 0], [31.0, 41.0])
     np.testing.assert_array_equal(buffers.active_flags.get(), [1])
+
+
+def make_full_vocab_case(
+    seed: int,
+    batch: int = 3,
+    beam: int = 6,
+    vocab: int = 17,
+    threads: int = TDT_BEAM_SEARCH_THREADS,
+) -> ParakeetModifiedBeamSearchDecoder:
+    """Build independent utterances with shared histories and competing prefixes.
+
+    Parameters
+    ----------
+    seed : int
+        Seed for reproducible token scores, duration scores, and search positions.
+    batch : int
+        Number of independent utterances represented by the buffers.
+    beam : int
+        Number of parent histories, from one to six.
+    vocab : int
+        Nonblank vocabulary size; at least eight to include the fixture's tokens.
+    threads : int
+        CUDA block size used for grouping and group selection.
+
+    Returns
+    -------
+    ParakeetModifiedBeamSearchDecoder
+        Initialized decoder with prepared search state and CPU ``histories`` for
+        exhaustive comparison. Duplicate histories use independent backpointers.
+    """
+
+    rng = np.random.default_rng(seed)
+    histories = [(), (2,), (2,), (2, 5), (2, 5), (7,)][:beam]
+    nodes, hashes, parents, tokens = [], [], [], []
+    for _ in range(batch):
+        for history in histories:
+            node, fingerprint = -1, 0
+            for token in history:
+                parents.append(node)
+                tokens.append(token)
+                node = len(parents) - 1
+                fingerprint = (fingerprint * 1099511628211 + token + 1) % 2**64
+            nodes.append(node)
+            hashes.append(fingerprint)
+    logits = rng.normal(size=(batch * beam, vocab + 1)).astype(np.float32)
+    logits -= np.logaddexp.reduce(logits, axis=1, keepdims=True)
+    duration_scores = rng.normal(size=(batch * beam, 5)).astype(np.float32)
+    duration_scores -= np.logaddexp.reduce(duration_scores, axis=1, keepdims=True)
+    case = make_fake_parakeet_decoder(
+        beam=beam, batch_size=batch, durations=(0, 3, 1, 4, 2), vocab_size=vocab
+    )
+    case.beam_search_threads = threads
+    case.histories = histories
+    case.token_log_probs = cp.asarray(logits)
+    case.duration_log_probs = cp.asarray(duration_scores)
+    case.hypothesis_scores = cp.asarray(-rng.random(batch * beam).astype(np.float32))
+    case.hypothesis_nodes = cp.asarray(nodes, dtype=cp.int32)
+    case.hypothesis_hashes = cp.asarray(hashes, dtype=cp.uint64)
+    case.hypothesis_lengths = cp.asarray([len(h) for h in histories] * batch, cp.int32)
+    case.time_indexes = cp.asarray(rng.integers(0, 8, batch * beam), dtype=cp.int32)
+    case.symbols_at_timestep = cp.asarray(rng.integers(0, 3, batch * beam), cp.int32)
+    case.search_output_lengths = cp.asarray(rng.integers(4, 11, batch), dtype=cp.int32)
+    case.node_parents = cp.asarray(parents, dtype=cp.int32)
+    case.node_tokens = cp.asarray(tokens, dtype=cp.int32)
+    case.runtime_dimensions = cp.asarray([batch, 10], dtype=cp.int32)
+    case.history_cache.fill(0)
+    case.blank_penalty = 0.2
+    case.max_symbols_per_timestep = 3
+    case.group_selection_shared_memory_bytes = (
+        expected_token_selection_shared_memory_bytes(vocab, threads)
+    )
+    return case
+
+
+def reference_full_vocab_candidates(
+    case: ParakeetModifiedBeamSearchDecoder,
+) -> list[dict[tuple[tuple[int, ...], int, int], float]]:
+    """Sum every path on the CPU, keyed by (history, frame, zero-duration count).
+
+    Parameters
+    ----------
+    case : ParakeetModifiedBeamSearchDecoder
+        Search state from ``make_full_vocab_case``, including its CPU histories.
+
+    Returns
+    -------
+    list[dict[tuple[tuple[int, ...], int, int], float]]
+        Every merged state's log probability per utterance, before beam pruning.
+        Inactive utterances produce empty dictionaries.
+
+    Notes
+    -----
+    Enumerates all tokens and durations independently of the GPU grouping and
+    shortlist optimizations, respecting penalties and actual utterance lengths.
+    """
+
+    logits, duration_scores = case.token_log_probs.get(), case.duration_log_probs.get()
+    scores, times, symbols = (
+        case.hypothesis_scores.get(),
+        case.time_indexes.get(),
+        case.symbols_at_timestep.get(),
+    )
+    durations = case.durations_array.get().tolist()
+    actual, frames = case.runtime_dimensions.get()
+    limits = np.clip(case.search_output_lengths.get(), 0, frames)
+    results = []
+    for utterance in range(case.batch_size):
+        merged = {}
+        if utterance >= actual:
+            results.append(merged)
+            continue
+        for parent, history in enumerate(case.histories):
+            row = utterance * case.beam + parent
+            if not np.isfinite(scores[row]) or times[row] >= limits[utterance]:
+                continue
+            for token in range(case.blank_id + 1):
+                emitted = token != case.blank_id
+                for d, duration in enumerate(durations):
+                    if not emitted and duration == 0:
+                        continue
+                    value = (
+                        float(scores[row])
+                        + float(duration_scores[row, d])
+                        + float(logits[row, token])
+                    )
+                    if not emitted:
+                        value -= case.blank_penalty
+                    if not np.isfinite(value):
+                        continue
+                    count = int(symbols[row]) + 1 if emitted and duration == 0 else 0
+                    advance = duration
+                    if count >= case.max_symbols_per_timestep:
+                        advance, count = 1, 0
+                    time = min(int(times[row]) + advance, int(limits[utterance]))
+                    if time == limits[utterance]:
+                        count = 0
+                    key = (history + (token,) if emitted else history, time, count)
+                    merged[key] = np.logaddexp(merged.get(key, -np.inf), value)
+        results.append(merged)
+    return results
+
+
+def run_full_vocab_candidates(
+    case: ParakeetModifiedBeamSearchDecoder,
+) -> list[dict[tuple[tuple[int, ...], int, int], float]]:
+    """Run production kernels and reconstruct their representative transitions.
+
+    Parameters
+    ----------
+    case : ParakeetModifiedBeamSearchDecoder
+        Prepared search state from ``make_full_vocab_case``.
+
+    Returns
+    -------
+    list[dict[tuple[tuple[int, ...], int, int], float]]
+        Finite GPU candidate scores per utterance, keyed by exact history, frame
+        index, and zero-duration count. The GPU may omit states below the beam.
+
+    Raises
+    ------
+    AssertionError
+        If multiple retained candidates describe the same search state.
+    """
+
+    TDT_SELECT_TOKENS_KERNEL(
+        (case.batch_size * case.beam,),
+        (case.token_selection_threads,),
+        (
+            case.token_log_probs,
+            case.hypothesis_scores,
+            case.time_indexes,
+            case.search_output_lengths,
+            case.top_token_scores,
+            case.top_token_indexes,
+            np.int32(case.blank_id),
+            np.int32(case.beam),
+        ),
+        shared_mem=case.token_selection_shared_memory_bytes,
+    )
+    launch_tdt_candidates(case)
+    times, symbols, durations = (
+        case.time_indexes.get(),
+        case.symbols_at_timestep.get(),
+        case.durations_array.get(),
+    )
+    limits = np.clip(
+        case.search_output_lengths.get(), 0, int(case.runtime_dimensions.get()[1])
+    )
+    results = []
+    for u in range(case.batch_size):
+        valid = cp.isfinite(case.candidates[0][u])
+        scores, edges, tokens = (array[u, valid].get() for array in case.candidates)
+        values = {}
+        for score, edge, token in zip(scores, edges, tokens, strict=True):
+            parent, d = divmod(int(edge), len(durations))
+            emitted = token != case.blank_id
+            row = u * case.beam + parent
+            count = int(symbols[row]) + 1 if emitted and durations[d] == 0 else 0
+            advance = int(durations[d])
+            if count >= case.max_symbols_per_timestep:
+                advance, count = 1, 0
+            time = min(int(times[row]) + advance, int(limits[u]))
+            if time == limits[u]:
+                count = 0
+            key = (
+                case.histories[parent] + (int(token),)
+                if emitted
+                else case.histories[parent],
+                time,
+                count,
+            )
+            assert key not in values, f"Duplicate candidate survived grouping: {key}"
+            values[key] = float(score)
+        results.append(values)
+    return results
+
+
+def assert_full_vocab_matches_reference(
+    case: ParakeetModifiedBeamSearchDecoder,
+) -> list[dict[tuple[tuple[int, ...], int, int], float]]:
+    """Check top-beam states and retained scores, returning the GPU candidates.
+
+    Parameters
+    ----------
+    case : ParakeetModifiedBeamSearchDecoder
+        Prepared search state from ``make_full_vocab_case``.
+
+    Returns
+    -------
+    list[dict[tuple[tuple[int, ...], int, int], float]]
+        GPU candidates checked against exhaustive CPU enumeration, available for
+        further assertions without repeating the kernel launches.
+
+    Raises
+    ------
+    AssertionError
+        If the top beam differs or any retained candidate has an incorrect score.
+    """
+
+    expected, actual = (
+        reference_full_vocab_candidates(case),
+        run_full_vocab_candidates(case),
+    )
+    for want, got in zip(expected, actual, strict=True):
+        wanted = sorted(want, key=want.get, reverse=True)[: case.beam]
+        selected = sorted(got, key=got.get, reverse=True)[: case.beam]
+        assert selected == wanted
+        for key, score in got.items():
+            assert score == pytest.approx(want[key], abs=5e-6, rel=2e-6)
+    return actual
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("seed", range(24))
+@pytest.mark.parametrize("beam", [1, 6])
+def test_full_vocabulary_matches_exhaustive_search(seed: int, beam: int) -> None:
+    case = make_full_vocab_case(seed, beam=beam)
+    assert_full_vocab_matches_reference(case)
+    case.runtime_dimensions[0] = 1
+    case.search_output_lengths[0] = 0
+    assert_full_vocab_matches_reference(case)
+
+
+@pytest.mark.cuda
+def test_full_vocabulary_recovers_token_below_both_parent_shortlists() -> None:
+    case = make_full_vocab_case(42, batch=1, beam=3)
+    case.hypothesis_scores[:] = cp.asarray(
+        [-np.inf, np.log(0.5), np.log(0.5)], cp.float32
+    )
+    case.time_indexes[:] = cp.asarray([0, 0, 1], cp.int32)
+    case.symbols_at_timestep.fill(0)
+    case.search_output_lengths.fill(8)
+    case.token_log_probs.fill(-np.inf)
+    case.token_log_probs[1, [0, 1, 2, 9]] = cp.log(cp.asarray([0.27, 0.26, 0.25, 0.22]))
+    case.token_log_probs[2, [3, 4, 5, 9]] = cp.log(cp.asarray([0.28, 0.26, 0.25, 0.21]))
+    case.duration_log_probs.fill(-np.inf)
+    case.duration_log_probs[1, 4] = 0
+    case.duration_log_probs[2, 2] = 0
+    actual = assert_full_vocab_matches_reference(case)[0]
+    assert max(actual, key=actual.get) == ((2, 9), 2, 0)
+    assert 9 not in case.top_token_indexes.get()
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(("beam", "vocab"), [(1, 8192), (2, 8), (4, 257), (6, 8192)])
+@pytest.mark.parametrize("threads", [128, 256, 512])
+def test_full_vocabulary_handles_different_beams_and_vocabularies(
+    beam: int, vocab: int, threads: int
+) -> None:
+    case = make_full_vocab_case(98, batch=1, beam=beam, vocab=vocab, threads=threads)
+    case.time_indexes.fill(0)
+    assert_full_vocab_matches_reference(case)
+
+
+@pytest.mark.cuda
+def test_full_vocabulary_keeps_blank_prefix_outside_token_shortlist() -> None:
+    case = make_full_vocab_case(46, batch=1, beam=4)
+    case.hypothesis_scores[:] = cp.asarray([-np.inf, 0, -np.inf, 0], cp.float32)
+    case.time_indexes.fill(0)
+    case.symbols_at_timestep.fill(0)
+    case.search_output_lengths.fill(8)
+    case.token_log_probs.fill(-np.inf)
+    case.token_log_probs[1, [0, 1, 2, 3, 5]] = cp.log(
+        cp.asarray([0.25, 0.24, 0.23, 0.22, 0.06])
+    )
+    case.token_log_probs[3, case.blank_id] = 0
+    case.duration_log_probs.fill(-np.inf)
+    case.duration_log_probs[:, 4] = 0
+    actual = assert_full_vocab_matches_reference(case)[0]
+    assert max(actual, key=actual.get) == ((2, 5), 2, 0)
+    assert 5 not in case.top_token_indexes[1].get()
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("members", [1, 2])
+@pytest.mark.parametrize("score", [-np.inf, np.inf, np.nan])
+def test_full_vocabulary_keeps_blank_prefix_with_nonfinite_emission(
+    members: int, score: float
+) -> None:
+    case = make_full_vocab_case(47, batch=1, beam=4)
+    case.hypothesis_scores[:] = cp.asarray(
+        [-np.inf, 0, 0 if members == 2 else -np.inf, 0]
+    )
+    case.time_indexes.fill(0)
+    case.symbols_at_timestep.fill(0)
+    case.search_output_lengths.fill(8)
+    case.token_log_probs.fill(-np.inf)
+    case.token_log_probs[1:3, :4] = cp.asarray([-1, -2, -3, -4])
+    case.token_log_probs[1:3, 5] = score
+    case.token_log_probs[3, case.blank_id] = 0
+    case.duration_log_probs.fill(-np.inf)
+    case.duration_log_probs[:, 2] = 0
+    actual = assert_full_vocab_matches_reference(case)[0]
+    assert max(actual, key=actual.get) == ((2, 5), 1, 0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("time", [3, INT32_MAX - 2])
+def test_full_vocabulary_clamps_large_duration_sums_without_overflow(time: int) -> None:
+    case = make_full_vocab_case(48, batch=1)
+    case.durations_array[:] = cp.asarray([0, INT32_MAX - 2, 1, INT32_MAX, 2], cp.int32)
+    case.time_indexes.fill(time)
+    case.search_output_lengths.fill(time + 2)
+    case.runtime_dimensions[1] = time + 2
+    case.max_symbols_per_timestep = INT32_MAX
+    case.symbols_at_timestep.fill(INT32_MAX - 1)
+    assert_full_vocab_matches_reference(case)
+
+
+@pytest.mark.cuda
+def test_full_vocabulary_routes_strongest_path_not_strongest_parent_sum() -> None:
+    case = make_full_vocab_case(49, batch=1, beam=3)
+    case.hypothesis_scores[:] = cp.asarray([-np.inf, 0, 0], cp.float32)
+    case.time_indexes[:] = cp.asarray([0, 0, 1], cp.int32)
+    case.symbols_at_timestep.fill(0)
+    case.search_output_lengths.fill(2)
+    case.token_log_probs.fill(-np.inf)
+    case.token_log_probs[1:, 9] = np.log(0.5)
+    case.duration_log_probs.fill(-np.inf)
+    case.duration_log_probs[1, [1, 3]] = np.log(0.3)
+    case.duration_log_probs[2, 2] = np.log(0.4)
+    assert_full_vocab_matches_reference(case)
+    winner = int(cp.argmax(case.candidates[0][0]))
+    score, edge, token = (array[0, winner].item() for array in case.candidates)
+    assert score == pytest.approx(np.log(0.5))
+    assert edge == 2 * 5 + 2
+    assert token == 9
+
+
+@pytest.mark.cuda
+def test_full_vocabulary_breaks_token_ties_deterministically() -> None:
+    case = make_full_vocab_case(50, batch=1, beam=3)
+    case.hypothesis_scores[:] = cp.asarray([-np.inf, 0, 0], cp.float32)
+    case.time_indexes[:] = cp.asarray([0, 0, 1], cp.int32)
+    case.symbols_at_timestep.fill(0)
+    case.search_output_lengths.fill(8)
+    case.token_log_probs.fill(-np.log(case.blank_id + 1))
+    case.token_log_probs[:, case.blank_id] = -np.inf
+    case.duration_log_probs.fill(-np.inf)
+    case.duration_log_probs[1, 4] = 0
+    case.duration_log_probs[2, 2] = 0
+    actual = assert_full_vocab_matches_reference(case)[0]
+    assert list(actual) == [((2, token), 2, 0) for token in range(3)]
+
+
+@pytest.mark.cuda
+def test_full_vocabulary_ignores_hash_collisions_and_nonfinite_scores() -> None:
+    case = make_full_vocab_case(80)
+    # Unrelated one-token histories now collide, but must never merge.
+    case.hypothesis_hashes[5] = case.hypothesis_hashes[1]
+    case.hypothesis_hashes[11] = case.hypothesis_hashes[7]
+    case.token_log_probs[0, :3] = cp.asarray([np.nan, np.inf, -np.inf], cp.float32)
+    case.hypothesis_scores[4] = -np.inf
+    case.duration_log_probs[2, 0] = np.nan
+    assert_full_vocab_matches_reference(case)
+
+
+@pytest.mark.cuda
+def test_full_vocabulary_graph_replays_changed_states_and_partial_batches() -> None:
+    case = make_full_vocab_case(53)
+    case.time_indexes.fill(0)
+    run_full_vocab_candidates(case)
+    stream = cp.cuda.get_current_stream()
+    stream.begin_capture()
+    launch_tdt_candidates(case)
+    graph = stream.end_capture()
+    case.time_indexes.fill(3)
+    case.symbols_at_timestep.fill(2)
+    case.runtime_dimensions[0] = 2
+    graph.launch(stream)
+    captured_scores = case.candidates[0].get()
+    valid = cp.asarray(np.isfinite(captured_scores))
+    captured = [array[valid].get() for array in case.candidates[1:]]
+    assert_full_vocab_matches_reference(case)
+    np.testing.assert_array_equal(case.candidates[0].get(), captured_scores)
+    for array, expected in zip(case.candidates[1:], captured, strict=True):
+        np.testing.assert_array_equal(array[valid].get(), expected)
 
 
 class NullCudaContext:
@@ -2411,21 +2903,30 @@ def make_parakeet_validation_decoder() -> ParakeetModifiedBeamSearchDecoder:
 
 
 @pytest.mark.parametrize(
-    "beam, vocab_size, search_limit, selection_limit",
+    "beam, vocab_size, durations, opt_in",
     [
-        (6, 32, 0, 0),
-        (32, 32, 64 * 1024, 0),
-        (6, 12256, 0, 0),
-        (6, 16000, 0, 64 * 1024),
-        (32, 16000, 64 * 1024, 64 * 1024),
+        (6, 32, (0, 1, 2, 3, 4), ()),
+        (48, 48, (0, 1, 2, 3, 4), ()),
+        (49, 49, (0, 1, 2, 3, 4), ("BEAM_SEARCH",)),
+        (6, 12256, (0, 1, 2, 3, 4), ()),
+        (6, 12257, (0, 1, 2, 3, 4), ("SELECT_TOKENS",)),
+        (6, 12272, (0, 1, 2, 3, 4), ("SELECT_TOKENS",)),
+        (6, 12273, (0, 1, 2, 3, 4), ("SELECT_TOKENS", "SELECT_GROUPS")),
+        (
+            50,
+            16000,
+            (0, 1, 2, 3, 4),
+            ("BEAM_SEARCH", "SELECT_TOKENS", "SELECT_GROUPS"),
+        ),
+        (110, 110, (1,), ("BEAM_SEARCH", "GROUP")),
     ],
 )
 def test_parakeet_decoder_opts_in_to_large_shared_memory(
     monkeypatch: pytest.MonkeyPatch,
     beam: int,
     vocab_size: int,
-    search_limit: int,
-    selection_limit: int,
+    durations: tuple[int, ...],
+    opt_in: tuple[str, ...],
 ) -> None:
     engine = FakeParakeetEngine(None)
     engine.shapes = {
@@ -2433,25 +2934,25 @@ def test_parakeet_decoder_opts_in_to_large_shared_memory(
         "targets": (beam, 1),
         "input_states_1": (2, beam, 3),
         "token_log_probs": (beam, vocab_size + 1),
-        "duration_log_probs": (beam, 5),
+        "duration_log_probs": (beam, len(durations)),
     }
-    kernel = SimpleNamespace(max_dynamic_shared_size_bytes=0)
-    selection_kernel = SimpleNamespace(max_dynamic_shared_size_bytes=0)
+    kernels = {
+        name: SimpleNamespace(max_dynamic_shared_size_bytes=0)
+        for name in ("BEAM_SEARCH", "SELECT_TOKENS", "GROUP", "SELECT_GROUPS")
+    }
     monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
     monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(
         NullCudaContext, "attributes", {"MaxSharedMemoryPerBlockOptin": 64 * 1024}
     )
-    monkeypatch.setattr(parakeet_tdt_decoder, "TDT_BEAM_SEARCH_KERNEL", kernel)
-    monkeypatch.setattr(
-        parakeet_tdt_decoder, "TDT_SELECT_TOKENS_KERNEL", selection_kernel
-    )
+    for name, kernel in kernels.items():
+        monkeypatch.setattr(parakeet_tdt_decoder, f"TDT_{name}_KERNEL", kernel)
     with pytest.raises(ASRInitializationError, match="execution context"):
         ParakeetModifiedBeamSearchDecoder(
             Path("decoder.trt"),
             1,
             vocab_size,
-            (0, 1, 2, 3, 4),
+            durations,
             10,
             0.08,
             0.0,
@@ -2459,8 +2960,10 @@ def test_parakeet_decoder_opts_in_to_large_shared_memory(
             cast(cp.cuda.Stream, NullCudaContext()),
         )
 
-    assert kernel.max_dynamic_shared_size_bytes == search_limit
-    assert selection_kernel.max_dynamic_shared_size_bytes == selection_limit
+    for name, kernel in kernels.items():
+        assert kernel.max_dynamic_shared_size_bytes == (
+            64 * 1024 if name in opt_in else 0
+        ), name
 
 
 def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
@@ -2827,8 +3330,10 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("threads", [128, 256, 512])
 def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
     monkeypatch: pytest.MonkeyPatch,
+    threads: int,
 ) -> None:
     stream = cp.cuda.get_current_stream()
     context = RecordingParakeetContext()
@@ -2841,6 +3346,7 @@ def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
         "duration_log_probs": (6, 2),
     }
     monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(parakeet_tdt_decoder, "TDT_BEAM_SEARCH_THREADS", threads)
 
     decoder = ParakeetModifiedBeamSearchDecoder(
         Path("wide-decoder.trt"),
@@ -2864,6 +3370,28 @@ def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
     assert decoder.hypothesis_hashes.shape == (2, 3)
     assert decoder.time_indexes.shape == (6,)
     assert decoder.state_1.shape == (2, 6, 3)
+    assert [(array.shape, array.dtype) for array in decoder.candidate_groups] == [
+        ((2, 6), np.int32),
+        ((2, 6, 3), np.int32),
+        ((2, 6, 3), np.float32),
+        ((2, 6, 3), np.float32),
+        ((2, 6, 3), np.int32),
+    ]
+    assert [(array.shape, array.dtype) for array in decoder.candidate_blanks] == [
+        ((2, 3), np.int32),
+        ((2, 3), np.float32),
+        ((2, 3), np.float32),
+        ((2, 3), np.int32),
+        ((2, 3), np.int32),
+    ]
+    assert [(array.shape, array.dtype) for array in decoder.candidates] == [
+        ((2, 21), np.float32),
+        ((2, 21), np.int32),
+        ((2, 21), np.int32),
+    ]
+    assert decoder.group_shared_memory_bytes == 96
+    assert decoder.beam_search_threads == threads
+    assert decoder.group_selection_shared_memory_bytes == 28 + threads // 32 * 8
     assert decoder.beam_search_shared_memory_bytes == (
         expected_beam_search_shared_memory_bytes(
             beam=3,

@@ -11,6 +11,8 @@ import argparse
 import logging
 import math
 from collections import OrderedDict
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 import onnx
@@ -27,6 +29,45 @@ from ..constants import (
 from ..tensorrt_plugins import load_tensorrt_plugins
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def onnx_export_logging(debug: bool = False) -> Generator[None]:
+    """Quiet ONNX optimization chatter without hiding warnings or export failures.
+
+    Parameters
+    ----------
+    debug : bool
+        Preserve existing logging levels when enabled. Otherwise suppress INFO
+        and DEBUG messages from ONNX IR and ONNX Script during the export.
+
+    Yields
+    ------
+    None
+        Export scope with quieter dependency logging. Previous levels are
+        restored on exit, including when export raises an exception.
+
+    Notes
+    -----
+    ONNX IR logs an INFO-level stack trace whenever a custom TensorRT operator
+    has no standard ONNX schema. These messages do not indicate export failure.
+    PyTorch warnings, exceptions, and application progress logs remain visible.
+    """
+
+    if debug:
+        yield
+        return
+
+    loggers = [logging.getLogger(name) for name in ("onnx_ir", "onnxscript")]
+    levels = [logger.level for logger in loggers]
+    try:
+        for logger in loggers:
+            logger.setLevel(max(logging.WARNING, logger.getEffectiveLevel()))
+        yield
+
+    finally:
+        for logger, level in zip(loggers, levels, strict=True):
+            logger.setLevel(level)
 
 
 def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> None:

@@ -4,6 +4,7 @@
 """Tests for Zipformer bundle export, metadata conversion, and validation."""
 
 import argparse
+import logging
 import re
 import sys
 from collections import OrderedDict
@@ -1667,17 +1668,22 @@ def test_export_zipformer_rejects_incomplete_transducer_modules(
         ("transducer_modified_beam_search", 12),
     ),
 )
+@pytest.mark.parametrize("debug", (False, True))
 def test_export_zipformer_onnx_inputs_and_context_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     decoder_type: str,
     decoder_batch: int | None,
+    debug: bool,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="onnx_ir")
     args = make_export_args(decoder_type)
     args.output_dir = tmp_path
     args.batch_size = 3
     args.beam = 4
     args.opt_audio_seconds = 2.5
+    args.debug = debug
     encoder = torch.nn.Identity()
     context_lookup = torch.arange(12, dtype=torch.float16).reshape(3, 4)
     decoder = joiner = None
@@ -1699,6 +1705,9 @@ def test_export_zipformer_onnx_inputs_and_context_cache(
         """
 
         assert torch.is_inference_mode_enabled()
+        assert logging.getLogger("onnx_ir").level == (
+            logging.INFO if debug else logging.WARNING
+        )
 
     export = Mock(side_effect=record_export)
     monkeypatch.setattr(torch.onnx, "export", export)
@@ -1706,6 +1715,7 @@ def test_export_zipformer_onnx_inputs_and_context_cache(
     encoder_path, decoder_path = export_model_to_onnx(
         encoder, decoder, joiner, make_model_config(), args
     )
+    assert logging.getLogger("onnx_ir").level == logging.INFO
 
     assert encoder_path == tmp_path / "zipformer.onnx"
     encoder_call = export.call_args_list[0]
@@ -1721,6 +1731,7 @@ def test_export_zipformer_onnx_inputs_and_context_cache(
         "output_names": ("encoder_output", "encoder_output_lengths"),
         "opset_version": zipformer_exporter.ONNX_OPSET_VERSION,
         "dynamic_shapes": {"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
+        "verbose": debug,
     }
     if decoder_batch is None:
         assert decoder_path is None
@@ -1750,6 +1761,7 @@ def test_export_zipformer_onnx_inputs_and_context_cache(
             "input_names": ("decoder_input", "encoder_output"),
             "output_names": ("tokens_log_prob",),
             "opset_version": zipformer_exporter.ONNX_OPSET_VERSION,
+            "verbose": debug,
         }
 
 

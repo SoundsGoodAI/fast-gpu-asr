@@ -295,8 +295,10 @@ states, reusable buffers, and CUDA graphs. Key differences:
   `beam` unique states.
 - **Search duration alternatives.** NeMo pairs each parent's top token candidates
   with its most probable duration, forcing zero-duration blanks to advance. We expand
-  each parent's top `beam` nonblank tokens over **all configured durations**,
-  plus blanks over every positive duration, before merging and pruning.
+  nonblank tokens across the **full vocabulary and all configured durations**,
+  plus blanks over every positive duration, before final pruning. Exact-history
+  grouping avoids materializing the full expansion; token shortlists are reused
+  only where they cannot discard a merged winner.
 - **Advance differently at the symbol limit.** NeMo forces a blank when its
   emission cap is reached. Our `max_symbols_per_timestep` advances one frame
   after the capped zero-duration token without adding a blank transition.

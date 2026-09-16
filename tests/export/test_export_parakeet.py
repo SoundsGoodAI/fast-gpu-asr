@@ -5,6 +5,7 @@
 
 import argparse
 import io
+import logging
 import re
 import sys
 import tarfile
@@ -661,9 +662,16 @@ def test_main_configures_logging_and_runs_export(
 
 
 @pytest.mark.parametrize("use_ctc", (False, True), ids=("tdt", "ctc"))
+@pytest.mark.parametrize("debug", (False, True))
 def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_ctc: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    use_ctc: bool,
+    debug: bool,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="onnx_ir")
+
     def record_export(module, inputs, path, **kwargs) -> None:
         """Check the inference context while Mock records the ONNX arguments.
 
@@ -680,6 +688,9 @@ def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
         """
 
         assert torch.is_inference_mode_enabled()
+        assert logging.getLogger("onnx_ir").level == (
+            logging.INFO if debug else logging.WARNING
+        )
 
     export = Mock(side_effect=record_export)
     monkeypatch.setattr(parakeet_exporter.torch.onnx, "export", export)
@@ -688,6 +699,7 @@ def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
     args.batch_size = 3
     args.beam = 4
     args.opt_audio_seconds = 2.75
+    args.debug = debug
     model_config = make_ctc_config() if use_ctc else make_model_config()
     model_config.encoder.d_model = 384
     encoder = torch.nn.Identity()
@@ -704,6 +716,7 @@ def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
         decoder.output_proj = torch.nn.Linear(1, 1, dtype=torch.float16, device="meta")
 
     paths = export_model_to_onnx(encoder, decoder, model_config, args)
+    assert logging.getLogger("onnx_ir").level == logging.INFO
 
     assert paths == (
         tmp_path / "parakeet.onnx",
@@ -725,6 +738,7 @@ def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
         "output_names": ("encoder_output", "encoder_output_lengths"),
         "dynamic_shapes": {"audio": {1: torch.export.Dim.DYNAMIC}, "audio_lengths": {}},
         "opset_version": parakeet_exporter.ONNX_OPSET_VERSION,
+        "verbose": debug,
     }
     if use_ctc:
         return
@@ -757,6 +771,7 @@ def test_export_parakeet_onnx_uses_fixed_batch_and_decoder_capacity(
             "output_states_2",
         ),
         "opset_version": parakeet_exporter.ONNX_OPSET_VERSION,
+        "verbose": debug,
     }
 
 

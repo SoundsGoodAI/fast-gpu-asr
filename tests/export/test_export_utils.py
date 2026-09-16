@@ -3,6 +3,7 @@
 
 """Tests for shared ONNX cleanup and TensorRT export utilities."""
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -15,10 +16,55 @@ from onnx import TensorProto, helper
 import fast_gpu_asr.export.export_utils as export_utils
 from fast_gpu_asr.export.export_utils import (
     build_tensorrt_engine,
+    onnx_export_logging,
     remove_onnx_artifacts,
 )
 
 PROFILE_SHAPES = ((8, 1), (8, 2), (8, 3))
+
+
+@pytest.mark.parametrize("debug", (False, True))
+def test_onnx_export_logging_preserves_warnings_and_application_logs(
+    caplog: pytest.LogCaptureFixture, debug: bool
+) -> None:
+    caplog.set_level(logging.INFO)
+    names = ("onnx_ir", "onnxscript")
+    for name in names:
+        caplog.set_level(logging.INFO, logger=name)
+
+    with onnx_export_logging(debug):
+        for name in names:
+            dependency = logging.getLogger(f"{name}.passes")
+            dependency.info("%s optimization details", name, stack_info=True)
+            dependency.warning("%s warning", name)
+            dependency.error("%s error", name)
+        export_utils.logger.info("Exporting encoder")
+
+    expected = []
+    for name in names:
+        if debug:
+            expected.append(f"{name} optimization details")
+        expected.extend((f"{name} warning", f"{name} error"))
+        assert logging.getLogger(name).level == logging.INFO
+    assert caplog.messages == [*expected, "Exporting encoder"]
+
+
+def test_onnx_export_logging_restores_levels_after_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.NOTSET, logger="onnx_ir")
+    caplog.set_level(logging.ERROR, logger="onnxscript")
+    failure = RuntimeError("ONNX conversion failed")
+
+    with pytest.raises(RuntimeError) as error, onnx_export_logging():
+        assert logging.getLogger("onnx_ir").level == logging.WARNING
+        assert logging.getLogger("onnxscript").level == logging.ERROR
+        raise failure
+
+    assert error.value is failure
+    assert logging.getLogger("onnx_ir").level == logging.NOTSET
+    assert logging.getLogger("onnxscript").level == logging.ERROR
 
 
 @pytest.fixture

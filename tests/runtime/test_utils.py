@@ -1814,6 +1814,23 @@ def test_validate_decoder_engine_rejects_capacity_overflow() -> None:
         )
 
 
+@pytest.mark.parametrize("extra_batch", (0, 1), ids=("fits", "overflows"))
+def test_validate_parakeet_decoder_checks_batched_candidate_indexing(
+    extra_batch: int,
+) -> None:
+    config = make_parakeet_config()
+    config.decoder_params.beam = 4
+    # Four parents, each with 3 * 4 token-duration slots and two blank slots.
+    batch_size = INT32_MAX // 56 + extra_batch
+    engine = make_decoder_engine(config, batch_size=batch_size)
+
+    if extra_batch:
+        with pytest.raises(ASRInitializationError, match="batched candidate tables"):
+            validate_decoder_engine(engine, config, batch_size)
+    else:
+        validate_decoder_engine(engine, config, batch_size)
+
+
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 def test_validate_decoder_engine_rejects_tensor_element_overflow(
     architecture: str,
@@ -1836,11 +1853,12 @@ def test_validate_decoder_engine_rejects_tensor_element_overflow(
 
 
 @pytest.mark.parametrize(
-    "architecture, beam, vocab_size, kernel_name, required",
+    "architecture, beam, vocab_size, duration_count, kernel_name, required",
     [
-        ("parakeet", 32, 32, "beam search", 58688),
-        ("zipformer", 32, 512, "beam search", 66560),
-        ("parakeet", 6, 16000, "token selection", 64128),
+        ("parakeet", 50, 50, 5, "beam search", 51264),
+        ("parakeet", 1, 32, 4100, "beam search", 49200),
+        ("zipformer", 32, 512, 0, "beam search", 66560),
+        ("parakeet", 6, 16000, 5, "token selection", 64128),
     ],
 )
 @pytest.mark.parametrize("limit_offset", [-1, 0, 1])
@@ -1849,6 +1867,7 @@ def test_validate_decoder_engine_checks_shared_memory(
     architecture: str,
     beam: int,
     vocab_size: int,
+    duration_count: int,
     kernel_name: str,
     required: int,
     limit_offset: int,
@@ -1858,8 +1877,8 @@ def test_validate_decoder_engine_checks_shared_memory(
     config.vocab_size = vocab_size
     if architecture == "parakeet":
         config.blank_id = vocab_size
-        config.decoder_params.tdt_durations = [0, 1, 2, 3, 4]
-        config.decoder_params.num_extra_outputs = 5
+        config.decoder_params.tdt_durations = list(range(duration_count))
+        config.decoder_params.num_extra_outputs = duration_count
     engine = make_decoder_engine(config)
     limit = required + limit_offset
 

@@ -1039,8 +1039,8 @@ TDT_SELECT_TOKENS_KERNEL = cp.RawKernel(
         const bool active = isfinite(hypothesis_scores[hypothesis])
                             && time_indexes[hypothesis] < output_lengths[utterance];
 
-        // Blank probability is handled with duration expansion in the beam-search
-        // kernel. This stage retains only the best nonblank tokens per parent.
+        // Grouping handles blanks. These rankings are exact for single-parent
+        // groups; multi-parent groups merge the full vocabulary before selection.
         extern __shared__ unsigned char shared_memory[];
         const int lane = thread & 31;
         const int warp = thread >> 5;
@@ -1103,9 +1103,380 @@ TDT_SELECT_TOKENS_KERNEL = cp.RawKernel(
     backend="nvcc",
 )
 
-TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
+TDT_GROUP_KERNEL = cp.RawKernel(
     HISTORY_HELPERS_SOURCE
     + TDT_VALUE_HELPERS_SOURCE
+    + TDT_SCORE_HELPERS_SOURCE
+    + r"""
+    extern "C" __global__ void tdt_group_candidates(const float* token_scores,
+        const float* duration_scores, const float* scores, const int* nodes,
+        const unsigned long long* hashes, const int* lengths, const int* times, const int* symbols,
+        const int* output_lengths, const int* durations, const int* positive_indexes,
+        const int* node_parents, const int* node_tokens, const int* runtime_dimensions,
+        int* group_counts, int* group_parents, float* group_weights, float* group_best_scores,
+        int* group_edges, int* blank_targets, float* blank_scores, float* blank_best_scores,
+        int* blank_edges, int* blank_tokens, float* candidate_scores, int* candidate_edges,
+        int* candidate_tokens, unsigned long long* history_cache, int beam, int vocab,
+        int duration_count, int positive_count, int max_symbols, float blank_penalty,
+        int cache_size)
+    {
+        const int utterance = blockIdx.x;
+        const int base = utterance * beam;
+        const int groups = beam * duration_count;
+        const int blanks = beam * positive_count;
+        const int candidates = groups * beam + blanks;
+        // Host validation bounds batch * candidates and all decoder tensor sizes
+        // to INT_MAX. Group/member offsets are no larger than that candidate table.
+        const int limit =
+            utterance < runtime_dimensions[0]
+                ? tdt_clamp_output_length(output_lengths[utterance], runtime_dimensions[1])
+                : 0;
+        extern __shared__ int scratch[];
+        int* relations = scratch;
+        int* destinations = relations + beam * beam;
+        int* counts = destinations + groups;
+        int* blank_times = counts + groups;
+        for (int i = threadIdx.x; i < candidates; i += blockDim.x)
+            candidate_scores[utterance * candidates + i] = -INFINITY;
+
+        // 1 means equal histories; 2 means the left history is the exact prefix
+        // of the right history with its final token removed. Hashes only filter.
+        for (int i = threadIdx.x; i < beam * beam; i += blockDim.x)
+        {
+            const int left = base + i / beam;
+            const int right = base + i % beam;
+            int relation = 0;
+            if (isfinite(scores[left]) && isfinite(scores[right]) && times[left] < limit
+                && times[right] < limit)
+            {
+                if (lengths[left] == lengths[right] && hashes[left] == hashes[right]
+                    && histories_equal(nodes[left], nodes[right], node_parents, node_tokens,
+                        history_cache + static_cast<long long>(utterance) * cache_size, cache_size))
+                    relation = 1;
+                else if (lengths[left] + 1 == lengths[right] && nodes[right] >= 0
+                         && hashes[left] * 1099511628211ULL
+                                    + static_cast<unsigned long long>(node_tokens[nodes[right]] + 1)
+                                == hashes[right]
+                         && histories_equal(nodes[left], node_parents[nodes[right]], node_parents,
+                             node_tokens,
+                             history_cache + static_cast<long long>(utterance) * cache_size,
+                             cache_size))
+                    relation = 2;
+            }
+            relations[i] = relation;
+        }
+        for (int g = threadIdx.x; g < groups; g += blockDim.x)
+        {
+            const int parent = base + g / duration_count;
+            tdt_advance_search_state(true, durations[g % duration_count], times[parent],
+                symbols[parent], max_symbols, limit, destinations[g], counts[g]);
+            if (destinations[g] >= limit)
+                counts[g] = 0;
+            group_counts[utterance * groups + g] = 0;
+        }
+        for (int b = threadIdx.x; b < blanks; b += blockDim.x)
+        {
+            const int parent = base + b / positive_count;
+            blank_times[b] = tdt_advance_time(
+                times[parent], durations[positive_indexes[b % positive_count]], false, limit);
+            blank_targets[utterance * blanks + b] = -2;
+        }
+        __syncthreads();
+
+        for (int g = threadIdx.x; g < groups; g += blockDim.x)
+        {
+            const int parent = g / duration_count;
+            if (relations[parent * beam + parent] != 1)
+                continue;
+            bool owner = true;
+            for (int other = 0; other < g; ++other)
+                if (destinations[g] == destinations[other] && counts[g] == counts[other]
+                    && relations[parent * beam + other / duration_count] == 1)
+                    owner = false;
+            if (!owner)
+                continue;
+
+            const int offset = (utterance * groups + g) * beam;
+            int members = 0;
+            for (int p = 0; p < beam; ++p)
+            {
+                if (relations[parent * beam + p] != 1)
+                    continue;
+                float weight = -INFINITY;
+                float best = -INFINITY;
+                int best_edge = -1;
+                for (int d = 0; d < duration_count; ++d)
+                {
+                    const int edge = p * duration_count + d;
+                    const float score =
+                        scores[base + p] + duration_scores[(base + p) * duration_count + d];
+                    if (destinations[edge] != destinations[g] || counts[edge] != counts[g]
+                        || !isfinite(score))
+                        continue;
+                    weight =
+                        weight == -INFINITY
+                            ? score
+                            : (score == -INFINITY ? weight : tdt_merge_log_scores(weight, score));
+                    if (score > best)
+                    {
+                        best = score;
+                        best_edge = edge;
+                    }
+                }
+                if (!isfinite(weight))
+                    continue;
+                group_parents[offset + members] = p;
+                group_weights[offset + members] = weight;
+                group_best_scores[offset + members] = best;
+                group_edges[offset + members] = best_edge;
+                ++members;
+            }
+            group_counts[utterance * groups + g] = members;
+        }
+        __syncthreads();
+
+        for (int b = threadIdx.x; b < blanks; b += blockDim.x)
+        {
+            const int parent = b / positive_count;
+            if (relations[parent * beam + parent] != 1)
+                continue;
+            bool owner = true;
+            for (int other = 0; other < b; ++other)
+                if (blank_times[b] == blank_times[other]
+                    && relations[parent * beam + other / positive_count] == 1)
+                    owner = false;
+            if (!owner)
+                continue;
+            float merged = -INFINITY;
+            float best = -INFINITY;
+            int best_edge = -1;
+            for (int other = 0; other < blanks; ++other)
+            {
+                const int p = other / positive_count;
+                if (blank_times[b] != blank_times[other] || relations[parent * beam + p] != 1)
+                    continue;
+                const int d = positive_indexes[other % positive_count];
+                const float score = scores[base + p]
+                                    + token_scores[(base + p) * (vocab + 1) + vocab] - blank_penalty
+                                    + duration_scores[(base + p) * duration_count + d];
+                if (!isfinite(score))
+                    continue;
+                merged = merged == -INFINITY
+                             ? score
+                             : (score == -INFINITY ? merged : tdt_merge_log_scores(merged, score));
+                if (score > best)
+                {
+                    best = score;
+                    best_edge = p * duration_count + d;
+                }
+            }
+            if (!isfinite(merged))
+                continue;
+            int target = -1;
+            for (int g = 0; g < groups; ++g)
+                if (group_counts[utterance * groups + g] > 0 && destinations[g] == blank_times[b]
+                    && counts[g] == 0 && relations[(g / duration_count) * beam + parent] == 2)
+                {
+                    target = g;
+                    break;
+                }
+            const int index = utterance * blanks + b;
+            blank_targets[index] = target;
+            blank_scores[index] = merged;
+            blank_best_scores[index] = best;
+            blank_edges[index] = best_edge;
+            blank_tokens[index] =
+                nodes[base + parent] >= 0 ? node_tokens[nodes[base + parent]] : -1;
+            if (target < 0)
+            {
+                const int candidate = utterance * candidates + groups * beam + b;
+                candidate_scores[candidate] = merged;
+                candidate_edges[candidate] = best_edge;
+                candidate_tokens[candidate] = vocab;
+            }
+        }
+    }
+    """,
+    "tdt_group_candidates",
+    options=("--std=c++20",),
+    backend="nvcc",
+)
+
+TDT_SELECT_GROUPS_KERNEL = cp.RawKernel(
+    TDT_SCORE_HELPERS_SOURCE
+    + TDT_TOPK_HELPERS_SOURCE
+    + r"""
+    extern "C" __global__ void tdt_select_groups(const float* logits, const float* top_scores,
+        const int* top_tokens, const int* group_counts, const int* group_parents,
+        const float* group_weights, const float* group_best_scores, const int* group_edges,
+        const int* blank_targets, const float* blank_scores, const float* blank_best_scores,
+        const int* blank_edges, const int* blank_tokens, float* candidate_scores,
+        int* candidate_edges, int* candidate_tokens, int beam, int vocab, int duration_count,
+        int positive_count)
+    {
+        const int groups = beam * duration_count;
+        const int blanks = beam * positive_count;
+        const int candidates = groups * beam + blanks;
+        const int utterance = blockIdx.x / groups;
+        const int group = blockIdx.x % groups;
+        const int members = group_counts[blockIdx.x];
+        if (!members)
+            return;
+        const int offset = blockIdx.x * beam;
+        const int output = utterance * candidates + group * beam;
+        if (members == 1)
+        {
+            const int parent = utterance * beam + group_parents[offset];
+            for (int rank = threadIdx.x; rank < beam; rank += blockDim.x)
+            {
+                candidate_scores[output + rank] =
+                    group_weights[offset] + top_scores[parent * beam + rank];
+                candidate_edges[output + rank] = group_edges[offset];
+                candidate_tokens[output + rank] = top_tokens[parent * beam + rank];
+            }
+            __syncthreads();
+            for (int b = threadIdx.x; b < blanks; b += blockDim.x)
+            {
+                const int index = utterance * blanks + b;
+                if (blank_targets[index] != group)
+                    continue;
+                const int token = blank_tokens[index];
+                const float logprob = logits[parent * (vocab + 1) + token];
+                const float emitted =
+                    isfinite(logprob) ? group_weights[offset] + logprob : -INFINITY;
+                int target = utterance * candidates + groups * beam + b;
+                for (int rank = 0; rank < beam; ++rank)
+                    if (top_tokens[parent * beam + rank] == token)
+                        target = output + rank;
+                const bool use_blank =
+                    blank_best_scores[index] > group_best_scores[offset] + logprob
+                    || !isfinite(logprob);
+                const float blank = blank_scores[index];
+                candidate_scores[target] =
+                    emitted == -INFINITY
+                        ? blank
+                        : (blank == -INFINITY ? emitted : tdt_merge_log_scores(emitted, blank));
+                candidate_edges[target] = use_blank ? blank_edges[index] : group_edges[offset];
+                candidate_tokens[target] = use_blank ? vocab : token;
+            }
+            return;
+        }
+
+        extern __shared__ unsigned char selection_scratch[];
+        float* scores = reinterpret_cast<float*>(selection_scratch);
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int warps = blockDim.x >> 5;
+        float* warp_scores = scores + vocab;
+        int* warp_tokens = reinterpret_cast<int*>(warp_scores + warps);
+        for (int token = threadIdx.x; token < vocab; token += blockDim.x)
+        {
+            float score = -INFINITY;
+            for (int i = 0; i < members; ++i)
+            {
+                const int parent = utterance * beam + group_parents[offset + i];
+                const float value =
+                    group_weights[offset + i] + logits[parent * (vocab + 1) + token];
+                if (isfinite(value))
+                    score = score == -INFINITY
+                                ? value
+                                : (value == -INFINITY ? score : tdt_merge_log_scores(score, value));
+            }
+            scores[token] = score;
+        }
+        __syncthreads();
+        for (int b = threadIdx.x; b < blanks; b += blockDim.x)
+        {
+            const int index = utterance * blanks + b;
+            // Grouping gives each (group, token) one blank owner, so these
+            // corrections write distinct shared-memory elements without atomics.
+            if (blank_targets[index] == group)
+            {
+                const int token = blank_tokens[index];
+                const float emitted = scores[token];
+                const float blank = blank_scores[index];
+                scores[token] =
+                    emitted == -INFINITY
+                        ? blank
+                        : (blank == -INFINITY ? emitted : tdt_merge_log_scores(emitted, blank));
+            }
+        }
+        __syncthreads();
+        for (int rank = 0; rank < beam; ++rank)
+        {
+            float best = -INFINITY;
+            int token = vocab;
+            for (int t = threadIdx.x; t < vocab; t += blockDim.x)
+                if (tdt_score_is_better(scores[t], t, best, token))
+                {
+                    best = scores[t];
+                    token = t;
+                }
+            tdt_warp_best(best, token);
+            if (lane == 0)
+            {
+                warp_scores[warp] = best;
+                warp_tokens[warp] = token;
+            }
+            __syncthreads();
+            if (warp == 0)
+            {
+                best = lane < warps ? warp_scores[lane] : -INFINITY;
+                token = lane < warps ? warp_tokens[lane] : vocab;
+                tdt_warp_best(best, token);
+                if (lane == 0)
+                {
+                    candidate_scores[output + rank] = best;
+                    candidate_tokens[output + rank] = token;
+                    if (token < vocab)
+                        scores[token] = NAN;
+                }
+            }
+            __syncthreads();
+        }
+        for (int rank = threadIdx.x; rank < beam; rank += blockDim.x)
+        {
+            if (!isfinite(candidate_scores[output + rank]))
+                continue;
+            const int token = candidate_tokens[output + rank];
+            int edge = -1;
+            float path_score = -INFINITY;
+            // Route the strongest individual path, not the largest merged parent weight.
+            for (int i = 0; i < members; ++i)
+            {
+                const int parent = utterance * beam + group_parents[offset + i];
+                const float score =
+                    group_best_scores[offset + i] + logits[parent * (vocab + 1) + token];
+                if (isfinite(score) && score > path_score)
+                {
+                    path_score = score;
+                    edge = group_edges[offset + i];
+                }
+            }
+            int emitted_token = token;
+            for (int b = 0; b < blanks; ++b)
+            {
+                const int index = utterance * blanks + b;
+                if (blank_targets[index] == group && blank_tokens[index] == token
+                    && blank_best_scores[index] > path_score)
+                {
+                    edge = blank_edges[index];
+                    emitted_token = vocab;
+                    path_score = blank_best_scores[index];
+                }
+            }
+            candidate_edges[output + rank] = edge;
+            candidate_tokens[output + rank] = emitted_token;
+        }
+    }
+    """,
+    "tdt_select_groups",
+    options=("--std=c++20",),
+    backend="nvcc",
+)
+
+TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
+    TDT_VALUE_HELPERS_SOURCE
     + TDT_TOPK_HELPERS_SOURCE
     + TDT_SCORE_HELPERS_SOURCE
     + r"""
@@ -1120,83 +1491,6 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         unsigned long long hash;
     };
 
-    __device__ __forceinline__ TdtCandidate tdt_candidate(int index, int beam, int duration_count,
-        int positive_duration_count, int hypothesis_base, int blank_id,
-        int max_symbols_per_timestep, int output_length, const int* durations,
-        const int* positive_duration_indexes, const int* top_token_indexes,
-        const unsigned long long* hypothesis_hashes, const int* hypothesis_lengths,
-        const int* time_indexes, const int* symbols_at_timestep)
-    {
-        TdtCandidate candidate;
-        const int per_parent = duration_count * beam;
-        const int token_count = per_parent * beam;
-        const bool emitted = index < token_count;
-        if (emitted)
-        {
-            candidate.parent = hypothesis_base + index / per_parent;
-            candidate.duration_index = index % per_parent / beam;
-            candidate.token = top_token_indexes[candidate.parent * beam + index % beam];
-        }
-        else
-        {
-            const int blank_index = index - token_count;
-            candidate.parent = hypothesis_base + blank_index / positive_duration_count;
-            candidate.duration_index =
-                positive_duration_indexes[blank_index % positive_duration_count];
-            candidate.token = blank_id;
-        }
-        candidate.length = hypothesis_lengths[candidate.parent] + emitted;
-        // The rolling fingerprint is only a filter. Equal keys also require
-        // an exact token-history check before their scores can merge.
-        candidate.hash = emitted ? hypothesis_hashes[candidate.parent] * 1099511628211ULL
-                                       + static_cast<unsigned long long>(candidate.token + 1)
-                                 : hypothesis_hashes[candidate.parent];
-        tdt_advance_search_state(emitted, durations[candidate.duration_index],
-            time_indexes[candidate.parent], symbols_at_timestep[candidate.parent],
-            max_symbols_per_timestep, output_length, candidate.time, candidate.symbols);
-        if (candidate.time >= output_length)
-        {
-            candidate.symbols = 0;
-        }
-        return candidate;
-    }
-
-    __device__ __forceinline__ bool tdt_histories_equal(const TdtCandidate& left,
-        const TdtCandidate& right, int blank_id, const int* hypothesis_nodes,
-        const int* node_parents, const int* node_tokens, unsigned long long* history_cache,
-        int cache_size)
-    {
-        int left_node = hypothesis_nodes[left.parent];
-        int right_node = hypothesis_nodes[right.parent];
-        // Emitted tokens are not materialized yet. Compare these virtual tails
-        // first, removing a stored tail from the blank path when necessary.
-        if (left.token != blank_id && right.token != blank_id)
-        {
-            if (left.token != right.token)
-            {
-                return false;
-            }
-        }
-        else if (left.token != blank_id)
-        {
-            if (right_node < 0 || left.token != node_tokens[right_node])
-            {
-                return false;
-            }
-            right_node = node_parents[right_node];
-        }
-        else if (right.token != blank_id)
-        {
-            if (left_node < 0 || right.token != node_tokens[left_node])
-            {
-                return false;
-            }
-            left_node = node_parents[left_node];
-        }
-        return histories_equal(
-            left_node, right_node, node_parents, node_tokens, history_cache, cache_size);
-    }
-
     __device__ __forceinline__ void gather_tdt_states(int hypothesis, int thread,
         const void* input_state_1_raw, const void* input_state_2_raw,
         const void* output_state_1_raw, const void* output_state_2_raw, const int* parent_indexes,
@@ -1207,9 +1501,8 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         int encoder_dim, int beam, int state_dtype, int encoder_output_dtype,
         int encoder_input_dtype);
 
-    extern "C" __global__ void tdt_beam_search(const float* token_log_probs,
-        const float* duration_log_probs, const float* top_token_scores,
-        const int* top_token_indexes, const float* hypothesis_scores, const int* hypothesis_nodes,
+    extern "C" __global__ void tdt_beam_search(const float* merged_scores, const int* merged_edges,
+        const int* merged_tokens, const float* hypothesis_scores, const int* hypothesis_nodes,
         const unsigned long long* hypothesis_hashes, const int* hypothesis_lengths,
         const int* time_indexes, const int* last_tokens, const int* symbols_at_timestep,
         float* next_scores, int* next_nodes, unsigned long long* next_hashes, int* next_lengths,
@@ -1217,15 +1510,13 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         int* parent_indexes, unsigned char* use_output_state, int* node_parents, int* node_tokens,
         float* node_timestamps, int* node_counts, float* completed_scores, int* completed_nodes,
         int* completed_lengths, int* active_flags, const int* output_lengths, const int* durations,
-        const int* positive_duration_indexes, const void* input_state_1_raw,
-        const void* input_state_2_raw, const void* output_state_1_raw,
-        const void* output_state_2_raw, void* next_state_1_raw, void* next_state_2_raw,
-        const void* encoder_output_raw, void* encoder_input_raw, int* targets, int hidden_dim,
-        int state_layers, const int* runtime_dimensions, int encoder_dim, int state_dtype,
-        int encoder_output_dtype, int encoder_input_dtype, int token_stride, int beam,
-        int duration_count, int positive_duration_count, int blank_id, int max_symbols_per_timestep,
-        float blank_penalty, float encoder_frame_shift_sec, unsigned long long* history_cache,
-        int history_cache_size)
+        const void* input_state_1_raw, const void* input_state_2_raw,
+        const void* output_state_1_raw, const void* output_state_2_raw, void* next_state_1_raw,
+        void* next_state_2_raw, const void* encoder_output_raw, void* encoder_input_raw,
+        int* targets, int hidden_dim, int state_layers, const int* runtime_dimensions,
+        int encoder_dim, int state_dtype, int encoder_output_dtype, int encoder_input_dtype,
+        int token_stride, int beam, int duration_count, int positive_duration_count, int blank_id,
+        int max_symbols_per_timestep, float encoder_frame_shift_sec)
     {
         // Runtime dimensions live in device memory so a captured search graph
         // can be replayed for different batch and temporal shapes.
@@ -1241,14 +1532,7 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
             utterance < actual_batch_size
                 ? tdt_clamp_output_length(output_lengths[utterance], num_frames)
                 : 0;
-        const int token_candidates_per_parent = duration_count * beam;
-        const int token_candidate_count = beam * token_candidates_per_parent;
-        const int candidate_count = token_candidate_count + beam * positive_duration_count;
-        int bucket_count = 1;
-        while (bucket_count < (candidate_count + 1LL) / 2)
-        {
-            bucket_count *= 2;
-        }
+        const int candidate_count = beam * (duration_count * beam + positive_duration_count);
 
         for (int output = thread; output < beam; output += blockDim.x)
         {
@@ -1290,134 +1574,16 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
         const int lane = thread & 31;
         const int warp = thread >> 5;
         const int num_warps = blockDim.x >> 5;
-        // Each candidate belongs to one bucket. Linked lists avoid a full
-        // candidate-by-candidate comparison and require no floating-point atomics.
         float* candidate_scores = reinterpret_cast<float*>(shared_memory);
-        int* candidate_links = reinterpret_cast<int*>(candidate_scores + candidate_count);
-        int* bucket_heads = candidate_links + candidate_count;
-        float* reduction_scores = reinterpret_cast<float*>(bucket_heads + bucket_count);
+        float* reduction_scores = candidate_scores + candidate_count;
         int* reduction_indexes = reinterpret_cast<int*>(reduction_scores + num_warps);
         float* selected_scores = reinterpret_cast<float*>(reduction_indexes + num_warps);
         int* selected_indexes = reinterpret_cast<int*>(selected_scores + beam);
-        for (int bucket = thread; bucket < bucket_count; bucket += blockDim.x)
-        {
-            bucket_heads[bucket] = -1;
-        }
-        __syncthreads();
-
-        // Expand each parent with its top nonblank tokens at every duration.
-        // Blank candidates use only positive durations so search always makes
-        // progress instead of admitting an infinite blank-duration-zero loop.
         for (int candidate = thread; candidate < candidate_count; candidate += blockDim.x)
         {
-            const TdtCandidate state = tdt_candidate(candidate, beam, duration_count,
-                positive_duration_count, hypothesis_base, blank_id, max_symbols_per_timestep,
-                output_length, durations, positive_duration_indexes, top_token_indexes,
-                hypothesis_hashes, hypothesis_lengths, time_indexes, symbols_at_timestep);
-            const int parent_index = state.parent;
-            float score;
-            if (candidate < token_candidate_count)
-            {
-                score = hypothesis_scores[parent_index]
-                        + duration_log_probs[parent_index * duration_count + state.duration_index]
-                        + top_token_scores[parent_index * beam + candidate % beam];
-            }
-            else
-            {
-                score = hypothesis_scores[parent_index]
-                        + token_log_probs[parent_index * (blank_id + 1) + blank_id] - blank_penalty
-                        + duration_log_probs[parent_index * duration_count + state.duration_index];
-            }
-            if (!isfinite(hypothesis_scores[parent_index])
-                || time_indexes[parent_index] >= output_length)
-            {
-                score = tdt_lowest_score();
-            }
-            candidate_scores[candidate] = isfinite(score) ? score : tdt_lowest_score();
-            if (isfinite(score))
-            {
-                unsigned long long key =
-                    state.hash
-                    ^ (static_cast<unsigned long long>(state.length) * 0x9e3779b97f4a7c15ULL)
-                    ^ (static_cast<unsigned long long>(state.time) * 0xbf58476d1ce4e5b9ULL)
-                    ^ (static_cast<unsigned long long>(state.symbols) * 0x94d049bb133111ebULL);
-                key ^= key >> 32;
-                const int bucket = static_cast<unsigned int>(key) & (bucket_count - 1);
-                candidate_links[candidate] = atomicExch(bucket_heads + bucket, candidate);
-            }
+            candidate_scores[candidate] = merged_scores[utterance * candidate_count + candidate];
         }
         __syncthreads();
-
-        for (int bucket = thread; bucket < bucket_count; bucket += blockDim.x)
-        {
-            // Atomic insertion order varies between launches. Sort each short
-            // bucket by candidate index so logaddexp and ties are reproducible.
-            int sorted = -1;
-            for (int candidate = bucket_heads[bucket]; candidate >= 0;)
-            {
-                const int next = candidate_links[candidate];
-                if (sorted < 0 || candidate < sorted)
-                {
-                    candidate_links[candidate] = sorted;
-                    sorted = candidate;
-                }
-                else
-                {
-                    int previous = sorted;
-                    while (candidate_links[previous] >= 0 && candidate_links[previous] < candidate)
-                    {
-                        previous = candidate_links[previous];
-                    }
-                    candidate_links[candidate] = candidate_links[previous];
-                    candidate_links[previous] = candidate;
-                }
-                candidate = next;
-            }
-            for (int first = sorted; first >= 0; first = candidate_links[first])
-            {
-                const TdtCandidate state = tdt_candidate(first, beam, duration_count,
-                    positive_duration_count, hypothesis_base, blank_id, max_symbols_per_timestep,
-                    output_length, durations, positive_duration_indexes, top_token_indexes,
-                    hypothesis_hashes, hypothesis_lengths, time_indexes, symbols_at_timestep);
-                float merged = candidate_scores[first];
-                float best_score = merged;
-                int best = first;
-                int previous = first;
-                for (int other = candidate_links[first]; other >= 0; other = candidate_links[other])
-                {
-                    const TdtCandidate other_state = tdt_candidate(other, beam, duration_count,
-                        positive_duration_count, hypothesis_base, blank_id,
-                        max_symbols_per_timestep, output_length, durations,
-                        positive_duration_indexes, top_token_indexes, hypothesis_hashes,
-                        hypothesis_lengths, time_indexes, symbols_at_timestep);
-                    if (state.hash == other_state.hash && state.length == other_state.length
-                        && state.time == other_state.time && state.symbols == other_state.symbols
-                        && tdt_histories_equal(state, other_state, blank_id, hypothesis_nodes,
-                            node_parents, node_tokens,
-                            history_cache + static_cast<long long>(utterance) * history_cache_size,
-                            history_cache_size))
-                    {
-                        const float score = candidate_scores[other];
-                        merged = tdt_merge_log_scores(merged, score);
-                        if (tdt_score_is_better(score, other, best_score, best))
-                        {
-                            best = other;
-                            best_score = score;
-                        }
-                        candidate_scores[other] = tdt_lowest_score();
-                        candidate_links[previous] = candidate_links[other];
-                    }
-                    else
-                    {
-                        previous = other;
-                    }
-                }
-                candidate_scores[first] = tdt_lowest_score();
-                candidate_scores[best] = merged;
-            }
-        }
-        __syncthreads();
-
         for (int rank = 0; rank < beam; ++rank)
         {
             float best_score = tdt_lowest_score();
@@ -1466,11 +1632,22 @@ TDT_BEAM_SEARCH_KERNEL = cp.RawKernel(
             for (int output = 0; output < retained_count; ++output)
             {
                 const int candidate = selected_indexes[output];
-                const bool emitted = candidate < token_candidate_count;
-                const TdtCandidate state = tdt_candidate(candidate, beam, duration_count,
-                    positive_duration_count, hypothesis_base, blank_id, max_symbols_per_timestep,
-                    output_length, durations, positive_duration_indexes, top_token_indexes,
-                    hypothesis_hashes, hypothesis_lengths, time_indexes, symbols_at_timestep);
+                const int offset = utterance * candidate_count + candidate;
+                const int edge = merged_edges[offset];
+                TdtCandidate state;
+                state.parent = hypothesis_base + edge / duration_count;
+                state.duration_index = edge % duration_count;
+                state.token = merged_tokens[offset];
+                const bool emitted = state.token != blank_id;
+                state.length = hypothesis_lengths[state.parent] + emitted;
+                state.hash = emitted ? hypothesis_hashes[state.parent] * 1099511628211ULL
+                                           + static_cast<unsigned long long>(state.token + 1)
+                                     : hypothesis_hashes[state.parent];
+                tdt_advance_search_state(emitted, durations[state.duration_index],
+                    time_indexes[state.parent], symbols_at_timestep[state.parent],
+                    max_symbols_per_timestep, output_length, state.time, state.symbols);
+                if (state.time >= output_length)
+                    state.symbols = 0;
                 const int parent_index = state.parent;
 
                 int candidate_node = hypothesis_nodes[parent_index];

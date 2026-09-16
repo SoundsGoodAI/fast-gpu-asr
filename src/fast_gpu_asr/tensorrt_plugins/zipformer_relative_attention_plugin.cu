@@ -163,14 +163,11 @@ template <> __device__ __forceinline__ float toFloat(float value) { return value
 
 template <typename T> __device__ __forceinline__ T fromFloat(float value);
 
-template <> __device__ __forceinline__ half fromFloat(float value)
-{
-    return __float2half_rn(value);
-}
+template <> __device__ __forceinline__ half fromFloat(float value) { return __float2half(value); }
 
 template <> __device__ __forceinline__ __nv_bfloat16 fromFloat(float value)
 {
-    return __float2bfloat16_rn(value);
+    return __float2bfloat16(value);
 }
 
 template <> __device__ __forceinline__ float fromFloat(float value) { return value; }

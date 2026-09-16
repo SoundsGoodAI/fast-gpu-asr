@@ -24,7 +24,9 @@ from ..utils import ASRInferenceError, ASRInitializationError, get_engine
 from .gpu_kernels import (
     TDT_BEAM_SEARCH_KERNEL,
     TDT_FINALIZE_KERNEL,
+    TDT_GROUP_KERNEL,
     TDT_PREPARE_INPUTS_KERNEL,
+    TDT_SELECT_GROUPS_KERNEL,
     TDT_SELECT_TOKENS_KERNEL,
 )
 
@@ -34,9 +36,10 @@ class ParakeetModifiedBeamSearchDecoder:
 
     Decoder engines with ``beam=1`` use the same search path as wider beams,
     so greedy decoding does not require a second implementation. Each active
-    hypothesis expands over nonblank token-duration combinations and
-    blank-duration advances. Duplicate histories with the same encoder position
-    and active symbol count are merged before beam pruning. Token histories use
+    hypothesis considers the full nonblank vocabulary at every duration and
+    blank-duration advances. Exact-history groups merge equivalent paths before
+    beam pruning, without materializing the vocabulary-by-duration expansion.
+    Merge keys include encoder position and active symbol count. Token histories use
     compact GPU backpointers, recurrent states are routed on the device, and
     final selection applies length-normalized log probability. The host only
     polls completion periodically and copies the selected histories.
@@ -106,9 +109,6 @@ class ParakeetModifiedBeamSearchDecoder:
             self.decoder_capacity = encoder_shape[0]
             self.encoder_dim = encoder_shape[1]
             self.blank_id = blank_id
-            positive_duration_indexes = tuple(
-                index for index, duration in enumerate(durations) if duration > 0
-            )
             self.max_symbols_per_timestep = max_symbols_per_timestep
             self.encoder_frame_shift_sec = encoder_frame_shift_sec
             self.blank_penalty = blank_penalty
@@ -124,36 +124,40 @@ class ParakeetModifiedBeamSearchDecoder:
             self.prepare_inputs_threads = TDT_PREPARE_INPUTS_THREADS
             self.token_selection_threads = TDT_SELECT_TOKENS_THREADS
             self.beam_search_threads = TDT_BEAM_SEARCH_THREADS
-            candidate_count = self.beam * (
-                len(durations) * self.beam + len(positive_duration_indexes)
+
+            positive_duration_indexes = tuple(
+                index for index, duration in enumerate(durations) if duration > 0
             )
-            bucket_count = 1 << ((candidate_count - 1) // 2).bit_length()
-            self.beam_search_shared_memory_bytes = (
-                candidate_count
-                * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
-                + bucket_count * np.dtype(np.int32).itemsize
-                + self.beam_search_threads
-                // 32
-                * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
-                + self.beam
-                * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
+            groups = self.beam * len(durations)
+            blanks = self.beam * len(positive_duration_indexes)
+            candidate_count = groups * self.beam + blanks
+            self.beam_search_shared_memory_bytes = candidate_count * np.dtype(
+                np.float32
+            ).itemsize + (self.beam_search_threads // 32 + self.beam) * (
+                np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
             )
-            if self.beam_search_shared_memory_bytes > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
-                TDT_BEAM_SEARCH_KERNEL.max_dynamic_shared_size_bytes = (
-                    self.device.attributes["MaxSharedMemoryPerBlockOptin"]
-                )
             self.token_selection_shared_memory_bytes = self.blank_id * np.dtype(
                 np.float32
             ).itemsize + self.token_selection_threads // 32 * (
                 np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
             )
-            if (
-                self.token_selection_shared_memory_bytes
-                > CUDA_DEFAULT_SHARED_MEMORY_BYTES
+            self.group_shared_memory_bytes = (
+                self.beam * self.beam + 2 * groups + blanks
+            ) * 4
+            self.group_selection_shared_memory_bytes = (
+                self.blank_id * 4 + self.beam_search_threads // 4
+            )
+
+            for kernel, size in (
+                (TDT_SELECT_TOKENS_KERNEL, self.token_selection_shared_memory_bytes),
+                (TDT_GROUP_KERNEL, self.group_shared_memory_bytes),
+                (TDT_SELECT_GROUPS_KERNEL, self.group_selection_shared_memory_bytes),
+                (TDT_BEAM_SEARCH_KERNEL, self.beam_search_shared_memory_bytes),
             ):
-                TDT_SELECT_TOKENS_KERNEL.max_dynamic_shared_size_bytes = (
-                    self.device.attributes["MaxSharedMemoryPerBlockOptin"]
-                )
+                if size > CUDA_DEFAULT_SHARED_MEMORY_BYTES:
+                    kernel.max_dynamic_shared_size_bytes = self.device.attributes[
+                        "MaxSharedMemoryPerBlockOptin"
+                    ]
 
             self.decoder = engine.create_execution_context()
             if self.decoder is None:
@@ -180,6 +184,23 @@ class ParakeetModifiedBeamSearchDecoder:
             top_token_shape = (self.decoder_capacity, self.beam)
             self.top_token_scores = cp.empty(top_token_shape, dtype=np.float32)
             self.top_token_indexes = cp.empty(top_token_shape, dtype=np.int32)
+
+            self.candidate_groups = (
+                cp.empty((batch_size, groups), np.int32),
+                *tuple(
+                    cp.empty((batch_size, groups, self.beam), dtype)
+                    for dtype in (np.int32, np.float32, np.float32, np.int32)
+                ),
+            )
+            self.candidate_blanks = tuple(
+                cp.empty((batch_size, blanks), dtype)
+                for dtype in (np.int32, np.float32, np.float32, np.int32, np.int32)
+            )
+            self.candidates = tuple(
+                cp.empty((batch_size, candidate_count), dtype)
+                for dtype in (np.float32, np.int32, np.int32)
+            )
+
             self.duration_log_probs = cp.empty(duration_shape, dtype=np.float32)
             self.output_state_1 = cp.empty(state_shape, dtype=state_dtype)
             self.output_state_2 = cp.empty(state_shape, dtype=state_dtype)
@@ -559,14 +580,62 @@ class ParakeetModifiedBeamSearchDecoder:
                                 executed = False
                                 break
 
-                            TDT_BEAM_SEARCH_KERNEL(
+                            TDT_GROUP_KERNEL(
                                 (self.batch_size,),
                                 (self.beam_search_threads,),
                                 (
                                     self.token_log_probs,
                                     self.duration_log_probs,
+                                    self.hypothesis_scores,
+                                    self.hypothesis_nodes,
+                                    self.hypothesis_hashes,
+                                    self.hypothesis_lengths,
+                                    self.time_indexes,
+                                    self.symbols_at_timestep,
+                                    self.search_output_lengths,
+                                    self.durations_array,
+                                    self.positive_duration_indexes_array,
+                                    node_parents,
+                                    node_tokens,
+                                    self.runtime_dimensions,
+                                    *self.candidate_groups,
+                                    *self.candidate_blanks,
+                                    *self.candidates,
+                                    self.history_cache,
+                                    np.int32(self.beam),
+                                    np.int32(self.blank_id),
+                                    np.int32(duration_count),
+                                    np.int32(positive_duration_count),
+                                    np.int32(self.max_symbols_per_timestep),
+                                    np.float32(self.blank_penalty),
+                                    np.int32(TDT_HISTORY_CACHE_SIZE),
+                                ),
+                                shared_mem=self.group_shared_memory_bytes,
+                                stream=self.stream,
+                            )
+                            TDT_SELECT_GROUPS_KERNEL(
+                                (self.batch_size * self.beam * duration_count,),
+                                (self.beam_search_threads,),
+                                (
+                                    self.token_log_probs,
                                     self.top_token_scores,
                                     self.top_token_indexes,
+                                    *self.candidate_groups,
+                                    *self.candidate_blanks,
+                                    *self.candidates,
+                                    np.int32(self.beam),
+                                    np.int32(self.blank_id),
+                                    np.int32(duration_count),
+                                    np.int32(positive_duration_count),
+                                ),
+                                shared_mem=self.group_selection_shared_memory_bytes,
+                                stream=self.stream,
+                            )
+                            TDT_BEAM_SEARCH_KERNEL(
+                                (self.batch_size,),
+                                (self.beam_search_threads,),
+                                (
+                                    *self.candidates,
                                     self.hypothesis_scores,
                                     self.hypothesis_nodes,
                                     self.hypothesis_hashes,
@@ -593,7 +662,6 @@ class ParakeetModifiedBeamSearchDecoder:
                                     self.active_flags,
                                     self.search_output_lengths,
                                     self.durations_array,
-                                    self.positive_duration_indexes_array,
                                     self.state_1,
                                     self.state_2,
                                     self.output_state_1,
@@ -616,10 +684,7 @@ class ParakeetModifiedBeamSearchDecoder:
                                     np.int32(positive_duration_count),
                                     np.int32(self.blank_id),
                                     np.int32(self.max_symbols_per_timestep),
-                                    np.float32(self.blank_penalty),
                                     np.float32(self.encoder_frame_shift_sec),
-                                    self.history_cache,
-                                    np.int32(TDT_HISTORY_CACHE_SIZE),
                                 ),
                                 shared_mem=self.beam_search_shared_memory_bytes,
                                 stream=self.stream,

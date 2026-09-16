@@ -35,6 +35,7 @@ from ..constants import (
 from ..utils import validate_model, validate_model_config
 from .export_utils import (
     build_tensorrt_engine,
+    onnx_export_logging,
     remove_onnx_artifacts,
     validate_zipformer,
 )
@@ -146,7 +147,9 @@ def parse_args() -> argparse.Namespace:
         help="TensorRT builder optimization level.",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Keep intermediate ONNX models."
+        "--debug",
+        action="store_true",
+        help="Keep intermediate ONNX models and verbose export diagnostics.",
     )
     return parser.parse_args()
 
@@ -576,7 +579,8 @@ def export_model_to_onnx(
         Validated published model configuration.
     args : argparse.Namespace
         Export settings, including output directory, fixed batch size, beam,
-        and optimal profile duration.
+        and optimal profile duration. Debug mode retains ONNX dependency
+        diagnostics and enables PyTorch's export progress messages.
 
     Returns
     -------
@@ -611,7 +615,7 @@ def export_model_to_onnx(
     audio_lengths = torch.full((args.batch_size,), audio_samples, dtype=torch.int64)
 
     logger.info("Exporting the batched Zipformer encoder to %s.", encoder_path)
-    with torch.inference_mode():
+    with torch.inference_mode(), onnx_export_logging(args.debug):
         torch.onnx.export(
             encoder,
             (audio, audio_lengths),
@@ -623,6 +627,7 @@ def export_model_to_onnx(
             input_names=("audio", "audio_lengths"),
             output_names=("encoder_output", "encoder_output_lengths"),
             opset_version=ONNX_OPSET_VERSION,
+            verbose=args.debug,
         )
 
     if decoder is None:
@@ -642,7 +647,7 @@ def export_model_to_onnx(
         decoder_batch *= args.beam
     logger.info("Exporting the batched Zipformer decoder to %s.", decoder_path)
     decoder_dtype = joiner.output_proj.weight.dtype
-    with torch.inference_mode():
+    with torch.inference_mode(), onnx_export_logging(args.debug):
         torch.onnx.export(
             joiner,
             (
@@ -661,6 +666,7 @@ def export_model_to_onnx(
             input_names=("decoder_input", "encoder_output"),
             output_names=("tokens_log_prob",),
             opset_version=ONNX_OPSET_VERSION,
+            verbose=args.debug,
         )
 
     return encoder_path, decoder_path

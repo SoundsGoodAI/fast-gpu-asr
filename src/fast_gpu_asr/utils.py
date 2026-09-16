@@ -746,8 +746,9 @@ def validate_decoder_engine(
     ------
     ASRInitializationError
         Raised when decoder capacity, tensor names, shapes, or dtypes differ
-        from the configured runtime contract, or a search kernel exceeds
-        the selected GPU's shared-memory limit.
+        from the configured runtime contract, tensor or search-table indexes
+        exceed int32, or a search kernel exceeds the selected GPU's
+        shared-memory limit.
 
     Notes
     -----
@@ -873,13 +874,22 @@ def validate_decoder_engine(
     if model_config.model_type == MODEL_TYPE_PARAKEET:
         model_name = "Parakeet"
         durations = model_config.decoder_params.tdt_durations
-        candidate_count = beam * (
-            len(durations) * beam + sum(duration > 0 for duration in durations)
+        positive_duration_count = len(
+            [duration for duration in durations if duration > 0]
         )
-        bucket_count = 1 << ((candidate_count - 1) // 2).bit_length()
-        shared_memory_bytes = bucket_count * np.dtype(np.int32).itemsize + (
-            candidate_count + TDT_BEAM_SEARCH_THREADS // 32 + beam
-        ) * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize)
+        candidate_count = beam * (len(durations) * beam + positive_duration_count)
+        if batch_size * candidate_count > INT32_MAX:
+            raise ASRInitializationError(
+                "Parakeet batched candidate tables exceed signed 32-bit indexing."
+            )
+        grouping_elements = beam * (2 * len(durations) + beam + positive_duration_count)
+        # Grouping and beam selection launch separately; validate the larger block.
+        shared_memory_bytes = max(
+            candidate_count * np.dtype(np.float32).itemsize
+            + (TDT_BEAM_SEARCH_THREADS // 32 + beam)
+            * (np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize),
+            grouping_elements * np.dtype(np.int32).itemsize,
+        )
         token_selection_bytes = model_config.vocab_size * np.dtype(np.float32).itemsize
         token_selection_bytes += (TDT_SELECT_TOKENS_THREADS // 32) * (
             np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
