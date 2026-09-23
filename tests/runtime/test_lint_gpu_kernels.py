@@ -4,6 +4,7 @@
 """Tests for native and embedded CUDA formatting with the real formatter."""
 
 import logging
+import runpy
 import subprocess
 import sys
 import textwrap
@@ -347,13 +348,13 @@ def test_standalone_formatter_does_not_import_cuda(cuda_project: Path) -> None:
             assert result.stdout == ""
 
 
-def test_check_and_fix_are_mutually_exclusive(
+def test_cli_check_and_fix_are_mutually_exclusive(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr("sys.argv", ["lint_gpu_kernels.py", "--check", "--fix"])
 
     with pytest.raises(SystemExit) as error:
-        lint_gpu_kernels.main()
+        runpy.run_path(str(MODULE_PATH), run_name="__main__")
 
     assert error.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err

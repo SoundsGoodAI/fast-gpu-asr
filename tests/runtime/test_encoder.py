@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Event
 from types import SimpleNamespace, TracebackType
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -741,11 +742,11 @@ def make_uninitialized_encoder(encoder_type: type[Encoder] = Encoder) -> Encoder
 
 
 @pytest.mark.parametrize(
-    ("encoder_output_dtype", "reported_cpu_count", "expected_workers"),
+    ("encoder_output_dtype", "reported_cpu_count", "expected_workers", "stream_ptr"),
     (
-        pytest.param(trt.float32, 1, 1, id="fp32-single-cpu"),
-        pytest.param(trt.float16, None, 1, id="fp16-unknown-cpu"),
-        pytest.param(trt.bfloat16, 8, 2, id="bf16-batch-limited"),
+        pytest.param(trt.float32, 1, 1, 0, id="fp32-single-cpu-legacy-stream"),
+        pytest.param(trt.float16, None, 1, 117, id="fp16-unknown-cpu"),
+        pytest.param(trt.bfloat16, 8, 2, 117, id="bf16-batch-limited"),
     ),
 )
 def test_encoder_initializes_engine_metadata_and_resources(
@@ -754,29 +755,13 @@ def test_encoder_initializes_engine_metadata_and_resources(
     encoder_output_dtype: trt.DataType,
     reported_cpu_count: int | None,
     expected_workers: int,
+    stream_ptr: int,
 ) -> None:
     context = FakeExecutionContext()
     device = FakeScope(3)
     aux_streams: list[FakeScope] = []
     loaded_paths: list[Path] = []
     pool_calls: list[tuple[int, str]] = []
-
-    def make_device(device_id: int) -> FakeScope:
-        """Return the expected fake CUDA device.
-
-        Parameters
-        ----------
-        device_id : int
-            CUDA ordinal requested by the encoder.
-
-        Returns
-        -------
-        FakeScope
-            Shared fake device scope used by the test.
-        """
-
-        assert device_id == 3
-        return device
 
     def make_aux_stream(null: bool, non_blocking: bool, ptds: bool) -> FakeScope:
         """Create and record one nonblocking TensorRT auxiliary stream.
@@ -802,7 +787,6 @@ def test_encoder_initializes_engine_metadata_and_resources(
         aux_streams.append(stream)
         return stream
 
-    monkeypatch.setattr(encoder_module.cp.cuda, "Device", make_device)
     monkeypatch.setattr(encoder_module.cp.cuda, "Stream", make_aux_stream)
     monkeypatch.setattr(encoder_module.cp.cuda, "Event", lambda **_: FakeEvent())
 
@@ -887,10 +871,11 @@ def test_encoder_initializes_engine_metadata_and_resources(
 
     engine_path = tmp_path / "encoder.trt"
     stream = FakeStream(device)
+    stream.ptr = stream_ptr
     encoder = Encoder(
         engine_path,
         sample_rate=16_000,
-        device_id=3,
+        device=device,  # type: ignore[arg-type]
         stream=stream,  # type: ignore[arg-type]
         right_padding_samples=2,
     )
@@ -912,7 +897,7 @@ def test_encoder_initializes_engine_metadata_and_resources(
     assert encoder.device is device
     assert encoder.stream is stream
     assert encoder.encoder is context
-    assert context.profile_calls == [(0, 117)]
+    assert context.profile_calls == [(0, stream_ptr)]
     assert encoder.lengths.shape == encoder.lengths_host.shape == (2,)
     assert encoder.lengths.dtype == encoder.lengths_host.dtype == np.dtype(np.int64)
     assert encoder.output_lengths.shape == (2,)
@@ -923,7 +908,7 @@ def test_encoder_initializes_engine_metadata_and_resources(
     assert encoder.context_memory is encoder.audio is encoder.audio_host is None
     assert encoder.encoder_output is encoder.cuda_graph is None
     assert encoder.cuda_graph_shape is None
-    assert encoder.cuda_graph_supported
+    assert encoder.cuda_graph_supported is (stream_ptr != 0)
     assert not encoder.host_transfer_pending
     assert not device.active
 
@@ -1220,6 +1205,28 @@ def test_encoder_reuses_device_and_host_buffer_capacity(
     assert encoder.encoder_output is encoder_output
     assert encoder.context_memory is context_memory
     assert encoder.stream.synchronizations == synchronizations
+
+
+def test_encoder_reports_missing_host_buffer_after_allocation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoder = make_runtime_encoder(monkeypatch)
+    audios = [np.ones(4, dtype=np.float32)]
+    with monkeypatch.context() as allocation_patch:
+        allocation_patch.setattr(
+            encoder_module.cpx,
+            "empty_pinned",
+            Mock(side_effect=MemoryError("pinned allocation failed")),
+        )
+        with pytest.raises(MemoryError, match="pinned allocation failed"):
+            encoder(audios)
+
+    with pytest.raises(
+        ASRInferenceError, match="Encoder audio buffers were not initialized"
+    ):
+        encoder(audios)
+    assert encoder.encoder.execute_calls == 0
+    assert encoder.host_transfer_event.records == 0
 
 
 def test_encoder_synchronizes_before_growing_context_memory(
@@ -1639,7 +1646,6 @@ def test_encoder_rejects_invalid_execution_context_initialization(
     fake_context = FakeExecutionContext() if context_available else None
     if fake_context is not None:
         fake_context.accept_profile = False
-    monkeypatch.setattr(encoder_module.cp.cuda, "Device", lambda _: device)
     monkeypatch.setattr(
         encoder_module, "get_engine", lambda _: FakeEncoderEngine(fake_context)
     )
@@ -1656,7 +1662,7 @@ def test_encoder_rejects_invalid_execution_context_initialization(
         Encoder(
             tmp_path / "encoder.trt",
             16000,
-            3,
+            device,  # type: ignore[arg-type]
             SimpleNamespace(ptr=17),  # type: ignore[arg-type]
             0,
         )

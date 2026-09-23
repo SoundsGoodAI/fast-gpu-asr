@@ -529,7 +529,7 @@ def test_parakeet_output_projection(dtype: torch.dtype, use_ctc: bool) -> None:
     embeddings: list[torch.Tensor] = []
     with (
         encoder.encoder.register_forward_hook(
-            lambda _module, _inputs, output: embeddings.append(output[0])
+            lambda module, inputs, output: embeddings.append(output[0])
         ),
         torch.inference_mode(),
     ):
@@ -569,7 +569,7 @@ def test_zipformer_output_projection(dtype: torch.dtype, use_ctc: bool) -> None:
     projected_outputs: list[torch.Tensor] = []
     with (
         encoder.projection_output.register_forward_hook(
-            lambda _module, _inputs, output: projected_outputs.append(output.clone())
+            lambda module, inputs, output: projected_outputs.append(output.clone())
         ),
         torch.inference_mode(),
     ):
@@ -594,12 +594,12 @@ def test_zipformer_eager_output_assembly_matches_surviving_bands() -> None:
         for module in (encoder.encoder_4, encoder.encoder_5, encoder.encoder_6):
             hooks.enter_context(
                 module.register_forward_hook(
-                    lambda _module, _inputs, output: stack_outputs.append(output)
+                    lambda module, inputs, output: stack_outputs.append(output)
                 )
             )
         hooks.enter_context(
             encoder.downsample_output.register_forward_pre_hook(
-                lambda _module, inputs: assembly_inputs.append(inputs[0])
+                lambda module, inputs: assembly_inputs.append(inputs[0])
             )
         )
         encoder(audio, lengths)
@@ -1135,7 +1135,7 @@ def test_partitioned_zipformer_encoder_matches_unsplit() -> None:
     partition_batch_sizes: list[int] = []
     with (
         partitioned_encoder.subsampling.conv3.register_forward_pre_hook(
-            lambda _module, inputs: partition_batch_sizes.append(inputs[0].size(0))
+            lambda module, inputs: partition_batch_sizes.append(inputs[0].size(0))
         ),
         torch.inference_mode(),
     ):
@@ -1214,7 +1214,7 @@ def test_partitioned_fast_conformer_subsampling_matches_unsplit(
     partition_batch_sizes: list[int] = []
     with (
         split_encoder.pre_encode.conv1.register_forward_pre_hook(
-            lambda _module, inputs: partition_batch_sizes.append(inputs[0].size(0))
+            lambda module, inputs: partition_batch_sizes.append(inputs[0].size(0))
         ),
         torch.inference_mode(),
     ):

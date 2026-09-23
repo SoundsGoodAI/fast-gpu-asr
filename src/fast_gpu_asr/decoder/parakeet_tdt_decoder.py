@@ -39,10 +39,10 @@ class ParakeetModifiedBeamSearchDecoder:
     hypothesis considers the full nonblank vocabulary at every duration and
     blank-duration advances. Exact-history groups merge equivalent paths before
     beam pruning, without materializing the vocabulary-by-duration expansion.
-    Merge keys include encoder position and active symbol count. Token histories use
-    compact GPU backpointers, recurrent states are routed on the device, and
-    final selection applies length-normalized log probability. The host only
-    polls completion periodically and copies the selected histories.
+    Merge keys include encoder position and active symbol count. Token histories
+    use compact GPU backpointers, recurrent states are routed on the device, and
+    final selection applies length-normalized log probability. The host only polls
+    completion periodically and copies the selected histories.
     """
 
     def __init__(
@@ -54,7 +54,7 @@ class ParakeetModifiedBeamSearchDecoder:
         max_symbols_per_timestep: int,
         encoder_frame_shift_sec: float,
         blank_penalty: float,
-        device_id: int,
+        device: cp.cuda.Device,
         stream: cp.cuda.Stream,
     ) -> None:
         """Initialize the TensorRT decoder and reusable GPU search buffers.
@@ -75,13 +75,13 @@ class ParakeetModifiedBeamSearchDecoder:
             Time shift in seconds between adjacent encoder frames.
         blank_penalty : float
             Value subtracted from blank log probabilities.
-        device_id : int
-            CUDA device ordinal used for inference.
+        device : cp.cuda.Device
+            CUDA device shared by the encoder and decoder.
         stream : cp.cuda.Stream
             CUDA stream shared with the encoder.
         """
 
-        self.device = cp.cuda.Device(device_id)
+        self.device = device
         self.stream = stream
         with self.device, self.stream:
             engine = get_engine(engine_path)
@@ -171,7 +171,7 @@ class ParakeetModifiedBeamSearchDecoder:
 
             self.cuda_graph: cp.cuda.graph.Graph | None = None
             self.cuda_graph_signature: tuple[int, ...] | None = None
-            self.cuda_graph_supported = True
+            self.cuda_graph_supported = stream.ptr != 0
 
             self.encoder_input = cp.empty(encoder_shape, dtype=encoder_dtype)
             self.targets = cp.empty(target_shape, dtype=np.int32)
@@ -343,7 +343,7 @@ class ParakeetModifiedBeamSearchDecoder:
             the decoder engine's floating-point dtype while being staged.
         encoder_output_lengths : cp.ndarray
             Contiguous CUDA ``int32`` valid encoder lengths with shape
-            ``(actual_batch,)``.
+            ``(actual_batch,)``. Search kernels clamp lengths to available frames.
 
         Returns
         -------
@@ -469,15 +469,13 @@ class ParakeetModifiedBeamSearchDecoder:
             self.completed_nodes.fill(-1)
 
             encoder_output_dtype = self.kernel_dtype_map[encoder_output.dtype]
-            self.runtime_dimensions_host[0] = actual_batch_size
-            self.runtime_dimensions_host[1] = max_frames
+            self.runtime_dimensions_host[:] = (actual_batch_size, max_frames)
             self.runtime_dimensions.set(
                 self.runtime_dimensions_host, stream=self.stream
             )
 
-            # Search kernels read batch and frame counts from runtime_dimensions.
-            # With contiguous encoder storage, its pointer and dtype plus the
-            # history stride fully identify all addresses captured by the graph.
+            # Shapes live on the device; captured addresses, dtypes, and the
+            # history stride determine whether the search graph can be reused.
             graph_signature = (
                 int(encoder_output.data.ptr),
                 int(encoder_output_dtype),
@@ -522,8 +520,7 @@ class ParakeetModifiedBeamSearchDecoder:
             graph_warmed = not signature_changed
             steps_executed = 0
             # An even chunk amortizes launches while restoring ping-pong buffers to
-            # their canonical identities after graph replay. This cadence performed
-            # best across batch-one and batch-256 decoder benchmarks.
+            # their canonical identities after graph replay.
             for chunk_start in range(0, max_steps, TDT_BEAM_SEARCH_CHUNK_STEPS):
                 chunk_steps = min(TDT_BEAM_SEARCH_CHUNK_STEPS, max_steps - chunk_start)
 

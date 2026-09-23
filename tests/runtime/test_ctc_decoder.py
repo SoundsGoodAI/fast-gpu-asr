@@ -40,7 +40,7 @@ def make_decoder(blank_id: int, blank_penalty: float) -> CTCGreedyDecoder:
         blank_id=blank_id,
         encoder_frame_shift_sec=0.04,
         blank_penalty=blank_penalty,
-        device_id=cp.cuda.Device().id,
+        device=cp.cuda.Device(),
         stream=cp.cuda.get_current_stream(),
     )
 

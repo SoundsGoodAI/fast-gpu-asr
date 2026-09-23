@@ -6,6 +6,7 @@
 import argparse
 import logging
 import re
+import runpy
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -787,12 +788,13 @@ def test_parse_args(monkeypatch: pytest.MonkeyPatch, overrides: bool) -> None:
     assert vars(parse_args()) == expected
 
 
-def test_parse_args_rejects_nonnumeric_blank_penalty(
+def test_cli_rejects_nonnumeric_blank_penalty(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["export", "--blank-penalty", "invalid"])
+    monkeypatch.delitem(sys.modules, zipformer_exporter.__name__)
     with pytest.raises(SystemExit) as error:
-        parse_args()
+        runpy.run_module(zipformer_exporter.__name__, run_name="__main__")
     assert error.value.code == 2
     assert "argument --blank-penalty: invalid float value" in capsys.readouterr().err
 
@@ -859,7 +861,7 @@ def test_zipformer_preserves_valid_blank_penalty(
     (False, 0, "0.25", None, float("nan"), float("inf"), -float("inf"), 1e39, -1e39),
 )
 def test_validate_zipformer_rejects_invalid_blank_penalty(
-    decoder_type: str, blank_penalty: object
+    decoder_type: str, blank_penalty: bool | int | float | str | None
 ) -> None:
     args = make_export_args(decoder_type)
     args.blank_penalty = blank_penalty

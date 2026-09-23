@@ -7,6 +7,7 @@ import argparse
 import io
 import logging
 import re
+import runpy
 import sys
 import tarfile
 from collections import OrderedDict
@@ -545,14 +546,14 @@ def test_export_parakeet_applies_decoder_beam_policy(
     args.beam = initial_beam
     observed_beams: list[int] = []
 
-    def stop_export(_model_path: Path, _temporary_dir: Path) -> None:
+    def stop_export(model_path: Path, temporary_dir: Path) -> None:
         """Capture the effective beam before any source processing.
 
         Parameters
         ----------
-        _model_path : Path
+        model_path : Path
             Unused archive path from the extraction callback.
-        _temporary_dir : Path
+        temporary_dir : Path
             Unused extraction directory from the callback.
 
         Raises
@@ -630,12 +631,13 @@ def test_parse_args(
     assert parse_args() == expected
 
 
-def test_parse_args_rejects_nonnumeric_blank_penalty(
+def test_cli_rejects_nonnumeric_blank_penalty(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["export", "--blank-penalty", "invalid"])
+    monkeypatch.delitem(sys.modules, parakeet_exporter.__name__)
     with pytest.raises(SystemExit) as error:
-        parse_args()
+        runpy.run_module(parakeet_exporter.__name__, run_name="__main__")
     assert error.value.code == 2
     assert "argument --blank-penalty: invalid float value" in capsys.readouterr().err
 
@@ -1343,7 +1345,7 @@ def test_parakeet_preserves_valid_blank_penalty(
     (False, 0, "0.25", None, float("nan"), float("inf"), -float("inf"), 1e39, -1e39),
 )
 def test_validate_parakeet_rejects_invalid_blank_penalty(
-    use_ctc: bool, blank_penalty: object
+    use_ctc: bool, blank_penalty: bool | int | float | str | None
 ) -> None:
     config = make_ctc_config() if use_ctc else make_model_config()
     args = make_export_args()
@@ -1763,7 +1765,7 @@ def test_extract_member_rejects_unreadable_member(
         add_archive_member(archive, "model_config.yaml")
 
     with tarfile.open(archive_path) as archive:
-        monkeypatch.setattr(archive, "extractfile", lambda _member: None)
+        monkeypatch.setattr(archive, "extractfile", lambda member: None)
         with pytest.raises(FileNotFoundError, match="Unable to read"):
             extract_member(archive, "model_config.yaml", tmp_path)
 

@@ -43,7 +43,7 @@ class ZipformerModifiedBeamSearchDecoder:
         blank_id: int,
         encoder_frame_shift_sec: float,
         blank_penalty: float,
-        device_id: int,
+        device: cp.cuda.Device,
         stream: cp.cuda.Stream,
     ) -> None:
         """Initialize the TensorRT decoder and reusable search buffers.
@@ -64,13 +64,13 @@ class ZipformerModifiedBeamSearchDecoder:
             Time shift in seconds between adjacent encoder frames.
         blank_penalty : float
             Value subtracted from blank log probabilities.
-        device_id : int
-            CUDA device ordinal used for inference.
+        device : cp.cuda.Device
+            CUDA device shared by the encoder and decoder.
         stream : cp.cuda.Stream
             CUDA stream shared with the encoder.
         """
 
-        self.device = cp.cuda.Device(device_id)
+        self.device = device
         self.stream = stream
         with self.device, self.stream:
             engine = get_engine(engine_path)
@@ -125,7 +125,7 @@ class ZipformerModifiedBeamSearchDecoder:
 
             self.cuda_graph: cp.cuda.graph.Graph | None = None
             self.cuda_graph_signature: tuple[int, ...] | None = None
-            self.cuda_graph_supported = True
+            self.cuda_graph_supported = stream.ptr != 0
 
             self.decoder_input = cp.empty(
                 decoder_shape,
@@ -414,42 +414,48 @@ class ZipformerModifiedBeamSearchDecoder:
                             executed = False
                             break
 
-                        beam_search_kernel(
-                            (actual_batch_size,),
-                            (self.beam_search_threads,),
-                            (
-                                self.tokens_log_prob,
-                                encoder_output,
-                                self.encoder_input,
-                                self.context_lookup,
-                                self.decoder_input,
-                                contexts,
-                                hypothesis_scores,
-                                hypothesis_nodes,
-                                hypothesis_lengths,
-                                hypothesis_hashes,
-                                next_scores,
-                                next_nodes,
-                                next_lengths,
-                                next_hashes,
-                                node_parents,
-                                node_tokens,
-                                node_timestamps,
-                                self.node_counts,
-                                output_lengths,
-                                np.int32(frame_index),
-                                np.int32(max_frames),
-                                np.int32(self.encoder_dim),
-                                encoder_output_dtype,
-                                encoder_input_dtype,
-                                context_lookup_dtype,
-                                np.int32(self.blank_id),
-                                np.float32(self.blank_penalty),
-                                np.float32(self.encoder_frame_shift_sec),
-                            ),
-                            shared_mem=beam_search_shared_memory_bytes,
-                            stream=self.stream,
-                        )
+                        try:
+                            beam_search_kernel(
+                                (actual_batch_size,),
+                                (self.beam_search_threads,),
+                                (
+                                    self.tokens_log_prob,
+                                    encoder_output,
+                                    self.encoder_input,
+                                    self.context_lookup,
+                                    self.decoder_input,
+                                    contexts,
+                                    hypothesis_scores,
+                                    hypothesis_nodes,
+                                    hypothesis_lengths,
+                                    hypothesis_hashes,
+                                    next_scores,
+                                    next_nodes,
+                                    next_lengths,
+                                    next_hashes,
+                                    node_parents,
+                                    node_tokens,
+                                    node_timestamps,
+                                    self.node_counts,
+                                    output_lengths,
+                                    np.int32(frame_index),
+                                    np.int32(max_frames),
+                                    np.int32(self.encoder_dim),
+                                    encoder_output_dtype,
+                                    encoder_input_dtype,
+                                    context_lookup_dtype,
+                                    np.int32(self.blank_id),
+                                    np.float32(self.blank_penalty),
+                                    np.float32(self.encoder_frame_shift_sec),
+                                ),
+                                shared_mem=beam_search_shared_memory_bytes,
+                                stream=self.stream,
+                            )
+                        except cp.cuda.driver.CUDADriverError as error:
+                            if not capture or error.status != 901:
+                                raise
+                            executed = False
+                            break
 
                         hypothesis_scores, next_scores = next_scores, hypothesis_scores
                         hypothesis_nodes, next_nodes = next_nodes, hypothesis_nodes

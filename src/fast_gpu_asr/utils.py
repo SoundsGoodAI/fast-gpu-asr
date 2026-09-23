@@ -146,8 +146,7 @@ def validate_tokenizer(model_dir: Path, model_config: DictConfig) -> None:
     ------
     ASRInitializationError
         Raised when ``bpe.model`` is missing or invalid, its effective
-        vocabulary differs from the model configuration, the standalone
-        SentencePiece word-boundary token is missing, or a Zipformer tokenizer
+        vocabulary differs from the model configuration, or a Zipformer tokenizer
         does not contain the configured in-vocabulary ``<blk>`` token.
     """
 
@@ -175,16 +174,6 @@ def validate_tokenizer(model_dir: Path, model_config: DictConfig) -> None:
         raise ASRInitializationError(
             f"Expected tokenizer vocabulary size {model_config.vocab_size}, got "
             f"{expected_vocab_size}."
-        )
-
-    standalone_word_id = tokenizer.piece_to_id("▁")
-    if (
-        not 0 <= standalone_word_id < model_config.vocab_size
-        or tokenizer.id_to_piece(standalone_word_id) != "▁"
-    ):
-        raise ASRInitializationError(
-            "Expected the tokenizer to contain an in-vocabulary standalone "
-            "SentencePiece word-boundary token."
         )
 
     if model_config.model_type == MODEL_TYPE_ZIPFORMER:

@@ -3,7 +3,9 @@
 
 """Tests for native TensorRT plugin discovery, compilation, and installation."""
 
+import runpy
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -169,6 +171,22 @@ def test_build_plugin_uses_exact_headers_and_libraries(
     )
 
 
+def test_cli_reports_missing_tensorrt_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        build_module.tensorrt_libs, "__file__", str(tmp_path / "__init__.py")
+    )
+    monkeypatch.delitem(sys.modules, build_module.__name__)
+
+    with pytest.raises(FileNotFoundError) as error:
+        runpy.run_module(build_module.__name__, run_name="__main__")
+
+    assert str(error.value) == (
+        f"TensorRT library not found: {tmp_path / 'libnvinfer.so.11'}"
+    )
+
+
 @pytest.mark.parametrize(
     ("available_cpus", "expected_workers"), ((None, 1), (1, 1), (8, 2))
 )
@@ -232,7 +250,7 @@ def test_main_deduplicates_cuda_include_directories(
     build_environment: SimpleNamespace,
 ) -> None:
     env = build_environment
-    env.headers.side_effect = lambda _name: "/cuda/include"
+    env.headers.side_effect = lambda name: "/cuda/include"
 
     build_module.main()
 

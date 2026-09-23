@@ -360,7 +360,9 @@ def make_parakeet_config() -> DictConfig:
     )
 
 
-def make_model_config(architecture: str) -> DictConfig:
+def make_model_config(
+    architecture: str, decoder_type: str = "transducer_modified_beam_search"
+) -> DictConfig:
     """Return a valid configuration for the requested architecture.
 
     Parameters
@@ -368,6 +370,9 @@ def make_model_config(architecture: str) -> DictConfig:
     architecture : str
         Test architecture selector; ``parakeet`` selects Parakeet and every
         other value selects Zipformer.
+    decoder_type : str
+        Decoder mode to configure, with beam one for greedy modes. CTC
+        configurations omit all transducer-only decoder fields.
 
     Returns
     -------
@@ -375,9 +380,18 @@ def make_model_config(architecture: str) -> DictConfig:
         Valid runtime configuration for the selected architecture.
     """
 
-    if architecture == "parakeet":
-        return make_parakeet_config()
-    return make_zipformer_config()
+    model_config = (
+        make_parakeet_config()
+        if architecture == "parakeet"
+        else make_zipformer_config(decoder_type)
+    )
+    model_config.decoder_type = decoder_type
+    model_config.decoder_params.beam = (
+        2 if decoder_type == "transducer_modified_beam_search" else 1
+    )
+    if decoder_type == "ctc_greedy_search":
+        model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
+    return model_config
 
 
 def make_encoder_engine(
@@ -638,7 +652,6 @@ POSITIVE_INTEGER_FIELDS = {
         *(("zipformer", field) for field in ZIPFORMER_REQUIRED_FIELDS),
         *(("zipformer", field) for field in ZIPFORMER_TRANSDUCER_REQUIRED_FIELDS),
     ),
-    ids=lambda value: str(value).replace(".", "-"),
 )
 def test_validate_model_config_reports_missing_required_field(
     architecture: str, field: str
@@ -675,32 +688,19 @@ def test_validate_model_config_reports_mandatory_missing_value(
     assert str(error.value) == f"Missing required model configuration field {field}."
 
 
+@pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 @pytest.mark.parametrize(
-    ("architecture", "decoder_type"),
+    "decoder_type",
     (
-        ("zipformer", "transducer_modified_beam_search"),
-        ("zipformer", "transducer_greedy_search"),
-        ("zipformer", "ctc_greedy_search"),
-        ("parakeet", "transducer_modified_beam_search"),
-        ("parakeet", "transducer_greedy_search"),
-        ("parakeet", "ctc_greedy_search"),
+        "transducer_modified_beam_search",
+        "transducer_greedy_search",
+        "ctc_greedy_search",
     ),
 )
 def test_validate_model_config_accepts_supported_decoder_modes(
     architecture: str, decoder_type: str
 ) -> None:
-    if architecture == "zipformer":
-        model_config = make_zipformer_config(decoder_type)
-    else:
-        model_config = make_parakeet_config()
-        model_config.decoder_type = decoder_type
-        model_config.decoder_params.beam = (
-            2 if decoder_type == "transducer_modified_beam_search" else 1
-        )
-        if decoder_type == "ctc_greedy_search":
-            model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
-
-    validate_model_config(model_config)
+    validate_model_config(make_model_config(architecture, decoder_type))
 
 
 @pytest.mark.parametrize(
@@ -710,9 +710,7 @@ def test_validate_model_config_accepts_supported_decoder_modes(
 def test_parakeet_ctc_rejects_invalid_blank_dimensions(
     vocab_size: int, blank_id: int, message: str
 ) -> None:
-    config = make_parakeet_config()
-    config.decoder_type = "ctc_greedy_search"
-    config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
+    config = make_model_config("parakeet", "ctc_greedy_search")
     config.vocab_size = vocab_size
     config.blank_id = blank_id
     with pytest.raises(ASRInitializationError, match=message):
@@ -758,6 +756,11 @@ def test_parakeet_ctc_rejects_invalid_blank_dimensions(
             {"audio_encoder_params.right_padding_samples": 0},
             id="zero-right-padding",
         ),
+        pytest.param(
+            "zipformer",
+            {"audio_encoder_params.right_padding_samples": 1601},
+            id="padding-longer-than-minimum-audio",
+        ),
     ),
 )
 def test_validate_model_config_accepts_inclusive_boundaries(
@@ -766,15 +769,6 @@ def test_validate_model_config_accepts_inclusive_boundaries(
     model_config = make_model_config(architecture)
     for field, value in updates.items():
         OmegaConf.update(model_config, field, value)
-
-    validate_model_config(model_config)
-
-
-def test_validate_model_config_accepts_ctc_without_transducer_decoder_fields() -> None:
-    model_config = make_zipformer_config("ctc_greedy_search")
-    for field in ZIPFORMER_TRANSDUCER_REQUIRED_FIELDS:
-        field_name = field.removeprefix("decoder_params.")
-        del model_config.decoder_params[field_name]
 
     validate_model_config(model_config)
 
@@ -874,7 +868,6 @@ def test_validate_model_config_rejects_non_dictconfig() -> None:
         for architecture, fields in POSITIVE_INTEGER_FIELDS.items()
         for field in fields
     ),
-    ids=lambda value: str(value).replace(".", "-"),
 )
 def test_validate_model_config_rejects_zero_for_every_positive_integer(
     architecture: str, field: str
@@ -932,7 +925,7 @@ def test_validate_model_config_requires_six_zipformer_stack_values(field: str) -
 )
 @pytest.mark.parametrize("value", (1, "012345", {"a": 0}))
 def test_validate_model_config_rejects_non_list_metadata(
-    architecture: str, field: str, value: object
+    architecture: str, field: str, value: int | str | dict[str, int]
 ) -> None:
     model_config = make_model_config(architecture)
     OmegaConf.update(model_config, field, value, merge=False)
@@ -1161,6 +1154,12 @@ def test_validate_model_config_rejects_inconsistent_metadata(
         ),
         pytest.param(
             "parakeet",
+            {"audio_encoder_params.opt_audio_seconds": float("nan")},
+            "0 < min_audio_seconds",
+            id="nan-duration",
+        ),
+        pytest.param(
+            "parakeet",
             {"audio_encoder_params.min_audio_seconds": 1e-8},
             "between 1 and",
             id="zero-sample-minimum",
@@ -1170,6 +1169,12 @@ def test_validate_model_config_rejects_inconsistent_metadata(
             {"audio_encoder_params.right_padding_samples": -1},
             "non-negative signed-32-bit integer",
             id="negative-right-padding",
+        ),
+        pytest.param(
+            "zipformer",
+            {"audio_encoder_params.right_padding_samples": 0.5},
+            "non-negative signed-32-bit integer",
+            id="non-integer-right-padding",
         ),
         pytest.param(
             "zipformer",
@@ -1275,9 +1280,9 @@ def test_get_engine_reports_deserialization_failure(
     runtime = Mock()
     runtime.deserialize_cuda_engine = Mock(return_value=None, side_effect=failure)
     monkeypatch.setattr(
-        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
+        utils_module.trt, "init_libnvinfer_plugins", lambda logger, namespace: True
     )
-    monkeypatch.setattr(utils_module.trt, "Runtime", lambda _logger: runtime)
+    monkeypatch.setattr(utils_module.trt, "Runtime", lambda logger: runtime)
 
     with pytest.raises(ASRInitializationError, match="Failed to deserialize") as error:
         get_engine(engine_path)
@@ -1294,7 +1299,7 @@ def test_get_engine_wraps_runtime_construction_failure(
     failure = RuntimeError("runtime unavailable")
     runtime = Mock(side_effect=failure)
     monkeypatch.setattr(
-        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
+        utils_module.trt, "init_libnvinfer_plugins", lambda logger, namespace: True
     )
     monkeypatch.setattr(utils_module.trt, "Runtime", runtime)
 
@@ -1311,9 +1316,9 @@ def test_get_engine_wraps_file_read_failure(
     engine_path = tmp_path / "decoder.trt"
     runtime = Mock()
     monkeypatch.setattr(
-        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: True
+        utils_module.trt, "init_libnvinfer_plugins", lambda logger, namespace: True
     )
-    monkeypatch.setattr(utils_module.trt, "Runtime", lambda _logger: runtime)
+    monkeypatch.setattr(utils_module.trt, "Runtime", lambda logger: runtime)
 
     with pytest.raises(ASRInitializationError, match="Failed to deserialize") as error:
         get_engine(engine_path)
@@ -1329,7 +1334,7 @@ def test_get_engine_reports_plugin_initialization_failure(
     engine_path.touch()
     runtime = Mock()
     monkeypatch.setattr(
-        utils_module.trt, "init_libnvinfer_plugins", lambda _logger, _namespace: False
+        utils_module.trt, "init_libnvinfer_plugins", lambda logger, namespace: False
     )
     monkeypatch.setattr(utils_module.trt, "Runtime", runtime)
 
@@ -1375,7 +1380,7 @@ def test_validate_parakeet_tokenizer_uses_full_vocabulary(
 
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
-def test_validate_tokenizer_requires_standalone_word_boundary(
+def test_validate_tokenizer_accepts_missing_standalone_word_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
     zipformer = architecture == "zipformer"
@@ -1390,8 +1395,7 @@ def test_validate_tokenizer_requires_standalone_word_boundary(
     )
     model_config = make_zipformer_config() if zipformer else make_parakeet_config()
 
-    with pytest.raises(ASRInitializationError, match="standalone SentencePiece"):
-        validate_tokenizer(tmp_path, model_config)
+    validate_tokenizer(tmp_path, model_config)
 
 
 def test_validate_tokenizer_reports_vocabulary_mismatch(
@@ -1495,16 +1499,14 @@ def test_validate_tokenizer_reports_loader_failure(
 
 @pytest.mark.parametrize("output_dtype", (trt.float32, trt.float16, trt.bfloat16))
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
-def test_validate_encoder_engine_accepts_supported_output_precision(
+def test_validate_encoder_engine_accepts_supported_precision_and_reordered_io(
     architecture: str, output_dtype: trt.DataType
 ) -> None:
     model_config = make_model_config(architecture)
-    assert (
-        validate_encoder_engine(
-            make_encoder_engine(model_config, output_dtype), model_config
-        )
-        == 2
-    )
+    engine = make_encoder_engine(model_config, output_dtype)
+    engine.names = engine.names[::-1]
+
+    assert validate_encoder_engine(engine, model_config) == 2
 
 
 @pytest.mark.parametrize(
@@ -1565,44 +1567,28 @@ def test_validate_encoder_engine_rejects_audio_profile_mismatch(
 
 
 @pytest.mark.parametrize(
-    "malformation",
-    ("missing_shape", "rank_one", "zero_batch", "oversized_batch", "variable_batch"),
+    ("profile", "message"),
+    (
+        (((2, 1), (2, 2)), "three rank-2"),
+        (((2, 1), (2,), (2, 3)), "three rank-2"),
+        (((0, 1), (0, 2), (0, 3)), "fixed positive signed-32-bit"),
+        (((INT32_MAX + 1, 1),) * 3, "fixed positive signed-32-bit"),
+        (((2, 1), (3, 2), (2, 3)), "fixed positive signed-32-bit"),
+    ),
+    ids=(
+        "missing-shape",
+        "rank-one",
+        "zero-batch",
+        "oversized-batch",
+        "variable-batch",
+    ),
 )
 def test_validate_encoder_engine_rejects_malformed_audio_profile(
-    malformation: str,
+    profile: tuple[tuple[int, ...], ...], message: str
 ) -> None:
     model_config = make_zipformer_config()
     engine = make_encoder_engine(model_config)
-    min_shape, opt_shape, max_shape = engine.profiles["audio"]
-    if malformation == "missing_shape":
-        engine.profiles["audio"] = (min_shape, opt_shape)
-        message = "three rank-2 encoder audio profile shapes"
-    elif malformation == "rank_one":
-        profile = [min_shape, opt_shape, max_shape]
-        profile[1] = (profile[1][0],)
-        engine.profiles["audio"] = tuple(profile)
-        message = "three rank-2 encoder audio profile shapes"
-    elif malformation == "zero_batch":
-        engine.profiles["audio"] = (
-            (0, min_shape[1]),
-            (0, opt_shape[1]),
-            (0, max_shape[1]),
-        )
-        message = "fixed positive signed-32-bit encoder batch size"
-    elif malformation == "oversized_batch":
-        engine.profiles["audio"] = (
-            (INT32_MAX + 1, min_shape[1]),
-            (INT32_MAX + 1, opt_shape[1]),
-            (INT32_MAX + 1, max_shape[1]),
-        )
-        message = "fixed positive signed-32-bit encoder batch size"
-    else:
-        engine.profiles["audio"] = (
-            min_shape,
-            (min_shape[0] + 1, opt_shape[1]),
-            max_shape,
-        )
-        message = "fixed positive signed-32-bit encoder batch size"
+    engine.profiles["audio"] = profile
 
     with pytest.raises(ASRInitializationError, match=message):
         validate_encoder_engine(engine, model_config)
@@ -1631,7 +1617,6 @@ def test_validate_encoder_engine_rejects_lengths_profile_mismatch() -> None:
         ("encoder_output", 2),
         ("encoder_output_lengths", 0),
     ),
-    ids=lambda value: str(value),
 )
 def test_validate_encoder_engine_rejects_tensor_shape_mismatch(
     architecture: str, tensor_name: str, dimension: int
@@ -1654,9 +1639,7 @@ def test_validate_encoder_engine_rejects_tensor_shape_mismatch(
 def test_validate_parakeet_ctc_encoder_rejects_wrong_output_dimension(
     output_dim: int,
 ) -> None:
-    model_config = make_parakeet_config()
-    model_config.decoder_type = "ctc_greedy_search"
-    model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
+    model_config = make_model_config("parakeet", "ctc_greedy_search")
     engine = make_encoder_engine(model_config, trt.float32)
     engine.shapes["encoder_output"] = (2, -1, output_dim)
 
@@ -1666,13 +1649,14 @@ def test_validate_parakeet_ctc_encoder_rejects_wrong_output_dimension(
 
 @pytest.mark.parametrize("architecture", ("zipformer", "parakeet"))
 @pytest.mark.parametrize("floating_dtype", (trt.float32, trt.float16, trt.bfloat16))
-def test_validate_decoder_engine_accepts_supported_precision(
+def test_validate_decoder_engine_accepts_supported_precision_and_reordered_io(
     architecture: str, floating_dtype: trt.DataType
 ) -> None:
     model_config = make_model_config(architecture)
-    validate_decoder_engine(
-        make_decoder_engine(model_config, floating_dtype), model_config, 2
-    )
+    engine = make_decoder_engine(model_config, floating_dtype)
+    engine.names = engine.names[::-1]
+
+    validate_decoder_engine(engine, model_config, 2)
 
 
 @pytest.mark.parametrize(
@@ -1682,7 +1666,6 @@ def test_validate_decoder_engine_accepts_supported_precision(
         for architecture, tensor_names in DECODER_PRECISION_TENSORS.items()
         for tensor_name in tensor_names
     ),
-    ids=lambda value: str(value),
 )
 def test_validate_decoder_engine_rejects_mixed_floating_precision(
     architecture: str, tensor_name: str
@@ -1709,39 +1692,22 @@ def test_validate_decoder_engine_rejects_uniform_unsupported_precision(
 
 
 @pytest.mark.parametrize(
-    ("tensor_name", "dtype", "message"),
+    ("architecture", "tensor_name", "dtype"),
     (
-        ("targets", trt.int64, "targets dtype"),
-        ("token_log_probs", trt.float16, "token_log_probs dtype"),
-        ("duration_log_probs", trt.float16, "duration_log_probs dtype"),
+        ("zipformer", "tokens_log_prob", trt.float16),
+        ("parakeet", "targets", trt.int64),
+        ("parakeet", "token_log_probs", trt.float16),
+        ("parakeet", "duration_log_probs", trt.float16),
     ),
 )
-def test_validate_parakeet_decoder_rejects_boundary_dtype(
-    tensor_name: str, dtype: trt.DataType, message: str
+def test_validate_decoder_engine_rejects_boundary_dtype(
+    architecture: str, tensor_name: str, dtype: trt.DataType
 ) -> None:
-    model_config = make_parakeet_config()
+    model_config = make_model_config(architecture)
     engine = make_decoder_engine(model_config)
     engine.dtypes[tensor_name] = dtype
 
-    with pytest.raises(ASRInitializationError, match=message):
-        validate_decoder_engine(engine, model_config, 2)
-
-
-@pytest.mark.parametrize(
-    ("tensor_name", "dtype", "message"),
-    (
-        ("decoder_input", trt.int32, "share an FP32, FP16, or BF16"),
-        ("tokens_log_prob", trt.float16, "tokens_log_prob dtype"),
-    ),
-)
-def test_validate_zipformer_decoder_rejects_boundary_dtype(
-    tensor_name: str, dtype: trt.DataType, message: str
-) -> None:
-    model_config = make_zipformer_config()
-    engine = make_decoder_engine(model_config)
-    engine.dtypes[tensor_name] = dtype
-
-    with pytest.raises(ASRInitializationError, match=message):
+    with pytest.raises(ASRInitializationError, match=f"{tensor_name} dtype"):
         validate_decoder_engine(engine, model_config, 2)
 
 
@@ -1789,7 +1755,6 @@ def test_validate_decoder_engine_rejects_invalid_io_signature(
         for tensor_name, rank in tensor_ranks.items()
         for dimension in range(rank)
     ),
-    ids=lambda value: str(value),
 )
 def test_validate_decoder_engine_rejects_shape_mismatch(
     architecture: str, tensor_name: str, dimension: int
@@ -1980,6 +1945,7 @@ def test_validate_zipformer_context_lookup_accepts_supported_dtype(
         ("shape_columns", "context lookup shape"),
         ("dtype", "FP16, FP32, or BF16"),
         ("nan", "every predictor context lookup value to be finite"),
+        ("inf", "every predictor context lookup value to be finite"),
     ),
 )
 def test_validate_zipformer_context_lookup_rejects_invalid_content(
@@ -2010,7 +1976,7 @@ def test_validate_zipformer_context_lookup_rejects_invalid_content(
         payload = torch.zeros(expected_shape, dtype=torch.int32)
     else:
         payload = torch.zeros(expected_shape)
-        payload[0, 0] = float("nan")
+        payload[0, 0] = float(malformation)
 
     torch.save(payload, tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE)
 
@@ -2031,7 +1997,7 @@ def test_validate_model_rejects_config_before_reading_bundle(
     monkeypatch.setattr(
         utils_module,
         "validate_tokenizer",
-        lambda _model_dir, _model_config: pytest.fail(
+        lambda model_dir, model_config: pytest.fail(
             "Tokenizer loaded before model metadata was validated."
         ),
     )
@@ -2113,7 +2079,7 @@ def test_validate_model_rejects_encoder_before_loading_decoder(
         return encoder
 
     monkeypatch.setattr(
-        utils_module, "validate_tokenizer", lambda _model_dir, _model_config: None
+        utils_module, "validate_tokenizer", lambda model_dir, model_config: None
     )
     monkeypatch.setattr(utils_module, "get_engine", load_engine)
 
@@ -2139,13 +2105,13 @@ def test_validate_model_rejects_decoder_before_loading_context_cache(
     engines = {encoder_path: make_encoder_engine(model_config), decoder_path: decoder}
 
     monkeypatch.setattr(
-        utils_module, "validate_tokenizer", lambda _model_dir, _model_config: None
+        utils_module, "validate_tokenizer", lambda model_dir, model_config: None
     )
     monkeypatch.setattr(utils_module, "get_engine", engines.__getitem__)
     monkeypatch.setattr(
         utils_module,
         "validate_zipformer_context_lookup",
-        lambda _model_dir, _model_config: pytest.fail(
+        lambda model_dir, model_config: pytest.fail(
             "Context cache loaded after decoder validation failed."
         ),
     )
@@ -2158,12 +2124,7 @@ def test_validate_model_rejects_decoder_before_loading_context_cache(
 def test_validate_model_accepts_complete_ctc_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
 ) -> None:
-    model_config = make_model_config(architecture)
-    model_config.decoder_type = "ctc_greedy_search"
-    model_config.decoder_params = {"beam": 1, "blank_penalty": 0.0}
-    if architecture == "zipformer":
-        model_config.audio_encoder_params.use_ctc = True
-        model_config.audio_encoder_params.output_dim = model_config.vocab_size
+    model_config = make_model_config(architecture, "ctc_greedy_search")
     encoder_path = tmp_path / f"{architecture}.trt"
     encoder_path.touch()
     tokenizer = Mock()
@@ -2201,7 +2162,7 @@ def test_validate_model_accepts_complete_transducer_bundle(
     load_engine = Mock(side_effect=engines.__getitem__)
     validate_context = Mock()
     monkeypatch.setattr(
-        utils_module, "validate_tokenizer", lambda _model_dir, _model_config: None
+        utils_module, "validate_tokenizer", lambda model_dir, model_config: None
     )
     monkeypatch.setattr(utils_module, "get_engine", load_engine)
     monkeypatch.setattr(

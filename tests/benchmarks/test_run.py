@@ -331,7 +331,9 @@ def test_stage_failure_preserves_evidence_and_cleans_only_bundles(
     execute = matrix_run.process.side_effect
     failed_call = ("build", "collect", "score").index(stage) + 1
 
-    def fail_stage(*args: object, **kwargs: object) -> None:
+    def fail_stage(
+        command: list[str], **kwargs: dict[str, str] | Path | TextIO | int | bool
+    ) -> None:
         """Run the stage stub, then fail once at the selected process call.
 
         Artifacts are written before raising ``KeyboardInterrupt`` or
@@ -339,13 +341,13 @@ def test_stage_failure_preserves_evidence_and_cleans_only_bundles(
 
         Parameters
         ----------
-        *args : object
-            Positional subprocess arguments forwarded unchanged to ``execute``.
-        **kwargs : object
+        command : list[str]
+            Subprocess command forwarded unchanged to ``execute``.
+        **kwargs : dict[str, str] | Path | TextIO | int | bool
             Keyword subprocess arguments forwarded unchanged to ``execute``.
         """
 
-        execute(*args, **kwargs)
+        execute(command, **kwargs)
         if matrix_run.process.call_count == failed_call:
             if interrupted:
                 raise KeyboardInterrupt("interrupted")
@@ -405,18 +407,20 @@ def test_rejects_changed_checkpoint_or_sidecar(
     if during_export:
         execute = matrix_run.process.side_effect
 
-        def change_file(*args: object, **kwargs: object) -> None:
+        def change_file(
+            command: list[str], **kwargs: dict[str, str] | Path | TextIO | int | bool
+        ) -> None:
             """Change the selected checkpoint or sidecar before export returns.
 
             Parameters
             ----------
-            *args : object
-                Positional subprocess arguments forwarded to the stage stub.
-            **kwargs : object
+            command : list[str]
+                Subprocess command forwarded to the stage stub.
+            **kwargs : dict[str, str] | Path | TextIO | int | bool
                 Keyword subprocess arguments forwarded to the stage stub.
             """
 
-            execute(*args, **kwargs)
+            execute(command, **kwargs)
             path.write_bytes(b"changed")
 
         matrix_run.process.side_effect = change_file

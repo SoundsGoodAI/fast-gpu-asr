@@ -26,7 +26,7 @@ class Encoder:
         self,
         engine_path: Path,
         sample_rate: int,
-        device_id: int,
+        device: cp.cuda.Device,
         stream: cp.cuda.Stream,
         right_padding_samples: int,
     ) -> None:
@@ -38,8 +38,8 @@ class Encoder:
             Path to the Zipformer or Parakeet encoder engine.
         sample_rate : int
             Sampling rate expected by the model.
-        device_id : int
-            CUDA device ordinal used for inference.
+        device : cp.cuda.Device
+            CUDA device shared by the encoder and decoder.
         stream : cp.cuda.Stream
             CUDA stream shared with downstream decoders.
         right_padding_samples : int
@@ -47,7 +47,7 @@ class Encoder:
             Zipformer feature extraction. Parakeet uses zero.
         """
 
-        self.device = cp.cuda.Device(device_id)
+        self.device = device
         with self.device:
             engine = get_engine(engine_path)
             input_names, output_names = get_names(engine)
@@ -99,7 +99,7 @@ class Encoder:
             self.encoder_output: cp.ndarray | None = None
             self.cuda_graph: cp.cuda.graph.Graph | None = None
             self.cuda_graph_shape: tuple[int, ...] | None = None
-            self.cuda_graph_supported = True
+            self.cuda_graph_supported = stream.ptr != 0
             self.host_transfer_event = cp.cuda.Event(disable_timing=True)
             self.host_transfer_pending = False
             audio_copy_workers = min(

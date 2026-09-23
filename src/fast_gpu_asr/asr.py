@@ -50,7 +50,8 @@ class ASR:
         model_dir_path = Path(model_dir)
         model_config = OmegaConf.load(model_dir_path / MODEL_CONFIG_FILE)
 
-        with cp.cuda.Device(device_id):
+        self.device = cp.cuda.Device(device_id)
+        with self.device:
             if validate:
                 validate_model(model_dir_path, model_config)
 
@@ -63,22 +64,16 @@ class ASR:
             if model_config.model_type == MODEL_TYPE_ZIPFORMER:
                 encoder_file = ZIPFORMER_TENSORRT_FILE
                 right_padding_samples = encoder_params.right_padding_samples
-                if model_config.decoder_type != "ctc_greedy_search":
-                    context_size = decoder_params.context_size
-                    vocab_size = model_config.vocab_size
             else:
                 encoder_file = PARAKEET_TENSORRT_FILE
                 right_padding_samples = 0
-                if model_config.decoder_type != "ctc_greedy_search":
-                    tdt_durations = tuple(decoder_params.tdt_durations)
-                    max_symbols_per_timestep = decoder_params.max_symbols_per_timestep
 
             self.stream = cp.cuda.Stream(null=False, non_blocking=True, ptds=False)
 
             self.encoder = Encoder(
                 model_dir_path / encoder_file,
                 model_config.model_samplerate,
-                device_id,
+                self.device,
                 self.stream,
                 right_padding_samples,
             )
@@ -88,19 +83,19 @@ class ASR:
                     model_config.blank_id,
                     encoder_frame_shift_sec,
                     decoder_params.blank_penalty,
-                    device_id,
+                    self.device,
                     self.stream,
                 )
             elif model_config.model_type == MODEL_TYPE_ZIPFORMER:
                 self.decoder = ZipformerModifiedBeamSearchDecoder(
                     model_dir_path / ZIPFORMER_DECODER_TENSORRT_FILE,
                     self.encoder.batch_size,
-                    context_size,
-                    vocab_size,
+                    decoder_params.context_size,
+                    model_config.vocab_size,
                     model_config.blank_id,
                     encoder_frame_shift_sec,
                     decoder_params.blank_penalty,
-                    device_id,
+                    self.device,
                     self.stream,
                 )
             else:
@@ -108,17 +103,15 @@ class ASR:
                     model_dir_path / PARAKEET_DECODER_TENSORRT_FILE,
                     self.encoder.batch_size,
                     model_config.blank_id,
-                    tdt_durations,
-                    max_symbols_per_timestep,
+                    tuple(decoder_params.tdt_durations),
+                    decoder_params.max_symbols_per_timestep,
                     encoder_frame_shift_sec,
                     decoder_params.blank_penalty,
-                    device_id,
+                    self.device,
                     self.stream,
                 )
 
-        self.postprocessor = PostProcessor(
-            model_dir_path / TOKENIZER_FILE, model_config.model_samplerate
-        )
+        self.postprocessor = PostProcessor(model_dir_path / TOKENIZER_FILE)
 
         self.call_lock = Lock()
 
@@ -130,18 +123,21 @@ class ASR:
         Parameters
         ----------
         audios : list[np.typing.NDArray[np.float32]]
-            One-dimensional waveforms normalized to ``[-1.0, 1.0]`` and
-            sampled at ``encoder.sample_rate``.
+            Nonempty list of nonempty one-dimensional waveforms normalized to
+            ``[-1.0, 1.0]`` and sampled at ``encoder.sample_rate``. Partial batches
+            are supported up to the exported capacity; each waveform must fit
+            the exported maximum duration.
 
         Returns
         -------
         tuple[list[str], list[list[tuple[str, float, float]]]]
-            Decoded texts and ``(word, start, end)`` tuples.
+            Decoded texts and ``(word, start, end)`` tuples in input order.
         """
 
         with self.call_lock:
-            encoder_output, encoder_output_lengths = self.encoder(audios)
-            token_ids, timestamps = self.decoder(encoder_output, encoder_output_lengths)
-            texts, word_timestamps = self.postprocessor(audios, token_ids, timestamps)
+            encoder_output, encoder_output_lens = self.encoder(audios)
+            token_ids, token_times = self.decoder(encoder_output, encoder_output_lens)
+            audio_durs = [audio.size / self.encoder.sample_rate for audio in audios]
+            texts, word_times = self.postprocessor(audio_durs, token_ids, token_times)
 
-        return texts, word_timestamps
+        return texts, word_times

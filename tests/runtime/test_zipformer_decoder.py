@@ -1033,12 +1033,42 @@ def test_zipformer_decoder_rejects_missing_reusable_buffers(
 
 
 @pytest.mark.cuda
-def test_zipformer_decoder_falls_back_after_captured_execution_failure() -> None:
+@pytest.mark.parametrize("failure", ("enqueue", "driver"))
+def test_zipformer_decoder_falls_back_after_captured_execution_failure(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     decoder = make_fake_zipformer_decoder()
     decoder.cuda_graph_supported = True
     decoder.decoder = ScriptedDecoderContext(
-        decoder, ([-8.0, 0.0, -8.0, -8.0],), rejected_call=3
+        decoder,
+        ([-8.0, 0.0, -8.0, -8.0],),
+        rejected_call=3 if failure == "enqueue" else -1,
     )
+    if failure == "driver":
+        execute = decoder.decoder.execute_async_v3
+
+        def invalidate_capture(stream: int) -> bool:
+            """Invalidate capture while reporting successful TensorRT execution.
+
+            Parameters
+            ----------
+            stream : int
+                CUDA stream pointer passed to the scripted execution context.
+
+            Returns
+            -------
+            bool
+                Execution status from the scripted context, which stays ``True``
+                even when capture is deliberately invalidated.
+            """
+
+            executed = execute(stream)
+            if decoder.decoder.calls == 4:
+                with pytest.raises(cp.cuda.runtime.CUDARuntimeError):
+                    cp.cuda.runtime.streamSynchronize(stream)
+            return executed
+
+        monkeypatch.setattr(decoder.decoder, "execute_async_v3", invalidate_capture)
     encoder_output = cp.zeros((1, 2, 3), dtype=np.float32)
     encoder_output_lengths = cp.full(1, 2, dtype=np.int32)
 
@@ -1052,6 +1082,7 @@ def test_zipformer_decoder_falls_back_after_captured_execution_failure() -> None
     assert not decoder.cuda_graph_supported
     assert decoder.cuda_graph is None
     assert decoder.cuda_graph_signature is None
+    assert decoder(encoder_output, encoder_output_lengths)[0] == first_tokens
 
 
 @pytest.mark.cuda
@@ -1112,6 +1143,24 @@ def test_zipformer_decoder_handles_cuda_capture_errors(
     assert token_ids == [[1]]
     assert not decoder.cuda_graph_supported
     assert decoder.cuda_graph is None
+
+
+@pytest.mark.cuda
+def test_zipformer_decoder_propagates_non_capture_driver_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoder = make_fake_zipformer_decoder()
+    decoder.decoder = ScriptedDecoderContext(decoder, ([-8.0, 0.0, -8.0, -8.0],))
+    inputs, lengths = cp.zeros((1, 1, 3), np.float32), cp.ones(1, np.int32)
+    expected = decoder(inputs, lengths)
+    failure = cp.cuda.driver.CUDADriverError(1)
+    with monkeypatch.context() as patch:
+        patch.setattr(decoder, "register_beam_search", (Mock(side_effect=failure), 0))
+        with pytest.raises(cp.cuda.driver.CUDADriverError) as error:
+            decoder(inputs, lengths)
+    assert error.value is failure
+    assert not decoder.stream.is_capturing()
+    assert decoder(inputs, lengths) == expected
 
 
 @pytest.mark.cuda
@@ -1297,43 +1346,23 @@ class NullCudaContext:
 
     def __exit__(
         self,
-        _exc_type: type[BaseException] | None,
-        _exc_value: BaseException | None,
-        _traceback: TracebackType | None,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
     ) -> None:
         """Exit the no-op CUDA context.
 
         Parameters
         ----------
-        _exc_type : type[BaseException] | None
+        exc_type : type[BaseException] | None
             Exception class leaving the context, when present.
-        _exc_value : BaseException | None
+        exc_value : BaseException | None
             Exception instance leaving the context, when present.
-        _traceback : TracebackType | None
+        traceback : TracebackType | None
             Exception traceback leaving the context, when present.
         """
 
         pass
-
-
-class FakeCudaArray:
-    """Expose array metadata for validation paths without allocating storage."""
-
-    def __init__(self, shape: tuple[int, ...], dtype: np.dtype) -> None:
-        """Initialize array metadata used by decoder validation.
-
-        Parameters
-        ----------
-        shape : tuple[int, ...]
-            Dimensions reported by the fake CUDA array.
-        dtype : np.dtype
-            Element dtype reported by the fake CUDA array.
-        """
-
-        self.ndim = len(shape)
-        self.shape = shape
-        self.dtype = dtype
-        self.flags = SimpleNamespace(c_contiguous=True)
 
 
 class RecordingZipformerContext:
@@ -1513,7 +1542,7 @@ def construct_zipformer_decoder(
         blank_id=0,
         encoder_frame_shift_sec=0.04,
         blank_penalty=0.0,
-        device_id=0,
+        device=cast(cp.cuda.Device, NullCudaContext()),
         stream=cast(cp.cuda.Stream, stream),
     )
 
@@ -1521,60 +1550,38 @@ def construct_zipformer_decoder(
 @pytest.mark.parametrize(
     ("encoder_output", "encoder_output_lengths", "message"),
     (
-        pytest.param(
-            np.zeros((2, 4), dtype=np.float32),
-            np.zeros(2, dtype=np.int32),
-            "rank-3",
-            id="rank",
-        ),
-        pytest.param(
-            np.zeros((0, 3, 4), dtype=np.float32),
-            np.zeros(0, dtype=np.int32),
-            "batch capacity",
-            id="empty-batch",
-        ),
-        pytest.param(
-            np.zeros((3, 3, 4), dtype=np.float32),
-            np.zeros(3, dtype=np.int32),
-            "batch capacity",
-            id="oversized-batch",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 5), dtype=np.float32),
-            np.zeros(2, dtype=np.int32),
-            "dimension 4",
-            id="encoder-dimension",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.int32),
-            np.zeros(2, dtype=np.int32),
+        (np.zeros((2, 4), np.float32), np.zeros(2, np.int32), "rank-3"),
+        (np.zeros((0, 3, 4), np.float32), np.zeros(0, np.int32), "batch capacity"),
+        (np.zeros((3, 3, 4), np.float32), np.zeros(3, np.int32), "batch capacity"),
+        (np.zeros((2, 3, 5), np.float32), np.zeros(2, np.int32), "dimension 4"),
+        (
+            np.zeros((2, 3, 4), np.int32),
+            np.zeros(2, np.int32),
             "float16, float32, or bfloat16",
-            id="encoder-dtype",
         ),
-        pytest.param(
-            np.zeros((2, 3, 8), dtype=np.float32)[:, :, ::2],
-            np.zeros(2, dtype=np.int32),
+        (
+            np.zeros((2, 3, 8), np.float32)[:, :, ::2],
+            np.zeros(2, np.int32),
             "contiguous",
-            id="noncontiguous-encoder",
         ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(3, dtype=np.int32),
-            "encoder output lengths",
-            id="length-shape",
+        (np.zeros((2, 3, 4), np.float32), np.zeros(3, np.int32), "output lengths"),
+        (np.zeros((2, 3, 4), np.float32), np.zeros(2, np.int64), "int32"),
+        (
+            np.zeros((2, 3, 4), np.float32),
+            np.zeros(4, np.int32)[::2],
+            "contiguous int32",
         ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(2, dtype=np.int64),
-            "int32 encoder output lengths",
-            id="length-dtype",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(4, dtype=np.int32)[::2],
-            "contiguous int32 encoder output lengths",
-            id="noncontiguous-lengths",
-        ),
+    ),
+    ids=(
+        "rank",
+        "empty-batch",
+        "oversized-batch",
+        "encoder-dimension",
+        "encoder-dtype",
+        "noncontiguous-encoder",
+        "length-shape",
+        "length-dtype",
+        "noncontiguous-lengths",
     ),
 )
 def test_zipformer_decoder_rejects_malformed_inputs(
@@ -1590,29 +1597,27 @@ def test_zipformer_decoder_rejects_malformed_inputs(
         )
 
 
-def test_zipformer_decoder_rejects_int32_history_capacity_overflow() -> None:
+@pytest.mark.parametrize(
+    "actual_batch_size,beam,message",
+    ((1, 4, "token histories exceed"), (2, 1, "encoder output exceeds")),
+)
+def test_zipformer_decoder_rejects_int32_index_overflow(
+    actual_batch_size: int, beam: int, message: str
+) -> None:
     decoder = make_zipformer_validation_decoder()
-    decoder.beam = 2
-    max_frames = INT32_MAX // (decoder.batch_size * decoder.beam) + 1
-    encoder_output = FakeCudaArray(
-        (1, max_frames, decoder.encoder_dim), np.dtype(np.float32)
+    decoder.beam = beam
+    frames = INT32_MAX // (decoder.batch_size * decoder.encoder_dim) + 1
+    inputs = SimpleNamespace(
+        ndim=3,
+        shape=(actual_batch_size, frames, decoder.encoder_dim),
+        dtype=np.float32,
+        flags=SimpleNamespace(c_contiguous=True),
     )
-    output_lengths = FakeCudaArray((1,), np.dtype(np.int32))
-
-    with pytest.raises(ASRInferenceError, match="token histories exceed"):
-        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
-
-
-def test_zipformer_decoder_rejects_int32_encoder_index_overflow() -> None:
-    decoder = make_zipformer_validation_decoder()
-    max_frames = INT32_MAX // (decoder.batch_size * decoder.encoder_dim) + 1
-    encoder_output = FakeCudaArray(
-        (decoder.batch_size, max_frames, decoder.encoder_dim), np.dtype(np.float32)
-    )
-    output_lengths = FakeCudaArray((decoder.batch_size,), np.dtype(np.int32))
-
-    with pytest.raises(ASRInferenceError, match="encoder output exceeds"):
-        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
+    with pytest.raises(ASRInferenceError, match=message):
+        decoder(
+            cast(cp.ndarray, inputs),
+            cast(cp.ndarray, np.ones(actual_batch_size, np.int32)),
+        )
 
 
 @pytest.mark.cuda
@@ -1655,7 +1660,7 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
     )
     context = RecordingZipformerContext()
     engine = FakeZipformerEngine(context, engine_dtype)
-    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
     stream = cp.cuda.get_current_stream()
     decoder = ZipformerModifiedBeamSearchDecoder(
         engine_path,
@@ -1665,7 +1670,7 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
         blank_id=0,
         encoder_frame_shift_sec=0.04,
         blank_penalty=0.0,
-        device_id=0,
+        device=cp.cuda.Device(0),
         stream=stream,
     )
 
@@ -1711,6 +1716,35 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
 
 
 @pytest.mark.cuda
+def test_zipformer_decoder_uses_ordinary_execution_on_legacy_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.save(torch.zeros(81, 4), tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE)
+    engine = FakeZipformerEngine(RecordingZipformerContext())
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
+    with cp.cuda.Stream.null:
+        decoder = ZipformerModifiedBeamSearchDecoder(
+            tmp_path / "decoder.trt",
+            2,
+            2,
+            8,
+            0,
+            0.04,
+            0.0,
+            cp.cuda.Device(0),
+            cp.cuda.Stream.null,
+        )
+        decoder.decoder = ScriptedDecoderContext(decoder, ([-8.0, 0.0, *([-8.0] * 6)],))
+        inputs, lengths = cp.zeros((1, 2, 4), cp.float32), cp.array([2], cp.int32)
+        for _ in range(2):
+            tokens, timestamps = decoder(inputs, lengths)
+            assert tokens == [[1, 1]]
+            np.testing.assert_allclose(timestamps, [[0.0, 0.04]])
+        assert not decoder.cuda_graph_supported
+        assert decoder.cuda_graph is None
+
+
+@pytest.mark.cuda
 def test_zipformer_decoder_initializes_every_wide_beam_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1724,7 +1758,7 @@ def test_zipformer_decoder_initializes_every_wide_beam_context(
         "encoder_output": (6, 4),
         "tokens_log_prob": (6, 8),
     }
-    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
 
     decoder = ZipformerModifiedBeamSearchDecoder(
         engine_path,
@@ -1734,7 +1768,7 @@ def test_zipformer_decoder_initializes_every_wide_beam_context(
         blank_id=3,
         encoder_frame_shift_sec=0.04,
         blank_penalty=0.0,
-        device_id=0,
+        device=cp.cuda.Device(0),
         stream=cp.cuda.get_current_stream(),
     )
 
@@ -1769,7 +1803,6 @@ def test_zipformer_decoder_opts_in_to_large_shared_memory(
         "tokens_log_prob": (beam, vocab_size),
     }
     monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
-    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(
         NullCudaContext,
         "attributes",
@@ -1791,7 +1824,7 @@ def test_zipformer_decoder_opts_in_to_large_shared_memory(
                 0,
                 0.04,
                 0.0,
-                0,
+                cast(cp.cuda.Device, NullCudaContext()),
                 cast(cp.cuda.Stream, NullCudaContext()),
             )
         register_launch, (kernel, shared_memory_bytes), _ = (
@@ -1813,8 +1846,7 @@ def test_zipformer_decoder_rejects_missing_execution_context(
 ) -> None:
     stream = NullCudaContext()
     engine = FakeZipformerEngine(None)
-    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
 
     with pytest.raises(
         ASRInitializationError, match="could not create the Zipformer decoder"
@@ -1828,8 +1860,7 @@ def test_zipformer_decoder_rejects_profile_selection_failure(
     stream = NullCudaContext()
     context = RecordingZipformerContext(profile_accepted=False)
     engine = FakeZipformerEngine(context)
-    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
-    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
 
     with pytest.raises(ASRInitializationError, match="optimization profile 0"):
         construct_zipformer_decoder(stream)
@@ -1847,12 +1878,12 @@ def test_zipformer_decoder_rejects_tensor_binding_failure(
     context = RecordingZipformerContext(rejected_binding)
     engine = FakeZipformerEngine(context)
 
-    def allocate(_shape: tuple[int, ...], dtype: type[np.float32]) -> SimpleNamespace:
+    def allocate(shape: tuple[int, ...], dtype: type[np.float32]) -> SimpleNamespace:
         """Return a pointer-bearing stand-in for one CuPy allocation.
 
         Parameters
         ----------
-        _shape : tuple[int, ...]
+        shape : tuple[int, ...]
             Allocation shape accepted for compatibility with ``cp.empty``.
         dtype : type[np.float32]
             Requested NumPy scalar type.
@@ -1866,9 +1897,8 @@ def test_zipformer_decoder_rejects_tensor_binding_failure(
         assert dtype is np.float32
         return SimpleNamespace(data=SimpleNamespace(ptr=1))
 
-    monkeypatch.setattr(zipformer_rnnt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(zipformer_rnnt_decoder.cp, "empty", allocate)
-    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(zipformer_rnnt_decoder, "get_engine", lambda path: engine)
 
     with pytest.raises(ASRInitializationError, match=rejected_binding):
         construct_zipformer_decoder(stream)

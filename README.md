@@ -63,7 +63,8 @@ We reproduced the [Open ASR Leaderboard](https://github.com/huggingface/open_asr
 
 **Requirements:** Linux x86-64, Python 3.12-3.14, a Turing (SM75) or newer NVIDIA GPU, and
 [NVIDIA driver 580 or newer](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
-The package uses CUDA 13 and TensorRT.
+Driver 580 is the CUDA 13 family minimum; PTX JIT or newer CUDA features may
+require a newer driver. The package uses CUDA 13 and TensorRT.
 The wheel includes all nine TensorRT plugin libraries; no local compilation or
 TensorRT development headers are needed.
 
@@ -208,17 +209,22 @@ Pass one or more nonempty 1D NumPy `float32` waveforms as a list, normalized to
 padded internally. Stay within the exported batch and duration limits; resample
 or split audio beforehand.
 
-`ASR` returns a transcript and a list of `(word, start, end)` tuples per clip,
-with times in seconds. Timestamps come from decoder tokens; the final word ends
-at the clip's duration. Select a GPU with `ASR(..., device_id=0)`.
+`ASR` returns `(texts, word_timestamps)` with one transcript and one list of
+`(word, start, end)` tuples per clip. Times are in seconds, rounded to milliseconds.
+They are encoder-frame estimates, not forced alignments: word intervals extend to the
+next word boundary or the clip's duration. Select a GPU with `ASR(..., device_id=0)`.
+
+Direct encoder/decoder use requires a `cp.cuda.Device`, a CUDA stream, and
+serialized calls. Encoder outputs reuse GPU buffers: use the same stream or
+synchronize across streams, and copy outputs you need to keep after the next call.
 
 ## Models and Inference Precision
 
 | Family | Example checkpoints | Decoder modes |
 |---|---|---|
-| Zipformer Transducer | [CR-CTC Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M), [Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M) | Transducer modified beam search |
+| Zipformer Transducer | [CR-CTC Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M), [Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-transducer-XL-290M) | Modified beam search / beam one |
 | Zipformer CTC | [CR-CTC Transducer XL 290M](https://huggingface.co/soundsgoodai/Zipformer-cr-ctc-transducer-XL-290M) | CTC greedy |
-| Parakeet TDT | [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) | TDT modified beam search |
+| Parakeet TDT | [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) | Modified beam search / beam one |
 | Parakeet CTC | [0.6B](https://huggingface.co/nvidia/parakeet-ctc-0.6b), [1.1B](https://huggingface.co/nvidia/parakeet-ctc-1.1b) | CTC greedy |
 
 **FP32, FP16, and BF16** are supported. BF16 requires Ampere or newer.
@@ -329,8 +335,8 @@ nonzero settings are not equivalent. Mode, beam, and penalty are saved in
 ### Export and Runtime Notes
 
 `--encoder-precision` and `--decoder-precision` default to `fp32`. Waveform
-frontends and CTC heads remain FP32 in both models. Changing precision can change
-transcripts: check WER alongside throughput.
+frontends and CTC heads remain FP32 in both models. FP32 permits TF32 and eligible
+reduced-math plugin tactics; check WER alongside throughput when changing precision.
 
 - **Zipformer precision.** The final encoder projection and transducer log
   probabilities remain FP32. BF16 exports use FP16 for the first subsampling
@@ -385,7 +391,9 @@ across precisions. Formatting limits are 88 columns for Python and 100 for CUDA/
 
 **Build a wheel:** `scripts/build_wheel.sh` rebuilds plugins and produces a repaired
 `manylinux_2_27_x86_64` wheel in `dist/`. Pass an output directory to override it.
-CUDA and TensorRT remain external dependencies. Source distributions are unsupported.
+This also requires `binutils` and `patchelf` in addition to the source-build
+prerequisites. CUDA and TensorRT remain external dependencies. Source
+distributions are unsupported.
 
 **CI:** The [workflow](https://github.com/SoundsGoodAI/fast-gpu-asr/actions/workflows/ci.yml)
 runs Python 3.12-3.14 CPU checks on pushes to `main` and pull requests. Manual

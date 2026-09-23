@@ -679,7 +679,7 @@ def test_feature_plugin_honors_nondefault_serialized_frontend(
     extractor.eps = 0.1
     result = build_feature_engine(creator, extractor, ((1, 640), (2, 2048), (3, 4096)))
     assert result is not None
-    _runtime, engine = result
+    _, engine = result
     lengths = np.array((3968, 2176), dtype=np.int64)
     audio = make_audio(lengths, 4096, seed=11)
     actual, actual_lengths = assert_run_matches_pytorch(

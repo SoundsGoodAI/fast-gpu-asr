@@ -3,9 +3,9 @@
 
 """Transcription postprocessing."""
 
+from math import isfinite
 from pathlib import Path
 
-import numpy as np
 import sentencepiece as spm
 
 from ..utils import ASRInferenceError
@@ -14,30 +14,37 @@ from ..utils import ASRInferenceError
 class PostProcessor:
     """Convert decoder token sequences into text and word timestamps."""
 
-    def __init__(self, tokenizer_path: Path, sample_rate: int) -> None:
+    def __init__(self, tokenizer_path: Path) -> None:
         """Cache tokenizer metadata used during transcription postprocessing.
+
+        Unknown, control, and byte-fallback tokens require exact per-word decoding
+        because their surfaces can disagree with the token word boundaries.
 
         Parameters
         ----------
         tokenizer_path : Path
             Path to the SentencePiece model packaged with the ASR model.
-        sample_rate : int
-            Input audio sampling rate in hertz.
         """
 
-        tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
-        token_pieces = tokenizer.id_to_piece(list(range(tokenizer.vocab_size())))
-
-        self.sample_rate = sample_rate
-        self.tokenizer = tokenizer
-        self.starts_word = tuple(piece.startswith("▁") for piece in token_pieces)
-        self.standalone_word_id = (
-            token_pieces.index("▁") if "▁" in token_pieces else None
+        self.tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
+        self.starts_word = tuple(
+            self.tokenizer.id_to_piece(token_id).startswith("▁")
+            for token_id in range(self.tokenizer.vocab_size())
         )
+        self.standalone_word_id = self.tokenizer.piece_to_id("▁")
+        if self.tokenizer.is_unknown(self.standalone_word_id):
+            self.standalone_word_id = None
+        self.fallback_token_ids = {
+            token_id
+            for token_id in range(self.tokenizer.vocab_size())
+            if self.tokenizer.is_unknown(token_id)
+            or self.tokenizer.is_control(token_id)
+            or self.tokenizer.is_byte(token_id)
+        }
 
     def __call__(
         self,
-        audios: list[np.typing.NDArray[np.float32]],
+        audio_durations: list[float],
         token_ids: list[list[int]],
         timestamps: list[list[float]],
     ) -> tuple[list[str], list[list[tuple[str, float, float]]]]:
@@ -45,8 +52,8 @@ class PostProcessor:
 
         Parameters
         ----------
-        audios : list[np.typing.NDArray[np.float32]]
-            Nonempty mono waveforms used to bound word timestamps.
+        audio_durations : list[float]
+            Audio durations in seconds, used to bound word timestamps.
         token_ids : list[list[int]]
             Decoded token IDs for each utterance.
         timestamps : list[list[float]]
@@ -61,10 +68,10 @@ class PostProcessor:
         ------
         ASRInferenceError
             Raised when batch dimensions or token metadata counts differ or
-            an audio waveform or decoder timestamp is malformed.
+            a decoder timestamp is malformed.
         """
 
-        if not len(audios) == len(token_ids) == len(timestamps):
+        if not len(audio_durations) == len(token_ids) == len(timestamps):
             raise ASRInferenceError(
                 "Decoder batch size differs from the input audio batch size."
             )
@@ -74,17 +81,12 @@ class PostProcessor:
 
         texts = self.tokenizer.decode(token_ids)
         word_timestamps: list[list[tuple[str, float, float]]] = [[] for _ in token_ids]
-        fallback_token_ids: list[list[int]] = []
+        fallback_tokens: list[list[int]] = []
         fallback_words: list[tuple[int, float, float]] = []
         rounded_timestamps: dict[float, float] = {}
-        for utt_idx, (audio, utt_token_ids, utt_timestamps) in enumerate(
-            zip(audios, token_ids, timestamps, strict=True)
+        for utt_idx, (utt_end_sec, utt_token_ids, utt_timestamps) in enumerate(
+            zip(audio_durations, token_ids, timestamps, strict=True)
         ):
-            if audio.ndim != 1 or audio.size == 0:
-                raise ASRInferenceError(
-                    "Expected each audio waveform to be a nonempty one-dimensional "
-                    f"NumPy array, got utterance {utt_idx}."
-                )
             if len(utt_token_ids) != len(utt_timestamps):
                 raise ASRInferenceError(
                     "Decoder token and timestamp counts differ for utterance "
@@ -95,7 +97,6 @@ class PostProcessor:
             if not utt_token_ids:
                 continue
 
-            utterance_end_sec = audio.size / self.sample_rate
             word_boundaries: list[tuple[int, float, float]] = []
             word_left: int | None = None
             rounded_word_start = 0.0
@@ -104,7 +105,7 @@ class PostProcessor:
             for token_index, (token_id, timestamp) in enumerate(
                 zip(utt_token_ids, utt_timestamps, strict=True)
             ):
-                if not np.isfinite(timestamp) or timestamp < previous_timestamp:
+                if not isfinite(timestamp) or timestamp < previous_timestamp:
                     raise ASRInferenceError(
                         "Expected finite, non-negative, nondecreasing decoder "
                         f"timestamps, got {timestamp} at token {token_index} of "
@@ -116,14 +117,14 @@ class PostProcessor:
                 if token_id == self.standalone_word_id:
                     # Consecutive standalone markers retain the earliest boundary.
                     if pending_word_start is None:
-                        pending_word_start = min(timestamp, utterance_end_sec)
+                        pending_word_start = min(timestamp, utt_end_sec)
                     continue
 
                 if pending_word_start is not None:
                     next_word_start = pending_word_start
                     pending_word_start = None
                 elif word_left is None or self.starts_word[token_id]:
-                    next_word_start = min(timestamp, utterance_end_sec)
+                    next_word_start = min(timestamp, utt_end_sec)
                 else:
                     continue
 
@@ -141,21 +142,19 @@ class PostProcessor:
                 rounded_word_start = rounded_next_word_start
 
             if word_left is not None:
-                rounded_word_end = rounded_timestamps.get(utterance_end_sec)
+                rounded_word_end = rounded_timestamps.get(utt_end_sec)
                 if rounded_word_end is None:
-                    rounded_word_end = round(utterance_end_sec, 3)
-                    rounded_timestamps[utterance_end_sec] = rounded_word_end
+                    rounded_word_end = round(utt_end_sec, 3)
+                    rounded_timestamps[utt_end_sec] = rounded_word_end
 
                 word_boundaries.append(
                     (word_left, rounded_word_start, rounded_word_end)
                 )
 
-            # SentencePiece normally separates exactly the boundaries identified
-            # by its metaspace tokens. Reusing the decoded text avoids one native
-            # decoder call per word. Unusual surfaces such as <unk> may introduce
-            # additional whitespace and take the exact batched fallback below.
+            # Special tokens can hide mismatches even when word counts agree.
             words = texts[utt_idx].split()
-            if len(words) == len(word_boundaries):
+            can_split_words = self.fallback_token_ids.isdisjoint(utt_token_ids)
+            if can_split_words and len(words) == len(word_boundaries):
                 word_timestamps[utt_idx] = [
                     (word, word_start, word_end)
                     for word, (_, word_start, word_end) in zip(
@@ -169,7 +168,7 @@ class PostProcessor:
             for (left, word_start, word_end), right in zip(
                 word_boundaries, word_rights, strict=True
             ):
-                fallback_token_ids.append(
+                fallback_tokens.append(
                     [
                         token_id
                         for token_id in utt_token_ids[left:right]
@@ -178,8 +177,8 @@ class PostProcessor:
                 )
                 fallback_words.append((utt_idx, word_start, word_end))
 
-        if fallback_token_ids:
-            decoded_words = self.tokenizer.decode(fallback_token_ids)
+        if fallback_tokens:
+            decoded_words = self.tokenizer.decode(fallback_tokens)
             for word, (utt_idx, word_start, word_end) in zip(
                 decoded_words, fallback_words, strict=True
             ):

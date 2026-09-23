@@ -362,7 +362,7 @@ def make_fake_parakeet_decoder(
         "duration_log_probs": (capacity, len(durations)),
     }
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
+        patch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
         decoder = ParakeetModifiedBeamSearchDecoder(
             Path("decoder.trt"),
             batch_size=batch_size,
@@ -371,7 +371,7 @@ def make_fake_parakeet_decoder(
             max_symbols_per_timestep=10,
             encoder_frame_shift_sec=0.08,
             blank_penalty=0.0,
-            device_id=0,
+            device=cp.cuda.Device(0),
             stream=cp.cuda.get_current_stream(),
         )
     decoder.cuda_graph_supported = False
@@ -498,12 +498,12 @@ def install_static_decoder_context(
     token_scores_array = cp.array(token_scores, dtype=np.float32)
     duration_scores_array = cp.array(duration_scores, dtype=np.float32)
 
-    def execute(_call: int) -> bool:
+    def execute(call: int) -> bool:
         """Write fixed scores and zero recurrent states for one step.
 
         Parameters
         ----------
-        _call : int
+        call : int
             Zero-based invocation accepted for the callback contract.
 
         Returns
@@ -569,7 +569,7 @@ def test_parakeet_decoder_returns_empty_results_for_zero_frames() -> None:
 @pytest.mark.cuda
 def test_parakeet_decoder_reports_tensorrt_execution_failure() -> None:
     decoder = make_fake_parakeet_decoder()
-    decoder.decoder = RuntimeDecoderContext(decoder, lambda _call: False)
+    decoder.decoder = RuntimeDecoderContext(decoder, lambda call: False)
 
     with pytest.raises(ASRInferenceError, match="TensorRT decoder execution failed"):
         decoder(cp.zeros((1, 1, 3), dtype=np.float32), cp.ones(1, dtype=np.int32))
@@ -761,12 +761,12 @@ def test_parakeet_decoder_does_not_leak_history_across_calls() -> None:
     decoder = make_fake_parakeet_decoder()
     emit_token = True
 
-    def execute(_call: int) -> bool:
+    def execute(call: int) -> bool:
         """Select a token or blank according to the enclosing test state.
 
         Parameters
         ----------
-        _call : int
+        call : int
             Zero-based invocation accepted for the callback contract.
 
         Returns
@@ -802,12 +802,12 @@ def test_parakeet_decoder_uses_configured_duration_values() -> None:
     decoder = make_fake_parakeet_decoder(durations=(0, 2))
     encoder_inputs: list[np.typing.NDArray[np.float32]] = []
 
-    def execute(_call: int) -> bool:
+    def execute(call: int) -> bool:
         """Record prepared encoder input and emit a two-frame token.
 
         Parameters
         ----------
-        _call : int
+        call : int
             Zero-based invocation accepted for the callback contract.
 
         Returns
@@ -1196,12 +1196,12 @@ def test_parakeet_decoder_retries_after_capture_execution_failure() -> None:
 
     capture_calls = 0
 
-    def execute(_call: int) -> bool:
+    def execute(call: int) -> bool:
         """Fail the second TensorRT execution recorded during graph capture.
 
         Parameters
         ----------
-        _call : int
+        call : int
             Zero-based invocation accepted for the callback contract.
 
         Returns
@@ -1253,12 +1253,12 @@ def test_parakeet_decoder_recovers_from_invalidated_cuda_capture() -> None:
 
     capture_invalidations = 0
 
-    def execute(_call: int) -> bool:
+    def execute(call: int) -> bool:
         """Invalidate CUDA capture while returning valid decoder outputs.
 
         Parameters
         ----------
-        _call : int
+        call : int
             Zero-based invocation accepted for the callback contract.
 
         Returns
@@ -2705,26 +2705,6 @@ class RecordingCudaContext:
         self.events.append(f"exit_{self.name}")
 
 
-class FakeCudaArray:
-    """Expose array metadata for validation paths without allocating storage."""
-
-    def __init__(self, shape: tuple[int, ...], dtype: np.dtype) -> None:
-        """Initialize array metadata used by decoder validation.
-
-        Parameters
-        ----------
-        shape : tuple[int, ...]
-            Dimensions reported by the fake CUDA array.
-        dtype : np.dtype
-            Element dtype reported by the fake CUDA array.
-        """
-
-        self.ndim = len(shape)
-        self.shape = shape
-        self.dtype = dtype
-        self.flags = SimpleNamespace(c_contiguous=True)
-
-
 class FakeDeviceBuffer:
     """Expose a stable device pointer without allocating CUDA memory."""
 
@@ -2941,7 +2921,6 @@ def test_parakeet_decoder_opts_in_to_large_shared_memory(
         for name in ("BEAM_SEARCH", "SELECT_TOKENS", "GROUP", "SELECT_GROUPS")
     }
     monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
-    monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(
         NullCudaContext, "attributes", {"MaxSharedMemoryPerBlockOptin": 64 * 1024}
     )
@@ -2956,7 +2935,7 @@ def test_parakeet_decoder_opts_in_to_large_shared_memory(
             10,
             0.08,
             0.0,
-            0,
+            cast(cp.cuda.Device, NullCudaContext()),
             cast(cp.cuda.Stream, NullCudaContext()),
         )
 
@@ -2970,26 +2949,9 @@ def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    requested_device_ids: list[int] = []
     failure = RuntimeError("engine load failed")
+    device = RecordingCudaContext("device", events)
     stream = RecordingCudaContext("stream", events)
-
-    def make_device(device_id: int) -> RecordingCudaContext:
-        """Record the requested device and return its fake CUDA context.
-
-        Parameters
-        ----------
-        device_id : int
-            CUDA device identifier requested by the decoder.
-
-        Returns
-        -------
-        RecordingCudaContext
-            Device context backed by the shared event log.
-        """
-
-        requested_device_ids.append(device_id)
-        return RecordingCudaContext("device", events)
 
     def fail_engine_load(engine_path: Path) -> None:
         """Raise the configured engine-load failure inside active contexts.
@@ -3009,7 +2971,6 @@ def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
         assert events == ["enter_device", "enter_stream"]
         raise failure
 
-    monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", make_device)
     monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", fail_engine_load)
 
     with pytest.raises(RuntimeError) as error:
@@ -3021,12 +2982,11 @@ def test_parakeet_decoder_initializes_inside_requested_cuda_contexts(
             max_symbols_per_timestep=10,
             encoder_frame_shift_sec=0.08,
             blank_penalty=0.0,
-            device_id=4,
+            device=cast(cp.cuda.Device, device),
             stream=cast(cp.cuda.Stream, stream),
         )
 
     assert error.value is failure
-    assert requested_device_ids == [4]
     assert events == ["enter_device", "enter_stream", "exit_stream", "exit_device"]
 
 
@@ -3047,12 +3007,15 @@ def test_parakeet_decoder_zero_frame_call_uses_cuda_contexts() -> None:
 
 
 def construct_parakeet_decoder(
+    device: cp.cuda.Device | NullCudaContext,
     stream: cp.cuda.Stream | NullCudaContext,
 ) -> ParakeetModifiedBeamSearchDecoder:
     """Initialize a decoder matching the default fake TensorRT engine.
 
     Parameters
     ----------
+    device : cp.cuda.Device | NullCudaContext
+        Real or no-op CUDA device supplied to constructor tests.
     stream : cp.cuda.Stream | NullCudaContext
         Real or no-op CUDA stream supplied to constructor tests.
 
@@ -3070,7 +3033,7 @@ def construct_parakeet_decoder(
         max_symbols_per_timestep=10,
         encoder_frame_shift_sec=0.08,
         blank_penalty=0.0,
-        device_id=0,
+        device=cast(cp.cuda.Device, device),
         stream=cast(cp.cuda.Stream, stream),
     )
 
@@ -3111,60 +3074,38 @@ def test_parakeet_decoder_swaps_buffers_and_rebinds_both_states(
 @pytest.mark.parametrize(
     ("encoder_output", "encoder_output_lengths", "message"),
     (
-        pytest.param(
-            np.zeros((2, 4), dtype=np.float32),
-            np.zeros(2, dtype=np.int32),
-            "rank-3",
-            id="rank",
-        ),
-        pytest.param(
-            np.zeros((0, 3, 4), dtype=np.float32),
-            np.zeros(0, dtype=np.int32),
-            "batch capacity",
-            id="empty-batch",
-        ),
-        pytest.param(
-            np.zeros((3, 3, 4), dtype=np.float32),
-            np.zeros(3, dtype=np.int32),
-            "batch capacity",
-            id="oversized-batch",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 5), dtype=np.float32),
-            np.zeros(2, dtype=np.int32),
-            "dimension 4",
-            id="encoder-dimension",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.int32),
-            np.zeros(2, dtype=np.int32),
+        (np.zeros((2, 4), np.float32), np.zeros(2, np.int32), "rank-3"),
+        (np.zeros((0, 3, 4), np.float32), np.zeros(0, np.int32), "batch capacity"),
+        (np.zeros((3, 3, 4), np.float32), np.zeros(3, np.int32), "batch capacity"),
+        (np.zeros((2, 3, 5), np.float32), np.zeros(2, np.int32), "dimension 4"),
+        (
+            np.zeros((2, 3, 4), np.int32),
+            np.zeros(2, np.int32),
             "float16, float32, or bfloat16",
-            id="encoder-dtype",
         ),
-        pytest.param(
-            np.zeros((2, 3, 8), dtype=np.float32)[:, :, ::2],
-            np.zeros(2, dtype=np.int32),
+        (
+            np.zeros((2, 3, 8), np.float32)[:, :, ::2],
+            np.zeros(2, np.int32),
             "contiguous",
-            id="noncontiguous-encoder",
         ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(3, dtype=np.int32),
-            "encoder output lengths",
-            id="length-shape",
+        (np.zeros((2, 3, 4), np.float32), np.zeros(3, np.int32), "output lengths"),
+        (np.zeros((2, 3, 4), np.float32), np.zeros(2, np.int64), "int32"),
+        (
+            np.zeros((2, 3, 4), np.float32),
+            np.zeros(4, np.int32)[::2],
+            "contiguous int32",
         ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(2, dtype=np.int64),
-            "int32 encoder output lengths",
-            id="length-dtype",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(4, dtype=np.int32)[::2],
-            "contiguous int32 encoder output lengths",
-            id="noncontiguous-lengths",
-        ),
+    ),
+    ids=(
+        "rank",
+        "empty-batch",
+        "oversized-batch",
+        "encoder-dimension",
+        "encoder-dtype",
+        "noncontiguous-encoder",
+        "length-shape",
+        "length-dtype",
+        "noncontiguous-lengths",
     ),
 )
 def test_parakeet_decoder_rejects_malformed_inputs(
@@ -3180,26 +3121,21 @@ def test_parakeet_decoder_rejects_malformed_inputs(
         )
 
 
-def test_parakeet_decoder_rejects_int32_history_capacity_overflow() -> None:
+@pytest.mark.parametrize("history", (False, True))
+def test_parakeet_decoder_rejects_int32_index_overflow(history: bool) -> None:
     decoder = make_parakeet_validation_decoder()
-    decoder.max_symbols_per_timestep = INT32_MAX
-    encoder_output = np.zeros((2, 2, 4), dtype=np.float32)
-    output_lengths = np.full(2, 2, dtype=np.int32)
-
-    with pytest.raises(ASRInferenceError, match="signed 32-bit kernel indexing"):
-        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
-
-
-def test_parakeet_decoder_rejects_int32_encoder_capacity_overflow() -> None:
-    decoder = make_parakeet_validation_decoder()
-    max_frames = INT32_MAX // (decoder.batch_size * decoder.encoder_dim) + 1
-    encoder_output = FakeCudaArray(
-        (decoder.batch_size, max_frames, decoder.encoder_dim), np.dtype(np.float32)
+    decoder.max_symbols_per_timestep = INT32_MAX if history else 1
+    frames = (
+        1 if history else INT32_MAX // (decoder.batch_size * decoder.encoder_dim) + 1
     )
-    output_lengths = FakeCudaArray((decoder.batch_size,), np.dtype(np.int32))
-
-    with pytest.raises(ASRInferenceError, match="signed 32-bit kernel indexing"):
-        decoder(cast(cp.ndarray, encoder_output), cast(cp.ndarray, output_lengths))
+    inputs = SimpleNamespace(
+        ndim=3,
+        shape=(decoder.batch_size, frames, decoder.encoder_dim),
+        dtype=np.float32,
+        flags=SimpleNamespace(c_contiguous=True),
+    )
+    with pytest.raises(ASRInferenceError, match="32-bit"):
+        decoder(cast(cp.ndarray, inputs), cast(cp.ndarray, np.ones(2, np.int32)))
 
 
 @pytest.mark.cuda
@@ -3228,7 +3164,8 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
     engine = FakeParakeetEngine(context, encoder_trt_dtype, state_trt_dtype)
     load_engine = Mock(return_value=engine)
     monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", load_engine)
-    decoder = construct_parakeet_decoder(stream)
+    device = cp.cuda.Device(0)
+    decoder = construct_parakeet_decoder(device, stream)
 
     load_engine.assert_called_once_with(Path("decoder.trt"))
     assert sorted(engine.shape_requests) == sorted(engine.shapes)
@@ -3244,7 +3181,7 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
         "output_states_1": decoder.output_state_1.data.ptr,
         "output_states_2": decoder.output_state_2.data.ptr,
     }
-    assert decoder.device.id == 0
+    assert decoder.device is device
     assert decoder.stream is stream
     assert decoder.decoder is context
     assert (
@@ -3330,6 +3267,26 @@ def test_parakeet_decoder_initializes_precisions_and_fixed_bindings(
 
 
 @pytest.mark.cuda
+def test_parakeet_decoder_uses_ordinary_execution_on_legacy_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = FakeParakeetEngine(RecordingParakeetContext())
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
+    with cp.cuda.Stream.null:
+        decoder = construct_parakeet_decoder(cp.cuda.Device(0), cp.cuda.Stream.null)
+        assert not decoder.cuda_graph_supported
+        install_static_decoder_context(
+            decoder, [-10.0, 0.0, *([-10.0] * 6)], [-10.0, 0.0]
+        )
+        inputs = cp.zeros((1, 17, 4), dtype=cp.float32)
+        lengths = cp.array([17], dtype=cp.int32)
+        tokens, timestamps = decoder(inputs, lengths)
+        assert tokens == [[1] * 17]
+        np.testing.assert_allclose(timestamps, [np.arange(17) * 0.08])
+        assert decoder.cuda_graph is None
+
+
+@pytest.mark.cuda
 @pytest.mark.parametrize("threads", [128, 256, 512])
 def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
     monkeypatch: pytest.MonkeyPatch,
@@ -3345,7 +3302,7 @@ def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
         "token_log_probs": (6, 8),
         "duration_log_probs": (6, 2),
     }
-    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
     monkeypatch.setattr(parakeet_tdt_decoder, "TDT_BEAM_SEARCH_THREADS", threads)
 
     decoder = ParakeetModifiedBeamSearchDecoder(
@@ -3356,7 +3313,7 @@ def test_parakeet_decoder_derives_wide_beam_capacity_and_buffers(
         max_symbols_per_timestep=10,
         encoder_frame_shift_sec=0.08,
         blank_penalty=0.25,
-        device_id=0,
+        device=cp.cuda.Device(0),
         stream=stream,
     )
 
@@ -3423,10 +3380,10 @@ def test_parakeet_decoder_reports_fixed_tensor_binding_failure(
     stream = cp.cuda.get_current_stream()
     context = RecordingParakeetContext(rejected_binding)
     engine = FakeParakeetEngine(context)
-    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda _path: engine)
+    monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", lambda path: engine)
 
     with pytest.raises(ASRInitializationError) as error:
-        construct_parakeet_decoder(stream)
+        construct_parakeet_decoder(cp.cuda.Device(0), stream)
 
     assert str(error.value) == (
         f"TensorRT rejected the Parakeet decoder tensor {rejected_binding}."
@@ -3451,11 +3408,10 @@ def test_parakeet_decoder_reports_context_setup_failure(
     )
     engine = FakeParakeetEngine(context)
     load_engine = Mock(return_value=engine)
-    monkeypatch.setattr(parakeet_tdt_decoder.cp.cuda, "Device", NullCudaContext)
     monkeypatch.setattr(parakeet_tdt_decoder, "get_engine", load_engine)
 
     with pytest.raises(ASRInitializationError) as error:
-        construct_parakeet_decoder(stream)
+        construct_parakeet_decoder(NullCudaContext(), stream)
 
     assert str(error.value) == message
     load_engine.assert_called_once_with(Path("decoder.trt"))

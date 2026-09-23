@@ -74,8 +74,15 @@ def make_joiner(
     return joiner.eval()
 
 
-@pytest.mark.parametrize("context_size", (1, 2))
-@pytest.mark.parametrize("dimensions", (DEFAULT_DIMENSIONS, ALTERNATE_DIMENSIONS))
+@pytest.mark.parametrize(
+    "context_size,dimensions",
+    (
+        (1, DEFAULT_DIMENSIONS),
+        (1, (5, 3, 6)),
+        (2, DEFAULT_DIMENSIONS),
+        (2, ALTERNATE_DIMENSIONS),
+    ),
+)
 def test_predictor_matches_reference(
     context_size: int, dimensions: tuple[int, int, int]
 ) -> None:
@@ -132,23 +139,26 @@ def test_predictor_checkpoint_layout(
     } == expected_shapes
 
 
-def assert_context_lookup(decoder: Decoder, chunk_size: int) -> None:
-    """Check cache row order, bounded batching, precision, and unchanged weights.
-
-    Parameters
-    ----------
-    decoder : Decoder
-        Small predictor whose complete context vocabulary fits in memory.
-    chunk_size : int
-        Maximum number of contexts permitted in each predictor call.
-
-    Notes
-    -----
-    Expected values are computed with reversed context enumeration, then
-    indexed using the runtime's radix formula to detect cache-order mistakes.
-    The temporary forward hook is removed before returning.
-    """
-
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize(
+    "context_size,dimensions,chunk_size",
+    (
+        (1, DEFAULT_DIMENSIONS, 1),
+        (1, DEFAULT_DIMENSIONS, 7),
+        (2, DEFAULT_DIMENSIONS, 1),
+        (2, DEFAULT_DIMENSIONS, 7),
+        (2, DEFAULT_DIMENSIONS, 36),
+        (2, ALTERNATE_DIMENSIONS, 100),
+    ),
+)
+def test_context_lookup_matches_runtime_index(
+    context_size: int,
+    dimensions: tuple[int, int, int],
+    chunk_size: int,
+    dtype: torch.dtype,
+) -> None:
+    decoder = make_decoder(context_size, dtype, dimensions)
+    # Reverse enumeration so expected rows are located by the runtime's radix formula.
     contexts = torch.tensor(
         list(product(range(-1, decoder.vocab_size), repeat=decoder.context_size)),
         dtype=torch.int32,
@@ -161,7 +171,7 @@ def assert_context_lookup(decoder: Decoder, chunk_size: int) -> None:
     batch_sizes = []
 
     with decoder.register_forward_pre_hook(
-        lambda _module, inputs: batch_sizes.append(len(inputs[0]))
+        lambda module, inputs: batch_sizes.append(len(inputs[0]))
     ):
         lookup = decoder.make_context_lookup(chunk_size)
 
@@ -172,24 +182,18 @@ def assert_context_lookup(decoder: Decoder, chunk_size: int) -> None:
     assert lookup.is_contiguous()
     assert not lookup.requires_grad
     assert torch.isfinite(lookup).all()
+    assert {parameter.dtype for parameter in decoder.parameters()} == {dtype}
     torch.testing.assert_close(lookup[indexes], expected)
     torch.testing.assert_close(decoder.state_dict(), snapshot, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("chunk_size", (1, 7, 36, 100))
-@pytest.mark.parametrize("context_size", (1, 2))
-def test_context_lookup_matches_runtime_index(
-    context_size: int, chunk_size: int, dtype: torch.dtype
-) -> None:
-    decoder = make_decoder(context_size, dtype)
-
-    assert {parameter.dtype for parameter in decoder.parameters()} == {dtype}
-    assert_context_lookup(decoder, chunk_size)
-
-
-def test_context_lookup_honors_nondefault_dimensions() -> None:
-    assert_context_lookup(make_decoder(dimensions=ALTERNATE_DIMENSIONS), 7)
+def test_context_lookup_uses_predictor_device() -> None:
+    # Meta exercises non-CPU allocation without CUDA-enabled PyTorch.
+    with torch.device("meta"):
+        decoder = Decoder(5, 8, 6, 2, torch.float32)
+    lookup = decoder.make_context_lookup(7)
+    assert lookup.device == decoder.decoder_proj.weight.device
+    assert lookup.shape == (36, 6)
 
 
 @pytest.mark.parametrize("chunk_size", (0, -1, 1.0))

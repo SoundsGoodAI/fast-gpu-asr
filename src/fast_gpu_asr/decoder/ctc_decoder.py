@@ -28,7 +28,7 @@ class CTCGreedyDecoder:
         blank_id: int,
         encoder_frame_shift_sec: float,
         blank_penalty: float,
-        device_id: int,
+        device: cp.cuda.Device,
         stream: cp.cuda.Stream,
     ) -> None:
         """Initialize the decoder.
@@ -42,13 +42,13 @@ class CTCGreedyDecoder:
         blank_penalty : float
             Value subtracted from blank-token log probabilities before greedy
             path selection.
-        device_id : int
-            CUDA device ordinal used for inference.
+        device : cp.cuda.Device
+            CUDA device shared by the encoder and decoder.
         stream : cp.cuda.Stream
             CUDA stream shared with the encoder.
         """
 
-        self.device = cp.cuda.Device(device_id)
+        self.device = device
         self.blank_id = blank_id
         self.encoder_frame_shift_sec = encoder_frame_shift_sec
         self.blank_penalty = blank_penalty
