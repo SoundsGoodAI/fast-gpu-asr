@@ -73,6 +73,8 @@ def reference_attention(
 ) -> torch.Tensor:
     """Evaluate relative attention by explicitly indexing every score.
 
+    Accumulate dot products in FP32, then preserve projection-dtype rounding.
+
     Parameters
     ----------
     attention : RelPositionMultiHeadAttention
@@ -103,7 +105,7 @@ def reference_attention(
 
     scores = torch.empty(
         (batch_size, num_heads, sequence_length, sequence_length),
-        dtype=torch.float32,
+        dtype=x.dtype,
         device=x.device,
     )
     for query_index in range(sequence_length):
@@ -126,7 +128,7 @@ def reference_attention(
                 .to(x.dtype)
             )
             scores[:, :, query_index, key_index] = (
-                content_score.float() + position_score.float()
+                content_score + position_score
             ) / math.sqrt(head_dim)
 
     key_padding_mask = (
@@ -135,9 +137,7 @@ def reference_attention(
     weights = torch.softmax(
         scores.masked_fill(key_padding_mask[:, None, None], float("-inf")), dim=3
     )
-    weights = weights.masked_fill((output_lengths <= 0)[:, None, None, None], 0.0).to(
-        value.dtype
-    )
+    weights = weights.masked_fill((output_lengths <= 0)[:, None, None, None], 0.0)
     output = torch.einsum("bhqk,bkhd->bqhd", weights, value)
     return attention.linear_out(output.flatten(2))
 
@@ -206,7 +206,7 @@ def test_parakeet_attention_casts_positions_to_input_dtype(
         pytest.param(torch.bfloat16, 2.77e-3, id="bf16"),
     ),
 )
-def test_parakeet_attention_promotes_score_sum_before_softmax(
+def test_parakeet_attention_keeps_score_sum_in_projection_dtype(
     dtype: torch.dtype, position_delta: float
 ) -> None:
     with torch.random.fork_rng(devices=[]):
@@ -244,7 +244,7 @@ def test_parakeet_attention_promotes_score_sum_before_softmax(
     assert torch.isfinite(output).all()
     torch.testing.assert_close(
         output[0, 0],
-        torch.stack((promoted_weight, torch.zeros((), dtype=dtype))),
+        torch.stack((low_precision_weight, torch.zeros((), dtype=dtype))),
         atol=0.0,
         rtol=0.0,
     )

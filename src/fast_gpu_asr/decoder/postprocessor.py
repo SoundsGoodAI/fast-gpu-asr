@@ -31,7 +31,9 @@ class PostProcessor:
         self.sample_rate = sample_rate
         self.tokenizer = tokenizer
         self.starts_word = tuple(piece.startswith("▁") for piece in token_pieces)
-        self.standalone_word_id = tokenizer.piece_to_id("▁")
+        self.standalone_word_id = (
+            token_pieces.index("▁") if "▁" in token_pieces else None
+        )
 
     def __call__(
         self,
@@ -44,7 +46,7 @@ class PostProcessor:
         Parameters
         ----------
         audios : list[np.typing.NDArray[np.float32]]
-            Input waveforms used to bound the final word in each utterance.
+            Nonempty mono waveforms used to bound word timestamps.
         token_ids : list[list[int]]
             Decoded token IDs for each utterance.
         timestamps : list[list[float]]
@@ -58,7 +60,7 @@ class PostProcessor:
         Raises
         ------
         ASRInferenceError
-            Raised when batch dimensions or token and timestamp counts differ or
+            Raised when batch dimensions or token metadata counts differ or
             an audio waveform or decoder timestamp is malformed.
         """
 
@@ -162,7 +164,7 @@ class PostProcessor:
                 ]
                 continue
 
-            word_rights = [word_left for word_left, _, _ in word_boundaries[1:]]
+            word_rights = [boundary[0] for boundary in word_boundaries[1:]]
             word_rights.append(len(utt_token_ids))
             for (left, word_start, word_end), right in zip(
                 word_boundaries, word_rights, strict=True

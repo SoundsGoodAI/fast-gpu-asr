@@ -252,7 +252,7 @@ def test_joiner_normalizes_low_precision_logits_in_float32(dtype: torch.dtype) -
 
     actual = joiner(torch.zeros(2, 6, dtype=dtype), torch.zeros(2, 6, dtype=dtype))
 
-    torch.testing.assert_close(actual, expected.expand(2, 5))
+    torch.testing.assert_close(actual, expected.expand(2, 5), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

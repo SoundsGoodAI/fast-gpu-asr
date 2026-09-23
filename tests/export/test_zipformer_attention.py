@@ -247,7 +247,8 @@ def reference_self_attention(
     x : torch.Tensor
         Features of shape ``(batch, frames, input_dim)``.
     attention_weights : torch.Tensor
-        Weights of shape ``(batch, heads, frames, frames)``.
+        Weights of shape ``(batch, heads, frames, frames)`` in the projected
+        values' dtype.
 
     Returns
     -------
@@ -259,9 +260,7 @@ def reference_self_attention(
     values = module.in_proj(x).reshape(
         batch_size, sequence_length, module.num_heads, -1
     )
-    weighted_values = torch.einsum(
-        "bhqk,bkhd->bqhd", attention_weights.to(values.dtype), values
-    )
+    weighted_values = torch.einsum("bhqk,bkhd->bqhd", attention_weights, values)
     return module.out_proj(weighted_values.flatten(2))
 
 
@@ -530,7 +529,12 @@ def test_self_attention_matches_reference(
     generator = torch.Generator().manual_seed(4)
     weights = torch.softmax(
         torch.randn(
-            2, NUM_HEADS, sequence_length, sequence_length, generator=generator
+            2,
+            NUM_HEADS,
+            sequence_length,
+            sequence_length,
+            dtype=dtype,
+            generator=generator,
         ),
         dim=3,
     )
@@ -574,16 +578,19 @@ def test_nonlinear_attention_matches_reference(
     generator = torch.Generator().manual_seed(5)
     weights = torch.softmax(
         torch.randn(
-            2, NUM_HEADS, sequence_length, sequence_length, generator=generator
+            2,
+            NUM_HEADS,
+            sequence_length,
+            sequence_length,
+            dtype=dtype,
+            generator=generator,
         ),
         dim=3,
     )
     module = make_nonlinear_attention(dtype)
     x = torch.randn(2, sequence_length, 12, dtype=dtype, generator=generator)
     gate, value, multiplier = module.in_proj(x).chunk(3, dim=2)
-    expected = torch.einsum(
-        "bqk,bkd->bqd", weights[:, 0].to(dtype), value * torch.tanh(gate)
-    )
+    expected = torch.einsum("bqk,bkd->bqd", weights[:, 0], value * torch.tanh(gate))
     expected = module.out_proj(expected * multiplier)
 
     actual = module(x, weights)
@@ -633,7 +640,7 @@ def test_attention_value_products_export_as_tensorrt_plugin(
         value_heads = 1
     x = torch.randn(2, 7, input_channels, dtype=dtype, generator=generator)
     attention_weights = torch.softmax(
-        torch.randn(2, attention_heads, 7, 7, generator=generator), dim=3
+        torch.randn(2, attention_heads, 7, 7, dtype=dtype, generator=generator), dim=3
     )
     onnx_path = tmp_path / "attention_value.onnx"
     dynamic_sequence_length = torch.export.Dim("sequence_length", min=1, max=32)
@@ -669,6 +676,7 @@ def test_attention_value_products_export_as_tensorrt_plugin(
     }
     assert len(custom_node.input) == 2
     assert len(custom_node.output) == 1
+    assert custom_node.input[0] == "attention_weights"
     assert custom_node.input[1] != "x"
     assert custom_node.output[0] != "output"
     assert not any(
@@ -699,11 +707,6 @@ def test_attention_value_products_export_as_tensorrt_plugin(
     for name, shape in expected_shapes:
         assert get_onnx_shape(value_info[name]) == shape, name
         assert value_info[name].type.tensor_type.elem_type == ONNX_DTYPES[dtype], name
-    assert get_onnx_shape(value_info["attention_weights"]) == weights_shape
-    assert (
-        value_info["attention_weights"].type.tensor_type.elem_type
-        == onnx.TensorProto.FLOAT
-    )
 
 
 @pytest.mark.parametrize(

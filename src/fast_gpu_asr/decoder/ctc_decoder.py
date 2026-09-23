@@ -15,11 +15,12 @@ from .gpu_kernels import CTC_COLLAPSE_KERNEL
 class CTCGreedyDecoder:
     """Collapse batched CTC argmax paths into token sequences for either model family.
 
-    The decoder keeps all frame-level work on the shared CUDA stream. It first
-    computes the argmax path for every frame, then launches one CUDA block per
-    utterance to remove repeated tokens and blanks. Token IDs, timestamps, and
-    emitted lengths are written to reusable device buffers and copied back to
-    pinned host buffers only after the valid output width is known.
+    The decoder keeps all frame-level work on the shared CUDA stream. Token IDs,
+    timestamps, and emitted lengths are written to reusable device buffers and
+    copied back to pinned host buffers only after the valid output width is known.
+
+    CuPy computes the argmax path for every frame. One CUDA block per utterance
+    then removes repeated tokens and blanks.
     """
 
     def __init__(
@@ -71,7 +72,8 @@ class CTCGreedyDecoder:
         log_probs : cp.ndarray
             FP32, FP16, or BF16 CTC log probabilities with shape
             ``(batch_size, num_frames, vocab_size)``. A nonzero blank penalty
-            adjusts the blank column in place before path selection.
+            adjusts the blank column in place. Path selection uses the updated
+            scores in the input dtype.
         output_lengths : cp.ndarray
             Contiguous CUDA ``int32`` valid frame counts with shape
             ``(batch_size,)``.
@@ -80,7 +82,7 @@ class CTCGreedyDecoder:
         -------
         tuple[list[list[int]], list[list[float]]]
             Collapsed non-blank token IDs and corresponding token start
-            timestamps in seconds.
+            timestamps in seconds, in input order.
 
         Raises
         ------
@@ -122,10 +124,6 @@ class CTCGreedyDecoder:
             )
 
         with self.device, self.stream:
-            if self.blank_penalty != 0.0:
-                log_probs[:, :, self.blank_id] -= self.blank_penalty
-            paths = cp.argmax(log_probs, axis=2).astype(cp.int32, copy=False)
-
             output_shape = (batch_size, num_frames)
             if self.emitted_tokens is None or self.emitted_tokens.shape != output_shape:
                 self.emitted_tokens = cp.empty(output_shape, dtype=np.int32)
@@ -143,6 +141,10 @@ class CTCGreedyDecoder:
                 or self.emitted_lengths_host is None
             ):
                 raise ASRInferenceError("CTC output buffers were not initialized.")
+
+            if self.blank_penalty != 0.0:
+                log_probs[:, :, self.blank_id] -= self.blank_penalty
+            paths = cp.argmax(log_probs, axis=2).astype(cp.int32, copy=False)
 
             CTC_COLLAPSE_KERNEL(
                 (batch_size,),

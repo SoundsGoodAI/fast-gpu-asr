@@ -497,15 +497,19 @@ def test_bias_norm_matches_float32_reference(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", DTYPE_TOLERANCES, ids=str)
-@pytest.mark.parametrize("value", (0.0, 256.0), ids=("zero-rms", "large-magnitude"))
+@pytest.mark.parametrize(
+    "value",
+    (0.0, 256.0, 32768.0),
+    ids=("zero-rms", "square-overflow", "scale-overflow"),
+)
 def test_bias_norm_handles_extreme_magnitudes(dtype: torch.dtype, value: float) -> None:
     module = BiasNorm(12).to(dtype)
-    module.scale.fill_(1.0)
+    module.scale.fill_(3.0)
     inputs = torch.full((2, 3, 12), value, dtype=dtype)
 
     actual = module(inputs)
 
-    expected = torch.full_like(inputs, 0.0 if value == 0 else 1.0)
+    expected = torch.full_like(inputs, 0.0 if value == 0 else 3.0)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

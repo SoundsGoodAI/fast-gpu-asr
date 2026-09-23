@@ -63,10 +63,11 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
         -------
         torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Output features with shape ``(batch_size, num_frames, n_feat)`` and
-            the same dtype as ``x``. Eager execution converts the content and
-            position scores to ``torch.float32`` before combining and normalizing
-            them. ONNX export replaces relative scoring, masking, softmax, and
+            the same dtype as ``x``. Eager scores and softmax outputs retain
+            the projection dtype.
+            ONNX export replaces relative scoring, masking, softmax, and
             value aggregation with one native TensorRT relative-attention plugin node.
+            The plugin combines scores and normalizes them in ``torch.float32``.
         """
 
         batch_size, num_frames, _ = x.size()
@@ -96,12 +97,8 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
             )
             content_query = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
             position_query = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
-            content_scores = torch.matmul(content_query, k.permute(0, 1, 3, 2)).to(
-                torch.float32
-            )
-            position_scores = torch.matmul(position_query, p.permute(0, 1, 3, 2)).to(
-                torch.float32
-            )
+            content_scores = torch.matmul(content_query, k.permute(0, 1, 3, 2))
+            position_scores = torch.matmul(position_query, p.permute(0, 1, 3, 2))
             position_scores = torch.nn.functional.pad(position_scores, (1, 0))
             position_scores = position_scores.reshape(
                 batch_size, self.h, position_scores.size(3), num_frames
@@ -123,7 +120,7 @@ class RelPositionMultiHeadAttention(torch.nn.Module):
             )
             weights = weights.masked_fill(
                 (output_lengths <= 0).reshape(batch_size, 1, 1, 1), 0.0
-            ).to(v.dtype)
+            )
             x = (
                 torch.matmul(weights, v.permute(0, 2, 1, 3))
                 .permute(0, 2, 1, 3)

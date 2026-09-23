@@ -46,6 +46,7 @@ class SelfAttention(torch.nn.Module):
             Input with shape ``(batch_size, seq_len, embed_dim)``.
         attn_weights : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Weights with shape ``(batch_size, num_heads, seq_len, seq_len)``.
+            Must have the same dtype as the projected values.
 
         Returns
         -------
@@ -57,7 +58,6 @@ class SelfAttention(torch.nn.Module):
         """
 
         x = self.in_proj(x)  # (batch_size, seq_len, num_heads * value_head_dim)
-        attn_weights = attn_weights.to(x.dtype)
 
         if torch.onnx.is_in_onnx_export():
             x = torch.onnx.ops.symbolic(
@@ -112,6 +112,7 @@ class NonlinAttention(torch.nn.Module):
             Input with shape ``(batch_size, seq_len, embed_dim)``.
         attn_weights : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Weights with shape ``(batch_size, num_heads, seq_len, seq_len)``.
+            Must have the same dtype as the projected values.
             Nonlinear attention consumes the first attention head.
 
         Returns
@@ -125,7 +126,6 @@ class NonlinAttention(torch.nn.Module):
 
         s, x, y = self.in_proj(x).chunk(3, dim=2)
         x = x * torch.tanh(s)
-        attn_weights = attn_weights.to(x.dtype)
 
         if torch.onnx.is_in_onnx_export():
             x = torch.onnx.ops.symbolic(

@@ -75,9 +75,8 @@ class Conv2dSubsampling(torch.nn.Module):
         ----------
         x : torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             Padded input features with shape ``(batch_size, num_frames, input_dim)``.
-            The top-level encoder casts ``torch.float32`` log-mel features to its
-            configured dtype before invoking this module. Frames beyond ``x_lens``
-            must be filled with ``ZERO_LOG``.
+            Features are cast to the first convolution's dtype here. Frames
+            beyond ``x_lens`` must be filled with ``ZERO_LOG``.
         x_lens : torch.Tensor[torch.int32]
             Valid input lengths with shape ``(batch_size,)``.
 
@@ -175,13 +174,14 @@ class BiasNorm(torch.nn.Module):
         -------
         torch.Tensor[torch.float32 | torch.float16 | torch.bfloat16]
             A normalized tensor with the same shape and dtype as ``x``.
+            Bias and scale promote arithmetic to FP32 without a separate
+            FP32 copy of the input tensor.
         """
 
-        output_dtype = x.dtype
-        x = x.to(torch.float32)
         centered = x - self.bias.to(torch.float32)
         rms = torch.sqrt(torch.mean(centered * centered, dim=2, keepdim=True))
         # TensorRT 11.2 fails to compile float32.tiny ("stof"). This floor is
         # below the smallest positive FP32 square root, so only zero RMS is clamped.
         rms = torch.clamp(rms, min=1e-30)
-        return (x * self.scale.to(torch.float32) / rms).to(output_dtype)
+        # A one-element scale promotes x; a scalar would retain x's dtype.
+        return (x * self.scale.to(torch.float32).reshape(1) / rms).to(x.dtype)

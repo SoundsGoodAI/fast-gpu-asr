@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright SoundsGoodAI 2026 - Daniil Kulko
 
-"""Runtime and validation tests for Zipformer CTC and RNN-T decoders."""
+"""Runtime and validation tests for the Zipformer RNN-T decoder."""
 
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -21,7 +21,6 @@ from fast_gpu_asr.constants import (
     ZIPFORMER_DECODER_CONTEXTS_FILE,
 )
 from fast_gpu_asr.decoder import gpu_kernels, zipformer_rnnt_decoder
-from fast_gpu_asr.decoder.ctc_decoder import CTCGreedyDecoder
 from fast_gpu_asr.decoder.gpu_kernels import (
     ZIPFORMER_BEAM_SEARCH_SOURCE,
     ZIPFORMER_FINALIZE_KERNEL,
@@ -85,31 +84,6 @@ class ScriptedDecoderContext:
                 self.decoder.tokens_log_prob, self.outputs[call % len(self.outputs)]
             )
         return call != self.rejected_call
-
-
-def make_ctc_decoder(blank_id: int = 0, blank_penalty: float = 0.0) -> CTCGreedyDecoder:
-    """Create a CTC decoder on the test's current CUDA stream.
-
-    Parameters
-    ----------
-    blank_id : int
-        Vocabulary ID interpreted as CTC blank.
-    blank_penalty : float
-        Score subtracted from the blank token before greedy selection.
-
-    Returns
-    -------
-    CTCGreedyDecoder
-        Decoder configured for 40 ms encoder frames on CUDA device zero.
-    """
-
-    return CTCGreedyDecoder(
-        blank_id=blank_id,
-        encoder_frame_shift_sec=0.04,
-        blank_penalty=blank_penalty,
-        device_id=0,
-        stream=cp.cuda.get_current_stream(),
-    )
 
 
 def initialize_zipformer_search_buffers(
@@ -375,143 +349,6 @@ def test_zipformer_beam_search_factory_rejects_invalid_thread_count(
 def test_zipformer_beam_search_factory_rejects_shared_memory_overflow() -> None:
     with pytest.raises(ValueError, match="dynamic shared memory exceeds"):
         get_zipformer_beam_search_kernels(1, 1, INT32_MAX // 4)
-
-
-@pytest.mark.cuda
-@pytest.mark.parametrize(
-    "dtype",
-    (
-        pytest.param(np.dtype(np.float32), id="fp32"),
-        pytest.param(np.dtype(np.float16), id="fp16"),
-        pytest.param(cp.dtype("bfloat16"), marks=pytest.mark.sm80, id="bf16"),
-    ),
-)
-def test_ctc_greedy_collapses_repeats_and_blanks(dtype: np.dtype) -> None:
-    decoder = make_ctc_decoder()
-    paths = cp.array([[0, 1, 1, 0, 1, 2], [2, 2, 0, 3, 3, 3]])
-    log_probs = cp.eye(4, dtype=cp.float32)[paths].astype(dtype)
-
-    token_ids, timestamps = decoder(log_probs, cp.array([6, 4], dtype=np.int32))
-
-    assert token_ids == [[1, 1, 2], [2, 3]]
-    np.testing.assert_allclose(timestamps[0], [0.04, 0.16, 0.20])
-    np.testing.assert_allclose(timestamps[1], [0.0, 0.12])
-
-
-@pytest.mark.cuda
-@pytest.mark.parametrize("blank_id", (0, 1))
-@pytest.mark.parametrize(
-    ("blank_probability", "blank_penalty", "emits_token"),
-    ((0.75, 0.0, False), (0.75, 2.0, True), (0.25, 0.0, True), (0.25, -2.0, False)),
-    ids=("blank-wins", "positive-penalty", "token-wins", "negative-penalty"),
-)
-def test_ctc_greedy_applies_blank_penalty_before_argmax(
-    blank_id: int, blank_probability: float, blank_penalty: float, emits_token: bool
-) -> None:
-    decoder = make_ctc_decoder(blank_id=blank_id, blank_penalty=blank_penalty)
-    log_probs = cp.full((1, 1, 2), np.log(1 - blank_probability), dtype=cp.float32)
-    log_probs[:, :, blank_id] = np.log(blank_probability)
-
-    token_ids, timestamps = decoder(log_probs, cp.array([1], dtype=np.int32))
-
-    assert token_ids == ([[1 - blank_id]] if emits_token else [[]])
-    assert timestamps == ([[0.0]] if emits_token else [[]])
-
-
-@pytest.mark.cuda
-def test_ctc_greedy_supports_nonzero_blank_id() -> None:
-    decoder = make_ctc_decoder(blank_id=2)
-    paths = cp.array([[2, 1, 1, 2, 1]])
-    log_probs = cp.eye(3, dtype=cp.float32)[paths]
-
-    token_ids, timestamps = decoder(log_probs, cp.array([5], dtype=np.int32))
-
-    assert token_ids == [[1, 1]]
-    np.testing.assert_allclose(timestamps, [[0.04, 0.16]])
-
-
-@pytest.mark.cuda
-def test_ctc_greedy_clamps_invalid_output_lengths() -> None:
-    decoder = make_ctc_decoder()
-    log_probs = cp.array(
-        [[[0.0, 1.0], [1.0, 0.0]], [[0.0, 1.0], [1.0, 0.0]]], dtype=np.float32
-    )
-
-    token_ids, timestamps = decoder(log_probs, cp.array([10, -1], dtype=np.int32))
-
-    assert token_ids == [[1], []]
-    np.testing.assert_allclose(timestamps[0], [0.0])
-    assert timestamps[1] == []
-
-
-@pytest.mark.cuda
-def test_ctc_greedy_reuses_buffers_without_leaking_results() -> None:
-    decoder = make_ctc_decoder()
-    first_paths = cp.array([[1, 0, 2, 0], [2, 2, 0, 0]])
-    first_tokens, first_timestamps = decoder(
-        cp.eye(4, dtype=cp.float32)[first_paths], cp.full(2, 4, dtype=np.int32)
-    )
-    buffer_names = (
-        "emitted_tokens",
-        "emitted_timestamps",
-        "emitted_lengths",
-        "emitted_tokens_host",
-        "emitted_timestamps_host",
-        "emitted_lengths_host",
-    )
-    allocated_buffers = {name: getattr(decoder, name) for name in buffer_names}
-
-    second_paths = cp.array([[3, 0, 1, 0], [0, 0, 0, 0]])
-    second_tokens, second_timestamps = decoder(
-        cp.eye(4, dtype=cp.float32)[second_paths], cp.full(2, 4, dtype=np.int32)
-    )
-
-    assert first_tokens == [[1, 2], [2]]
-    np.testing.assert_allclose(first_timestamps[0], [0.0, 0.08])
-    np.testing.assert_allclose(first_timestamps[1], [0.0])
-    assert second_tokens == [[3, 1], []]
-    np.testing.assert_allclose(second_timestamps[0], [0.0, 0.08])
-    assert second_timestamps[1] == []
-    for name, buffer in allocated_buffers.items():
-        assert getattr(decoder, name) is buffer, name
-
-
-@pytest.mark.cuda
-@pytest.mark.parametrize(
-    "buffer_name, message",
-    [
-        ("emitted_timestamps", "CTC output buffers"),
-        ("emitted_timestamps_host", "CTC host output buffers"),
-    ],
-)
-def test_ctc_greedy_rejects_missing_reusable_buffers(
-    buffer_name: str, message: str
-) -> None:
-    decoder = make_ctc_decoder()
-    log_probs = cp.array([[[0.0, 1.0], [1.0, 0.0]]], dtype=np.float32)
-    lengths = cp.array([2], dtype=np.int32)
-    expected = ([[1]], [[0.0]])
-    assert decoder(log_probs, lengths) == expected
-    buffer = getattr(decoder, buffer_name)
-    setattr(decoder, buffer_name, None)
-
-    with pytest.raises(ASRInferenceError, match=message):
-        decoder(log_probs, lengths)
-
-    setattr(decoder, buffer_name, buffer)
-    assert decoder(log_probs, lengths) == expected
-
-
-@pytest.mark.cuda
-def test_ctc_greedy_returns_empty_results_for_zero_frames() -> None:
-    decoder = make_ctc_decoder()
-
-    token_ids, timestamps = decoder(
-        cp.empty((2, 0, 4), dtype=np.float32), cp.zeros(2, dtype=np.int32)
-    )
-
-    assert token_ids == [[], []]
-    assert timestamps == [[], []]
 
 
 @pytest.mark.cuda
@@ -1634,20 +1471,6 @@ class FakeZipformerEngine:
         return self.context
 
 
-def make_ctc_validation_decoder() -> CTCGreedyDecoder:
-    """Construct only the state needed by pre-CUDA CTC validation.
-
-    Returns
-    -------
-    CTCGreedyDecoder
-        Uninitialized decoder carrying a valid blank-token ID.
-    """
-
-    decoder = CTCGreedyDecoder.__new__(CTCGreedyDecoder)
-    decoder.blank_id = 0
-    return decoder
-
-
 def make_zipformer_validation_decoder() -> ZipformerModifiedBeamSearchDecoder:
     """Construct only the state needed by pre-CUDA RNN-T validation.
 
@@ -1693,68 +1516,6 @@ def construct_zipformer_decoder(
         device_id=0,
         stream=cast(cp.cuda.Stream, stream),
     )
-
-
-@pytest.mark.parametrize(
-    ("log_probs", "output_lengths", "message"),
-    (
-        pytest.param(
-            np.zeros((2, 3), dtype=np.float32),
-            np.zeros(2, dtype=np.int32),
-            "rank-3",
-            id="rank",
-        ),
-        pytest.param(
-            np.zeros((0, 3, 4), dtype=np.float32),
-            np.zeros(0, dtype=np.int32),
-            "At least one CTC utterance",
-            id="empty-batch",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.int32),
-            np.zeros(2, dtype=np.int32),
-            "float16, float32, or bfloat16",
-            id="log-probability-dtype",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(3, dtype=np.int32),
-            "output lengths",
-            id="length-shape",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(2, dtype=np.int64),
-            "output lengths",
-            id="length-dtype",
-        ),
-        pytest.param(
-            np.zeros((2, 3, 4), dtype=np.float32),
-            np.zeros(4, dtype=np.int32)[::2],
-            "contiguous int32 output lengths",
-            id="noncontiguous-lengths",
-        ),
-    ),
-)
-def test_ctc_decoder_rejects_malformed_inputs(
-    log_probs: np.typing.NDArray[np.generic],
-    output_lengths: np.typing.NDArray[np.generic],
-    message: str,
-) -> None:
-    decoder = make_ctc_validation_decoder()
-
-    with pytest.raises(ASRInferenceError, match=message):
-        decoder(cast(cp.ndarray, log_probs), cast(cp.ndarray, output_lengths))
-
-
-def test_ctc_decoder_rejects_int32_frame_overflow() -> None:
-    log_probs = FakeCudaArray((1, INT32_MAX + 1, 2), np.dtype(np.float32))
-    output_lengths = FakeCudaArray((1,), np.dtype(np.int32))
-
-    with pytest.raises(ASRInferenceError, match="CTC frame count exceeds"):
-        make_ctc_validation_decoder()(
-            cast(cp.ndarray, log_probs), cast(cp.ndarray, output_lengths)
-        )
 
 
 @pytest.mark.parametrize(
@@ -1887,6 +1648,8 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
 ) -> None:
     engine_path = tmp_path / "decoder.trt"
     context_lookup = torch.arange(81 * 4, dtype=torch.float32).reshape(81, 4) / 7.0
+    if context_dtype == torch.bfloat16:
+        context_lookup[0] = torch.tensor((-0.0, -1.0, 2.0**-133, 2.0**120))
     torch.save(
         context_lookup.to(context_dtype), tmp_path / ZIPFORMER_DECODER_CONTEXTS_FILE
     )
@@ -1934,6 +1697,7 @@ def test_zipformer_decoder_initializes_context_cache_and_bindings(
     assert decoder.decoder_input.dtype == expected_engine_dtype
     assert decoder.encoder_input.dtype == expected_engine_dtype
     assert decoder.context_lookup.dtype == expected_context_dtype
+    assert decoder.context_lookup.flags.c_contiguous
     assert decoder.initial_decoder_input.dtype == expected_engine_dtype
     assert decoder.tokens_log_prob.dtype == np.float32
     np.testing.assert_array_equal(
