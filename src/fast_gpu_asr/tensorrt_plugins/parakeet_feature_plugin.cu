@@ -440,7 +440,8 @@ class ParakeetFeaturePlugin final : public IPluginV3,
         : mParameters(parameters), mTactic(tactic)
     {
         mInitialized =
-            areValidParameters(parameters) && cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS;
+            areValidParameters(parameters) && cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS
+            && cudaEventCreateWithFlags(&mPlanReady, cudaEventDisableTiming) == cudaSuccess;
         if (mInitialized)
         {
             int32_t device{};
@@ -477,6 +478,10 @@ class ParakeetFeaturePlugin final : public IPluginV3,
         if (mPlan != 0)
         {
             cufftDestroy(mPlan);
+        }
+        if (mPlanReady != nullptr)
+        {
+            cudaEventDestroy(mPlanReady);
         }
         if (mCublas != nullptr)
         {
@@ -716,7 +721,10 @@ class ParakeetFeaturePlugin final : public IPluginV3,
         int32_t outputEmbed[]{frequencies};
         cufftResult const result = cufftPlanMany(&mPlan, 1, dimensions, inputEmbed, 1,
             transformStride, outputEmbed, 1, frequencies, CUFFT_R2C, rows);
-        if (result != CUFFT_SUCCESS)
+        // Order legacy-stream plan initialization before nonblocking execution.
+        // Without this dependency, concurrent shape changes have exposed an
+        // uninitialized internal cuFFT table during the first execution.
+        if (result != CUFFT_SUCCESS || cudaEventRecord(mPlanReady, cudaStreamLegacy) != cudaSuccess)
         {
             if (mPlan != 0)
             {
@@ -787,7 +795,8 @@ class ParakeetFeaturePlugin final : public IPluginV3,
         if (!mStreamInitialized || stream != mStream)
         {
             if (cufftSetStream(mPlan, stream) != CUFFT_SUCCESS
-                || cublasSetStream(mCublas, stream) != CUBLAS_STATUS_SUCCESS)
+                || cublasSetStream(mCublas, stream) != CUBLAS_STATUS_SUCCESS
+                || cudaStreamWaitEvent(stream, mPlanReady, 0) != cudaSuccess)
             {
                 return 1;
             }
@@ -889,6 +898,7 @@ class ParakeetFeaturePlugin final : public IPluginV3,
     FeatureParameters mParameters{};
     cublasHandle_t mCublas{nullptr};
     cufftHandle mPlan{};
+    cudaEvent_t mPlanReady{nullptr};
     cudaStream_t mStream{nullptr};
     void* mCublasWorkspace{nullptr};
     int32_t mPlanRows{};

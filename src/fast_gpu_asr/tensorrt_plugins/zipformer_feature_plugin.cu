@@ -378,8 +378,10 @@ class ZipformerFeaturePlugin final : public IPluginV3,
             static_cast<double>(parameters.zeroLog));
         bool const validTimingCacheId =
             timingCacheLength > 0 && static_cast<size_t>(timingCacheLength) < mTimingCacheId.size();
-        mInitialized = areValidParameters(parameters) && validTimingCacheId
-                       && cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS;
+        mInitialized =
+            areValidParameters(parameters) && validTimingCacheId
+            && cublasCreate(&mCublas) == CUBLAS_STATUS_SUCCESS
+            && cudaEventCreateWithFlags(&mPlanReady, cudaEventDisableTiming) == cudaSuccess;
         initializeFields();
     }
 
@@ -388,6 +390,10 @@ class ZipformerFeaturePlugin final : public IPluginV3,
         if (mPlan != 0)
         {
             cufftDestroy(mPlan);
+        }
+        if (mPlanReady != nullptr)
+        {
+            cudaEventDestroy(mPlanReady);
         }
         if (mCublas != nullptr)
         {
@@ -639,7 +645,8 @@ class ZipformerFeaturePlugin final : public IPluginV3,
         int32_t outputEmbed[]{planFrequencies};
         cufftResult const result = cufftPlanMany(&mPlan, 1, dimensions, inputEmbed, 1,
             transformStride, outputEmbed, 1, planFrequencies, CUFFT_R2C, rows);
-        if (result != CUFFT_SUCCESS)
+        // Order legacy-stream plan initialization before nonblocking execution.
+        if (result != CUFFT_SUCCESS || cudaEventRecord(mPlanReady, cudaStreamLegacy) != cudaSuccess)
         {
             if (mPlan != 0)
             {
@@ -712,7 +719,8 @@ class ZipformerFeaturePlugin final : public IPluginV3,
         // the plan and custom kernels on an older nondefault stream.
         if (stream != mCufftStream)
         {
-            if (cufftSetStream(mPlan, stream) != CUFFT_SUCCESS)
+            if (cufftSetStream(mPlan, stream) != CUFFT_SUCCESS
+                || cudaStreamWaitEvent(stream, mPlanReady, 0) != cudaSuccess)
             {
                 return 1;
             }
@@ -814,6 +822,7 @@ class ZipformerFeaturePlugin final : public IPluginV3,
     FeatureParameters mParameters{};
     cublasHandle_t mCublas{nullptr};
     cufftHandle mPlan{};
+    cudaEvent_t mPlanReady{nullptr};
     cudaStream_t mCublasStream{nullptr};
     cudaStream_t mCufftStream{nullptr};
     void* mCublasWorkspace{nullptr};

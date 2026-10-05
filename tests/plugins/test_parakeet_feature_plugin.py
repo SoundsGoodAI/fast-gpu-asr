@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cupy as cp
@@ -487,6 +488,42 @@ def assert_run_matches_pytorch(
     return actual, actual_lengths
 
 
+def run_context(
+    engine: trt.ICudaEngine, extractor: FeatureExtractor, device: int, seed: int
+) -> None:
+    """Check a thread-owned context across shape and stream changes.
+
+    Reuse one context and alternate two nonblocking streams to exercise FFT
+    plan recreation and stream rebinding. Synchronize each run and compare
+    its features and lengths with the eager frontend before reusing resources.
+
+    Parameters
+    ----------
+    engine : trt.ICudaEngine
+        Shared engine whose runtime must remain alive until the worker finishes.
+    extractor : FeatureExtractor
+        Read-only eager frontend used to validate each run.
+    device : int
+        CUDA device to select in the worker thread.
+    seed : int
+        Base seed for deterministic worker-specific audio, incremented for
+        each shape case without changing global random state.
+    """
+
+    with cp.cuda.Device(device):
+        context = engine.create_execution_context()
+        assert context is not None
+        streams = (
+            cp.cuda.Stream(non_blocking=True),
+            cp.cuda.Stream(non_blocking=True),
+        )
+        for index, samples in enumerate((640, 4000, 1920, 1920, 640)):
+            lengths = np.array((samples - 160, 320, 0), dtype=np.int64)
+            audio = make_audio(lengths, samples, seed=seed + index)
+            run = run_engine(engine, audio, lengths, context, streams[index % 2])
+            assert_run_matches_pytorch(run, extractor, audio, lengths)
+
+
 def feature_input_specs(
     audio_shape: tuple[int, ...] = (1, 640),
     length_shape: tuple[int, ...] = (1,),
@@ -787,16 +824,14 @@ def test_feature_plugin_supports_concurrent_contexts(
     feature_engine: FeatureEngine,
 ) -> None:
     _, engine, extractor = feature_engine
-    host_cases = []
-    for audio_samples, length_values in ((640, (480,)), (4000, (3840, 1920, 320))):
-        lengths = np.array(length_values, dtype=np.int64)
-        host_cases.append((make_audio(lengths, audio_samples), lengths))
-
-    runs = [run_engine(engine, audio, lengths) for audio, lengths in host_cases]
-    assert runs[0].context is not runs[1].context
-    assert runs[0].stream.ptr != runs[1].stream.ptr
-    for run, (audio, lengths) in zip(runs, host_cases, strict=True):
-        assert_run_matches_pytorch(run, extractor, audio, lengths)
+    device = cp.cuda.Device().id
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(run_context, engine, extractor, device, seed)
+            for seed in (7, 19)
+        ]
+        for future in futures:
+            future.result()
 
 
 def test_feature_plugin_rejects_runtime_batch_mismatch(

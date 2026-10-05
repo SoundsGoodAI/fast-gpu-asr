@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cupy as cp
@@ -484,6 +485,46 @@ def assert_run_matches_pytorch(
     return actual, actual_lengths
 
 
+def run_context(
+    engine: trt.ICudaEngine, extractor: FeatureExtractor, device: int, offset: int
+) -> None:
+    """Check a thread-owned context across shape and stream changes.
+
+    Reuse one context and alternate two nonblocking streams to exercise FFT
+    plan recreation and stream rebinding. Synchronize each run and compare
+    its features and lengths with the eager frontend before reusing resources.
+
+    Parameters
+    ----------
+    engine : trt.ICudaEngine
+        Shared engine whose runtime must remain alive until the worker finishes.
+    extractor : FeatureExtractor
+        Read-only eager frontend used to validate each run.
+    device : int
+        CUDA device to select in the worker thread.
+    offset : int
+        Samples subtracted from the first waveform's valid length to produce
+        distinct deterministic inputs in each worker.
+    """
+
+    with cp.cuda.Device(device):
+        context = engine.create_execution_context()
+        assert context is not None
+        streams = (
+            cp.cuda.Stream(non_blocking=True),
+            cp.cuda.Stream(non_blocking=True),
+        )
+        for index, samples in enumerate((1800, 5000, 3400, 3400, 1800)):
+            lengths = np.array(
+                (samples - RIGHT_PADDING - offset, 1200, 800), dtype=np.int64
+            )
+            audio = make_padded_audio(lengths, samples)
+            run = run_engine(
+                engine, extractor, audio, lengths, context, streams[index % 2]
+            )
+            assert_run_matches_pytorch(run, extractor, audio, lengths)
+
+
 def feature_input_specs(
     audio_shape: tuple[int, ...] = (1, 1800),
     length_shape: tuple[int, ...] = (1,),
@@ -763,6 +804,18 @@ def test_feature_plugin_supports_concurrent_contexts(feature_engine) -> None:
             assert run.context.execute_async_v3(run.stream.ptr)
     for run, (audio, lengths) in zip(runs, host_cases, strict=True):
         assert_run_matches_pytorch(run, extractor, audio, lengths)
+
+
+def test_feature_plugin_recreates_plans_in_concurrent_threads(feature_engine) -> None:
+    _, engine, extractor = feature_engine
+    device = cp.cuda.Device().id
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(run_context, engine, extractor, device, offset)
+            for offset in (0, 80)
+        ]
+        for future in futures:
+            future.result()
 
 
 def test_feature_plugin_rejects_runtime_batch_mismatch(feature_engine) -> None:
