@@ -312,6 +312,8 @@ def test_ctc_greedy_blank_penalty_mutates_original_view_including_padding(
 def test_ctc_greedy_handles_large_byte_offsets(axis: int, reverse: bool) -> None:
     stride = 1 << 30
     nbytes = 3 * stride + 16
+    # Each case uses a new stream; reclaim cached blocks from earlier arenas.
+    cp.get_default_memory_pool().free_all_blocks()
     if cp.cuda.runtime.memGetInfo()[0] < nbytes + (256 << 20):
         pytest.skip("The large-offset regression needs 3 GiB of free GPU memory.")
     storage = cp.empty(nbytes, dtype=cp.uint8)

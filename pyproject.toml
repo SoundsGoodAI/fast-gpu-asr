@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-gpu-asr"
-version = "0.1.0"
+version = "0.1.1"
 description = "Batched TensorRT inference for Zipformer and Parakeet ASR models."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
@@ -31,17 +31,17 @@ classifiers = [
 ]
 dependencies = [
     "audioop-lts>=0.2.2,<1.0.0 ; python_full_version >= '3.13'",
-    "cuda-bindings>=13.4.1,<14.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "cuda-pathfinder>=1.8.1,<2.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "cuda-toolkit[cccl,cublas,cudart,cufft,nvcc]>=13.4.1,<14.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cuda-bindings>=13.4.3,<14.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cuda-pathfinder>=1.8.3,<2.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cuda-toolkit[cccl,cublas,cudart,cufft,nvcc]>=13.4.2,<14.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "cupy-cuda13x>=14.2.0,<15.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "numpy>=2.5.3,<3.0.0",
     "omegaconf>=2.3.1,<3.0.0",
-    "onnx>=1.22.0,<2.0.0",
+    "onnx>=1.23.1,<2.0.0",
     "onnxscript>=0.7.2,<1.0.0",
     "sentencepiece>=0.2.2,<1.0.0",
     "tensorrt-cu13>=11.3.0.99,<12.0.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torch>=2.14.0,<3.0.0",
+    "torch>=2.14.1,<3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -50,17 +50,17 @@ benchmark = [
     "kaleido>=1.4.0,<2.0.0",
     "kaldialign>=0.12.0,<1.0.0",
     "num2words>=0.5.14,<1.0.0",
-    "plotly>=7.0.0,<8.0.0",
-    "regex>=2026.9.10",
+    "plotly>=7.1.0,<8.0.0",
+    "regex>=2026.9.29",
 ]
 dev = [
-    "clang-format>=23.1.1",
+    "clang-format>=23.1.2",
     "kaldi-native-fbank>=1.22.3,<2.0.0",
     "packaging>=26.3",
-    "plotly>=7.0.0,<8.0.0",
+    "plotly>=7.1.0,<8.0.0",
     "pyyaml>=6.0.3,<7.0.0",
     "pytest>=9.1.1,<10.0.0",
-    "ruff>=0.16.7,<1.0.0",
+    "ruff>=0.16.10,<1.0.0",
 ]
 
 [project.scripts]
