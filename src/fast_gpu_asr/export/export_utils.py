@@ -467,13 +467,10 @@ def validate_parakeet(model_config: DictConfig, args: argparse.Namespace) -> Non
 
     max_samples = round(args.max_audio_seconds * sample_rate)
     feature_frames = max_samples // hop_length + 1
-    # Match the feature plugin's in-place R2C buffer and aligned cuBLAS scratch.
-    transform_bytes = args.batch_size * feature_frames * (n_fft + 2) * 4
-    cublas_offset = (transform_bytes + 255) // 256 * 256
-    if cublas_offset + (16 << 20) > INT32_MAX:
+    if args.batch_size * feature_frames > INT32_MAX:
         raise ValueError(
             "The maximum Parakeet profile exceeds the feature plugin's signed "
-            "32-bit TensorRT workspace limit."
+            "32-bit cuFFT/cuBLAS frame-count limit."
         )
 
     encoder_frames = (((feature_frames + 1) // 2 + 1) // 2 + 1) // 2
@@ -884,8 +881,6 @@ def validate_zipformer(
 
     sample_rate = model_config.feature_opts.frame_opts.samp_freq
     frame_shift_ms = model_config.feature_opts.frame_opts.frame_shift_ms
-    frame_length_ms = model_config.feature_opts.frame_opts.frame_length_ms
-    frame_length = frame_length_ms * sample_rate // 1000
     frame_shift = frame_shift_ms * sample_rate // 1000
 
     min_audio_samples = round(args.min_audio_seconds * sample_rate)
@@ -906,14 +901,10 @@ def validate_zipformer(
             "resampling plugin's CUDA grid.y limit of 65535."
         )
 
-    fft_length = 2 ** (frame_length - 1).bit_length()
-    # Match the feature plugin's in-place R2C buffer and aligned cuBLAS scratch.
-    transform_bytes = args.batch_size * max_feature_frames * (fft_length + 2) * 4
-    cublas_offset = (transform_bytes + 255) // 256 * 256
-    if cublas_offset + (16 << 20) > INT32_MAX:
+    if args.batch_size * max_feature_frames > INT32_MAX:
         raise ValueError(
             "The maximum Zipformer profile exceeds the feature plugin's signed "
-            "32-bit TensorRT workspace limit."
+            "32-bit cuFFT/cuBLAS frame-count limit."
         )
 
 

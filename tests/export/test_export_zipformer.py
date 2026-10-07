@@ -1255,14 +1255,21 @@ def test_validate_zipformer_minimum_audio_frame_boundary() -> None:
         validate_zipformer(make_model_config(), make_state_dict(), 512, args)
 
 
-def test_validate_zipformer_feature_workspace_boundary() -> None:
+def test_validate_zipformer_accepts_large_feature_workspace() -> None:
     args = make_export_args()
     args.max_audio_seconds = 40.0
-    args.batch_size = 259
+    args.batch_size = 384
     validate_zipformer(make_model_config(), make_state_dict(), 512, args)
 
-    args.batch_size = 260
-    with pytest.raises(ValueError, match="signed 32-bit TensorRT workspace"):
+
+def test_validate_zipformer_feature_frame_count_boundary() -> None:
+    args = make_export_args()
+    args.batch_size = 65535
+    args.max_audio_seconds = (INT32_MAX // args.batch_size) / 100
+    validate_zipformer(make_model_config(), make_state_dict(), 512, args)
+
+    args.max_audio_seconds += 0.01
+    with pytest.raises(ValueError, match="frame-count limit"):
         validate_zipformer(make_model_config(), make_state_dict(), 512, args)
 
 

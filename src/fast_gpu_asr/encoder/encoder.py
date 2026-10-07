@@ -329,6 +329,8 @@ class Encoder:
                     # TensorRT may still use the previous context allocation.
                     self.stream.synchronize()
                 self.cuda_graph, self.cuda_graph_shape = None, None
+                # Release the old block before allocating its larger replacement.
+                self.context_memory, self.context_memory_size = None, 0
                 self.context_memory = cp.cuda.Memory(context_memory_size)
                 self.context_memory_size = context_memory_size
                 self.encoder.set_device_memory(

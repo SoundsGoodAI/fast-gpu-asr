@@ -37,7 +37,6 @@ constexpr char const* kPreemphField = "preemph";
 constexpr char const* kZeroLogField = "zero_log";
 constexpr size_t kCublasWorkspaceBytes = 16U << 20;
 constexpr size_t kCublasWorkspaceAlignment = 256;
-constexpr size_t kMaximumWorkspaceBytes = static_cast<size_t>(std::numeric_limits<int32_t>::max());
 constexpr int32_t kThreadsPerBlock = 256;
 constexpr int32_t kWarpSize = 32;
 constexpr int32_t kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
@@ -151,10 +150,7 @@ bool makeWorkspaceLayout(
     {
         return false;
     }
-    // TensorRT's surrounding ForeignNode path uses signed 32-bit workspace byte
-    // offsets on supported releases. Reject oversized profiles during build
-    // instead of allowing an internal offset to wrap during tactic execution.
-    return layout.totalBytes <= kMaximumWorkspaceBytes;
+    return true;
 }
 
 __global__ void prepareFrames(float const* audio, int64_t const* audioLengths, float const* window,

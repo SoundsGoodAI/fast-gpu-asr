@@ -269,7 +269,7 @@ def build_feature_engine(
         profile.set_shape(name, *shapes)
         assert tuple(map(tuple, profile.get_shape(name))) == shapes
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 32)
     config.builder_optimization_level = 3
     assert config.add_optimization_profile(profile) == 0
     serialized_engine = builder.build_serialized_network(network, config)
@@ -649,8 +649,6 @@ def build_static_contract(
         output.name = name
         network.mark_output(output)
     config = builder.create_builder_config()
-    # Keep the builder cap above the plugin's signed-32-bit workspace limit so
-    # this test exercises the plugin's own overflow guard.
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 32)
     return True, builder.build_serialized_network(network, config)
 
@@ -1082,16 +1080,51 @@ def test_feature_plugin_accepts_valid_static_contract(
     assert serialized_engine is not None
 
 
-def test_feature_plugin_rejects_workspace_overflow(
+def test_feature_plugin_rejects_frame_count_overflow(
     plugin_creator: PluginCreatorFixture,
 ) -> None:
     _, creator = plugin_creator
     layer_added, serialized_engine = build_static_contract(
-        creator, feature_input_specs(audio_shape=(260, 640_200), length_shape=(260,))
+        creator,
+        feature_input_specs(audio_shape=(1 << 20, 640_200), length_shape=(1 << 20,)),
     )
 
     assert layer_added
     assert serialized_engine is None
+
+
+def test_feature_plugin_supports_large_workspace(
+    plugin_creator: PluginCreatorFixture,
+) -> None:
+    _, creator = plugin_creator
+    extractor = make_extractor()
+    result = build_feature_engine(
+        creator, extractor, ((384, 1600), (384, 160_000), (384, 640_000))
+    )
+    assert result is not None
+    _, engine = result
+    assert engine.device_memory_size_v2 > (1 << 31) - 1
+    lengths = np.array((640_000, 160_001, 320, 0), dtype=np.int64)
+    audio = make_audio(lengths, 640_000)
+    run = run_engine(engine, np.tile(audio, (96, 1)), np.tile(lengths, 96))
+    run.stream.synchronize()
+
+    with torch.inference_mode():
+        expected, expected_lengths = extractor(
+            torch.from_numpy(audio), torch.from_numpy(lengths)
+        )
+    actual = cp.asnumpy(run.features)
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(
+        cp.asnumpy(run.feature_lengths), np.tile(expected_lengths.numpy(), 96)
+    )
+    for start in range(0, 384, 4):
+        np.testing.assert_allclose(
+            actual[start : start + 4],
+            expected.numpy(),
+            rtol=FEATURE_RTOL,
+            atol=FEATURE_ATOL,
+        )
 
 
 @pytest.mark.parametrize(

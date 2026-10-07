@@ -1557,14 +1557,20 @@ def test_validate_parakeet_rejects_fft_size_mismatch(
         validate_parakeet(model_config, make_export_args())
 
 
-def test_validate_parakeet_rejects_feature_workspace_overflow_boundary() -> None:
+def test_validate_parakeet_accepts_large_feature_workspace() -> None:
     args = make_export_args()
-    args.batch_size = 259
-
+    args.batch_size = 384
     validate_parakeet(make_model_config(), args)
 
-    args.batch_size = 260
-    with pytest.raises(ValueError, match="workspace limit"):
+
+def test_validate_parakeet_feature_frame_count_boundary() -> None:
+    args = make_export_args()
+    args.beam = 1
+    args.batch_size = ((1 << 31) - 1) // 4001
+    validate_parakeet(make_model_config(), args)
+
+    args.batch_size += 1
+    with pytest.raises(ValueError, match="frame-count limit"):
         validate_parakeet(make_model_config(), args)
 
 

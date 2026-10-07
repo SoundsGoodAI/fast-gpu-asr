@@ -4,6 +4,7 @@
 """Tests for TensorRT encoder initialization, audio staging, and execution."""
 
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace, TracebackType
@@ -1229,7 +1230,40 @@ def test_encoder_reports_missing_host_buffer_after_allocation_failure(
     assert encoder.host_transfer_event.records == 0
 
 
-def test_encoder_synchronizes_before_growing_context_memory(
+def allocate_released_context_memory(
+    encoder: Encoder, previous_synchronizations: int, size: int
+) -> SimpleNamespace:
+    """Validate context-memory cleanup before returning a replacement allocation.
+
+    Parameters
+    ----------
+    encoder : Encoder
+        Encoder with a fake stream whose synchronization count is inspected.
+        Its context-memory reference, capacity, and CUDA graph must be cleared.
+    previous_synchronizations : int
+        Stream synchronization count recorded before growing context memory.
+    size : int
+        Requested context-memory size in bytes.
+
+    Returns
+    -------
+    SimpleNamespace
+        Fake allocation with a fixed ``ptr`` and the requested ``size``.
+
+    Raises
+    ------
+    AssertionError
+        The stream has not synchronized or the previous context state remains.
+    """
+
+    assert encoder.stream.synchronizations > previous_synchronizations
+    assert encoder.context_memory is None
+    assert encoder.context_memory_size == 0
+    assert encoder.cuda_graph is None
+    return SimpleNamespace(ptr=9000, size=size)
+
+
+def test_encoder_releases_context_memory_before_growing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     encoder = make_runtime_encoder(monkeypatch)
@@ -1237,37 +1271,46 @@ def test_encoder_synchronizes_before_growing_context_memory(
     encoder([waveform])
     original_memory = encoder.context_memory
     synchronizations = encoder.stream.synchronizations
-    memory_allocation_synchronizations: list[int] = []
-    allocate_memory = encoder_module.cp.cuda.Memory
-
-    def record_memory_allocation(size: int) -> SimpleNamespace:
-        """Record synchronization state before context-memory allocation.
-
-        Parameters
-        ----------
-        size : int
-            Requested TensorRT context-memory size in bytes.
-
-        Returns
-        -------
-        SimpleNamespace
-            Fake CUDA allocation returned by the original stub.
-        """
-
-        memory_allocation_synchronizations.append(encoder.stream.synchronizations)
-        return allocate_memory(size)
-
     encoder.cuda_graph_supported = False
     encoder.encoder.required_device_memory_size = 96
-    monkeypatch.setattr(encoder_module.cp.cuda, "Memory", record_memory_allocation)
+    monkeypatch.setattr(
+        encoder_module.cp.cuda,
+        "Memory",
+        partial(allocate_released_context_memory, encoder, synchronizations),
+    )
     encoder([waveform])
 
     assert original_memory is not None
-    assert len(memory_allocation_synchronizations) == 1
-    assert memory_allocation_synchronizations[0] > synchronizations
     assert encoder.context_memory is not original_memory
     assert encoder.context_memory_size == 96
     assert encoder.encoder.device_memory == (encoder.context_memory.ptr, 96)
+
+
+def test_encoder_recovers_after_context_memory_allocation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoder = make_runtime_encoder(monkeypatch)
+    waveform = np.ones(3, dtype=np.float32)
+    encoder([waveform])
+    encoder([waveform])
+    assert encoder.cuda_graph is not None
+    executions = encoder.encoder.execute_calls
+    encoder.encoder.required_device_memory_size = 96
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            encoder_module.cp.cuda, "Memory", Mock(side_effect=MemoryError("OOM"))
+        )
+        with pytest.raises(MemoryError, match="OOM"):
+            encoder([waveform])
+
+    assert encoder.encoder.execute_calls == executions
+    assert encoder.cuda_graph is None
+    assert encoder.context_memory is None
+    assert encoder.context_memory_size == 0
+    encoder.encoder.required_device_memory_size = 64
+    encoder([waveform])
+    assert encoder.encoder.device_memory == (encoder.context_memory.ptr, 64)
+    assert encoder.encoder.execute_calls == executions + 1
 
 
 def test_encoder_handles_zero_sized_context_memory(

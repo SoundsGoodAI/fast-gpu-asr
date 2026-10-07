@@ -35,7 +35,6 @@ constexpr char const* kLogEpsField = "log_eps";
 constexpr char const* kEpsField = "eps";
 constexpr size_t kCublasWorkspaceBytes = 16U << 20;
 constexpr size_t kCublasWorkspaceAlignment = 256;
-constexpr size_t kMaximumWorkspaceBytes = static_cast<size_t>(std::numeric_limits<int32_t>::max());
 constexpr int32_t kThreadsPerBlock = 256;
 constexpr int32_t kParallelNormalizationThreads = 64;
 constexpr int32_t kCoalescedNormalizationThreads = 128;
@@ -127,8 +126,7 @@ bool makeWorkspaceLayout(int64_t rows, int32_t fftLength, WorkspaceLayout& layou
     }
 
     // An in-place R2C transform needs two padding floats after every even-sized
-    // real row. The same allocation subsequently stores strided power rows,
-    // keeping the maximum production workspace below TensorRT's 2 GiB boundary.
+    // real row. The same allocation subsequently stores strided power rows.
     int32_t const transformStride = fftLength + 2;
     size_t transformElements{};
     size_t transformBytes{};
@@ -140,10 +138,7 @@ bool makeWorkspaceLayout(int64_t rows, int32_t fftLength, WorkspaceLayout& layou
     {
         return false;
     }
-    // TensorRT's surrounding ForeignNode path uses signed 32-bit workspace byte
-    // offsets on supported releases. Reject oversized profiles during build
-    // instead of allowing an internal offset to wrap during tactic execution.
-    return layout.totalBytes <= kMaximumWorkspaceBytes;
+    return true;
 }
 
 struct FeatureParameters
